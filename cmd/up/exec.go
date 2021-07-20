@@ -1,3 +1,16 @@
+// Copyright 2021 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package up
 
 import (
@@ -19,7 +32,7 @@ func (up *upContext) cleanCommand(ctx context.Context) {
 	in := strings.NewReader("\n")
 	var out bytes.Buffer
 
-	cmd := "cat /var/okteto/bin/version.txt; cat /proc/sys/fs/inotify/max_user_watches; /var/okteto/bin/clean >/dev/null 2>&1"
+	cmd := "cat /var/okteto/bin/version.txt; cat /proc/sys/fs/inotify/max_user_watches; [ -f /var/okteto/cloudbin/start.sh ] && echo yes || echo no; /var/okteto/bin/clean >/dev/null 2>&1"
 
 	err := exec.Exec(
 		ctx,
@@ -42,14 +55,14 @@ func (up *upContext) cleanCommand(ctx context.Context) {
 	up.cleaned <- out.String()
 }
 
-func (up *upContext) runCommand(ctx context.Context) error {
+func (up *upContext) runCommand(ctx context.Context, cmd []string) error {
 	log.Infof("starting remote command")
 	if err := config.UpdateStateFile(up.Dev, config.Ready); err != nil {
 		return err
 	}
 
 	if up.Dev.RemoteModeEnabled() {
-		return ssh.Exec(ctx, up.Dev.Interface, up.Dev.RemotePort, true, os.Stdin, os.Stdout, os.Stderr, up.Dev.Command.Values)
+		return ssh.Exec(ctx, up.Dev.Interface, up.Dev.RemotePort, true, os.Stdin, os.Stdout, os.Stderr, cmd)
 	}
 
 	return exec.Exec(
@@ -63,7 +76,7 @@ func (up *upContext) runCommand(ctx context.Context) error {
 		os.Stdin,
 		os.Stdout,
 		os.Stderr,
-		up.Dev.Command.Values,
+		cmd,
 	)
 }
 
@@ -72,7 +85,7 @@ func (up *upContext) checkOktetoStartError(ctx context.Context, msg string) erro
 	if up.Dev.PersistentVolumeEnabled() {
 		if userID != -1 && userID != *up.Dev.SecurityContext.RunAsUser {
 			return errors.UserError{
-				E: fmt.Errorf("User %d doesn't have write permissions for the %s directory", userID, up.Dev.MountPath),
+				E: fmt.Errorf("User %d doesn't have write permissions for synchronization paths", userID),
 				Hint: fmt.Sprintf(`Set 'securityContext.runAsUser: %d' in your okteto manifest.
     After that, run 'okteto down -v' to reset your development container and run 'okteto up' again`, userID),
 			}

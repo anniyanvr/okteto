@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -46,7 +46,9 @@ services:
     imagePullPolicy: IfNotPresent
     sync:
       - worker:/src
-    healthchecks: true`)
+    healthchecks: true
+    lifecycle:
+       postStart: true`)
 
 	dev, err := Read(manifest)
 	if err != nil {
@@ -61,9 +63,10 @@ services:
 		Image:             "web:latest",
 		ImagePullPolicy:   apiv1.PullNever,
 		Command:           []string{"/var/okteto/bin/start.sh"},
-		Args:              []string{"-r"},
+		Args:              []string{"-r", "-v"},
 		Probes:            &Probes{},
-		Environment: []EnvVar{
+		Lifecycle:         &Lifecycle{},
+		Environment: Environment{
 			{
 				Name:  "OKTETO_NAMESPACE",
 				Value: "n",
@@ -110,9 +113,7 @@ services:
 				SubPath:   path.Join(SourceCodeSubPath, "sub"),
 			},
 		},
-		InitContainer: InitContainer{
-			Image: OktetoBinImageTag,
-		},
+		InitContainer: InitContainer{Image: OktetoBinImageTag},
 	}
 
 	marshalled1, _ := yaml.Marshal(rule1)
@@ -131,16 +132,14 @@ services:
 		Args:            nil,
 		Healthchecks:    true,
 		Probes:          &Probes{Readiness: true, Liveness: true, Startup: true},
-		Environment:     make([]EnvVar, 0),
+		Lifecycle:       &Lifecycle{PostStart: true, PostStop: false},
+		Environment:     make(Environment, 0),
 		SecurityContext: &SecurityContext{
 			RunAsUser:  &rootUser,
 			RunAsGroup: &rootUser,
 			FSGroup:    &rootUser,
 		},
-		Resources: ResourceRequirements{
-			Limits:   ResourceList{},
-			Requests: ResourceList{},
-		},
+		Resources:        ResourceRequirements{},
 		PersistentVolume: true,
 		Volumes: []VolumeMount{
 			{
@@ -158,11 +157,200 @@ services:
 	}
 }
 
+func TestDevToTranslationRuleInitContainer(t *testing.T) {
+	manifest := []byte(`name: web
+namespace: n
+sync:
+  - .:/app
+initContainer:
+  image: image
+  resources:
+    requests:
+      cpu: 1
+      memory: 1Gi
+    limits:
+      cpu: 2
+      memory: 2Gi`)
+
+	dev, err := Read(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rule := dev.ToTranslationRule(dev, false)
+	ruleOK := &TranslationRule{
+		Marker:            OktetoBinImageTag,
+		OktetoBinImageTag: "image",
+		ImagePullPolicy:   apiv1.PullAlways,
+		Command:           []string{"/var/okteto/bin/start.sh"},
+		Args:              []string{"-r", "-v"},
+		Probes:            &Probes{},
+		Lifecycle:         &Lifecycle{},
+		Environment: Environment{
+			{
+				Name:  "OKTETO_NAMESPACE",
+				Value: "n",
+			},
+			{
+				Name:  "OKTETO_NAME",
+				Value: "web",
+			},
+		},
+		SecurityContext: &SecurityContext{
+			RunAsUser:  &rootUser,
+			RunAsGroup: &rootUser,
+			FSGroup:    &rootUser,
+		},
+		Resources:        ResourceRequirements{},
+		PersistentVolume: true,
+		Volumes: []VolumeMount{
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: OktetoSyncthingMountPath,
+				SubPath:   SyncthingSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: RemoteMountPath,
+				SubPath:   RemoteSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/app",
+				SubPath:   SourceCodeSubPath,
+			},
+		},
+		InitContainer: InitContainer{
+			Image: "image",
+			Resources: ResourceRequirements{
+				Requests: map[apiv1.ResourceName]resource.Quantity{
+					apiv1.ResourceCPU:    resource.MustParse("1"),
+					apiv1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+				Limits: map[apiv1.ResourceName]resource.Quantity{
+					apiv1.ResourceCPU:    resource.MustParse("2"),
+					apiv1.ResourceMemory: resource.MustParse("2Gi"),
+				},
+			},
+		},
+	}
+
+	marshalled, _ := yaml.Marshal(rule)
+	marshalledOK, _ := yaml.Marshal(ruleOK)
+	if string(marshalled) != string(marshalledOK) {
+		t.Fatalf("Wrong rule generation.\nActual %s, \nExpected %s", string(marshalled), string(marshalledOK))
+	}
+}
+
+func TestDevToTranslationRuleDockerEnabled(t *testing.T) {
+	manifest := []byte(`name: web
+image: dev-image
+namespace: n
+sync:
+  - .:/app
+docker:
+  enabled: true`)
+
+	dev, err := Read(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dev.Username = "cindy"
+	dev.RegistryURL = "registry.okteto.dev"
+
+	rule := dev.ToTranslationRule(dev, false)
+	ruleOK := &TranslationRule{
+		Marker:            OktetoBinImageTag,
+		OktetoBinImageTag: OktetoBinImageTag,
+		ImagePullPolicy:   apiv1.PullAlways,
+		Image:             "dev-image",
+		Command:           []string{"/var/okteto/bin/start.sh"},
+		Args:              []string{"-r", "-v", "-d"},
+		Probes:            &Probes{},
+		Lifecycle:         &Lifecycle{},
+		Environment: Environment{
+			{
+				Name:  "OKTETO_NAMESPACE",
+				Value: "n",
+			},
+			{
+				Name:  "OKTETO_NAME",
+				Value: "web",
+			},
+			{
+				Name:  "OKTETO_USERNAME",
+				Value: "cindy",
+			},
+			{
+				Name:  "OKTETO_REGISTRY_URL",
+				Value: "registry.okteto.dev",
+			},
+			{
+				Name:  "DOCKER_HOST",
+				Value: DefaultDockerHost,
+			},
+			{
+				Name:  "DOCKER_CERT_PATH",
+				Value: "/certs/client",
+			},
+			{
+				Name:  "DOCKER_TLS_VERIFY",
+				Value: "1",
+			},
+		},
+		SecurityContext: &SecurityContext{
+			RunAsUser:  &rootUser,
+			RunAsGroup: &rootUser,
+			FSGroup:    &rootUser,
+		},
+		PersistentVolume: true,
+		Volumes: []VolumeMount{
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: DefaultDockerCertDir,
+				SubPath:   DefaultDockerCertDirSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: DefaultDockerCacheDir,
+				SubPath:   DefaultDockerCacheDirSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: OktetoSyncthingMountPath,
+				SubPath:   SyncthingSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: RemoteMountPath,
+				SubPath:   RemoteSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/app",
+				SubPath:   SourceCodeSubPath,
+			},
+		},
+		InitContainer: InitContainer{Image: OktetoBinImageTag},
+		Docker: DinDContainer{
+			Enabled: true,
+			Image:   DefaultDinDImage,
+		},
+	}
+
+	marshalled, _ := yaml.Marshal(rule)
+	marshalledOK, _ := yaml.Marshal(ruleOK)
+	if string(marshalled) != string(marshalledOK) {
+		t.Fatalf("Wrong rule generation.\nActual %s, \nExpected %s", string(marshalled), string(marshalledOK))
+	}
+}
+
 func TestSSHServerPortTranslationRule(t *testing.T) {
 	tests := []struct {
 		name     string
 		manifest *Dev
-		expected []EnvVar
+		expected Environment
 	}{
 		{
 			name: "default",
@@ -170,7 +358,7 @@ func TestSSHServerPortTranslationRule(t *testing.T) {
 				Image:         &BuildInfo{},
 				SSHServerPort: oktetoDefaultSSHServerPort,
 			},
-			expected: []EnvVar{
+			expected: Environment{
 				{Name: "OKTETO_NAMESPACE", Value: ""},
 				{Name: "OKTETO_NAME", Value: ""},
 			},
@@ -181,7 +369,7 @@ func TestSSHServerPortTranslationRule(t *testing.T) {
 				Image:         &BuildInfo{},
 				SSHServerPort: 22220,
 			},
-			expected: []EnvVar{
+			expected: Environment{
 				{Name: "OKTETO_NAMESPACE", Value: ""},
 				{Name: "OKTETO_NAME", Value: ""},
 				{Name: oktetoSSHServerPortVariable, Value: "22220"},

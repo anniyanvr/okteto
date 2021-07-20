@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -24,7 +24,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-//Deploy deploys a stack
+// Deploy deploys a stack
 func Deploy(ctx context.Context) *cobra.Command {
 	var stackPath string
 	var name string
@@ -34,20 +34,26 @@ func Deploy(ctx context.Context) *cobra.Command {
 	var noCache bool
 
 	cmd := &cobra.Command{
-		Use:   "deploy <name>",
+		Use:   "deploy",
 		Short: "Deploys a stack",
+		Args:  utils.NoArgsAccepted("https://okteto.com/docs/reference/cli/#deploy-1"),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := login.WithEnvVarIfAvailable(ctx); err != nil {
+				return err
+			}
+
+			ctx := context.Background()
+			if err := utils.LoadEnvironment(ctx, true); err != nil {
+				return err
+			}
+
 			s, err := utils.LoadStack(name, stackPath)
 			if err != nil {
 				return err
 			}
-			analytics.TrackStackWarnings(s.Warnings)
+			analytics.TrackStackWarnings(s.Warnings.NotSupportedFields)
 
 			if err := s.UpdateNamespace(namespace); err != nil {
-				return err
-			}
-
-			if err := login.WithEnvVarIfAvailable(ctx); err != nil {
 				return err
 			}
 

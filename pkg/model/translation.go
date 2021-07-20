@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,19 +18,20 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 )
 
-//Translation represents the information for translating a deployment
+// Translation represents the information for translating a deployment
 type Translation struct {
-	Interactive bool               `json:"interactive"`
-	Name        string             `json:"name"`
-	Version     string             `json:"version"`
-	Deployment  *appsv1.Deployment `json:"-"`
-	Annotations map[string]string  `json:"annotations,omitempty"`
-	Tolerations []apiv1.Toleration `json:"tolerations,omitempty"`
-	Replicas    int32              `json:"replicas"`
-	Rules       []*TranslationRule `json:"rules"`
+	Interactive bool                      `json:"interactive"`
+	Name        string                    `json:"name"`
+	Version     string                    `json:"version"`
+	Deployment  *appsv1.Deployment        `json:"-"`
+	Annotations Annotations               `json:"annotations,omitempty"`
+	Tolerations []apiv1.Toleration        `json:"tolerations,omitempty"`
+	Replicas    int32                     `json:"replicas"`
+	Strategy    appsv1.DeploymentStrategy `json:"strategy"`
+	Rules       []*TranslationRule        `json:"rules"`
 }
 
-//TranslationRule represents how to apply a container translation in a deployment
+// TranslationRule represents how to apply a container translation in a deployment
 type TranslationRule struct {
 	Marker            string               `json:"marker"`
 	OktetoBinImageTag string               `json:"oktetoBinImageTag"`
@@ -38,7 +39,7 @@ type TranslationRule struct {
 	Container         string               `json:"container,omitempty"`
 	Image             string               `json:"image,omitempty"`
 	ImagePullPolicy   apiv1.PullPolicy     `json:"imagePullPolicy,omitempty" yaml:"imagePullPolicy,omitempty"`
-	Environment       []EnvVar             `json:"environment,omitempty"`
+	Environment       Environment          `json:"environment,omitempty"`
 	Secrets           []Secret             `json:"secrets,omitempty"`
 	Command           []string             `json:"command,omitempty"`
 	Args              []string             `json:"args,omitempty"`
@@ -51,21 +52,23 @@ type TranslationRule struct {
 	Resources         ResourceRequirements `json:"resources,omitempty"`
 	InitContainer     InitContainer        `json:"initContainers,omitempty"`
 	Probes            *Probes              `json:"probes" yaml:"probes"`
+	Lifecycle         *Lifecycle           `json:"lifecycle" yaml:"lifecycle"`
+	Docker            DinDContainer        `json:"docker" yaml:"docker"`
 }
 
-//IsMainDevContainer returns true if the translation rule applies to the main dev container of the okteto manifest
+// IsMainDevContainer returns true if the translation rule applies to the main dev container of the okteto manifest
 func (r *TranslationRule) IsMainDevContainer() bool {
 	return r.OktetoBinImageTag != ""
 }
 
-//VolumeMount represents a volume mount
+// VolumeMount represents a volume mount
 type VolumeMount struct {
 	Name      string `json:"name,omitempty"`
 	MountPath string `json:"mountpath,omitempty"`
 	SubPath   string `json:"subpath,omitempty"`
 }
 
-//IsSyncthing returns the volume mount is for syncthing
+// IsSyncthing returns the volume mount is for syncthing
 func (v *VolumeMount) IsSyncthing() bool {
 	return v.SubPath == SyncthingSubPath && v.MountPath == OktetoSyncthingMountPath
 }

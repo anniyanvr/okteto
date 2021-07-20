@@ -1,6 +1,6 @@
 // +build integration
 
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -36,12 +36,14 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	ps "github.com/mitchellh/go-ps"
-	upCmd "github.com/okteto/okteto/cmd/up"
+	"github.com/okteto/okteto/cmd/utils"
 	"github.com/okteto/okteto/pkg/config"
 	k8Client "github.com/okteto/okteto/pkg/k8s/client"
 	"github.com/okteto/okteto/pkg/okteto"
 	"github.com/okteto/okteto/pkg/syncthing"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	yaml "gopkg.in/yaml.v2"
@@ -150,7 +152,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestGetVersion(t *testing.T) {
-	v, err := upCmd.GetLatestVersionFromGithub()
+	v, err := utils.GetLatestVersionFromGithub()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,6 +703,32 @@ func getDeployment(ctx context.Context, ns, name string) (*appsv1.Deployment, er
 	}
 
 	return client.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+}
+
+func getStatefulset(ctx context.Context, ns, name string) (*appsv1.StatefulSet, error) {
+	client, _, err := k8Client.GetLocal()
+	if err != nil {
+		return nil, err
+	}
+
+	return client.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
+}
+
+func getJob(ctx context.Context, ns, name string) (*batchv1.Job, error) {
+	client, _, err := k8Client.GetLocal()
+	if err != nil {
+		return nil, err
+	}
+
+	return client.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
+}
+
+func getVolume(ctx context.Context, ns, name string) (*corev1.PersistentVolumeClaim, error) {
+	client, _, err := k8Client.GetLocal()
+	if err != nil {
+		return nil, err
+	}
+	return client.CoreV1().PersistentVolumeClaims(ns).Get(ctx, name, metav1.GetOptions{})
 }
 
 func compareDeployment(ctx context.Context, deployment *appsv1.Deployment) error {

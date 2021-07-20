@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,8 +27,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-//Run runs the "okteto down" sequence
-func Run(dev *model.Dev, d *appsv1.Deployment, trList map[string]*model.Translation, wait bool, c *kubernetes.Clientset) error {
+// Run runs the "okteto down" sequence
+func Run(dev *model.Dev, d *appsv1.Deployment, trList map[string]*model.Translation, wait bool, c kubernetes.Interface) error {
 	ctx := context.Background()
 	if len(trList) == 0 {
 		log.Info("no translations available in the deployment")

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,6 +23,7 @@ import (
 
 	sp "github.com/briandowns/spinner"
 	"github.com/okteto/okteto/pkg/log"
+	"golang.org/x/term"
 )
 
 var spinnerSupport bool
@@ -38,6 +39,16 @@ func NewSpinner(suffix string) *Spinner {
 	s := sp.New(sp.CharSets[14], 100*time.Millisecond)
 	s.HideCursor = true
 	s.Suffix = fmt.Sprintf(" %s", suffix)
+	s.FinalMSG = s.Suffix
+	s.PreUpdate = func(s *sp.Spinner) {
+		width, _, _ := term.GetSize(int(os.Stdout.Fd()))
+		if width > 4 && len(s.FinalMSG)+2 > width {
+			s.Suffix = s.FinalMSG[:width-5] + "..."
+		} else {
+			s.Suffix = s.FinalMSG
+		}
+	}
+
 	return &Spinner{
 		sp: s,
 	}
@@ -60,6 +71,9 @@ func loadBoolean(k string) bool {
 //Start starts the spinner
 func (p *Spinner) Start() {
 	if spinnerSupport {
+		if p.sp.FinalMSG == "" {
+			p.sp.FinalMSG = p.sp.Suffix
+		}
 		p.sp.Start()
 	} else {
 		fmt.Println(strings.TrimSpace(p.sp.Suffix))
@@ -68,6 +82,9 @@ func (p *Spinner) Start() {
 
 //Stop stops the spinner
 func (p *Spinner) Stop() {
+	if p.sp.FinalMSG != "" {
+		p.sp.FinalMSG = ""
+	}
 	if spinnerSupport {
 		p.sp.Stop()
 	}
@@ -76,6 +93,7 @@ func (p *Spinner) Stop() {
 //Update updates the spinner message
 func (p *Spinner) Update(text string) {
 	p.sp.Suffix = fmt.Sprintf(" %s", ucFirst(text))
+	p.sp.FinalMSG = fmt.Sprintf(" %s", ucFirst(text))
 	if !spinnerSupport {
 		fmt.Println(strings.TrimSpace(p.sp.Suffix))
 	}

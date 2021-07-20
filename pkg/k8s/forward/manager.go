@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -219,7 +219,7 @@ func (p *PortForwardManager) buildForwarder(namespace, pod string, ports []strin
 }
 
 func (p *PortForwardManager) buildForwarderToService(ctx context.Context, namespace, service string) (*active, *portforward.PortForwarder, error) {
-	svc, err := services.Get(ctx, namespace, service, p.client)
+	svc, err := services.Get(ctx, service, namespace, p.client)
 	if err != nil {
 		return nil, nil, err
 	}

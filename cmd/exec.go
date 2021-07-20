@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -35,7 +35,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-//Exec executes a command on the CND container
+// Exec executes a command on the CND container
 func Exec() *cobra.Command {
 	var devPath string
 	var namespace string
@@ -76,12 +76,7 @@ func Exec() *cobra.Command {
 
 			return err
 		},
-		Args: func(cmd *cobra.Command, args []string) error {
-			if len(args) < 1 {
-				return fmt.Errorf("exec requires the COMMAND argument")
-			}
-			return nil
-		},
+		Args: utils.MinimumNArgsAccepted(1, "https://okteto.com/docs/reference/cli/#exec"),
 	}
 
 	cmd.Flags().StringVarP(&devPath, "file", "f", utils.DefaultDevManifest, "path to the manifest file")

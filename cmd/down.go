@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,6 +23,7 @@ import (
 	"github.com/okteto/okteto/pkg/errors"
 	k8Client "github.com/okteto/okteto/pkg/k8s/client"
 	"github.com/okteto/okteto/pkg/k8s/deployments"
+	"github.com/okteto/okteto/pkg/k8s/diverts"
 	"github.com/okteto/okteto/pkg/k8s/volumes"
 	"github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
@@ -30,7 +31,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-//Down deactivates the development container
+// Down deactivates the development container
 func Down() *cobra.Command {
 	var devPath string
 	var namespace string
@@ -40,6 +41,7 @@ func Down() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "down",
 		Short: "Deactivates your development container",
+		Args:  utils.NoArgsAccepted("https://okteto.com/docs/reference/cli/#down"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			dev, err := utils.LoadDev(devPath, namespace, k8sContext)
@@ -94,6 +96,12 @@ func runDown(ctx context.Context, dev *model.Dev) error {
 		return err
 	}
 
+	if dev.Divert != nil {
+		if err := diverts.Delete(ctx, dev, client); err != nil {
+			return err
+		}
+	}
+
 	d, err := deployments.Get(ctx, dev, dev.Namespace, client)
 	if err != nil && !errors.IsNotFound(err) {
 		return err
@@ -122,5 +130,5 @@ func removeVolume(ctx context.Context, dev *model.Dev) error {
 		return err
 	}
 
-	return volumes.Destroy(ctx, dev.GetVolumeName(), dev.Namespace, client, dev.Timeout)
+	return volumes.Destroy(ctx, dev.GetVolumeName(), dev.Namespace, client, dev.Timeout.Default)
 }

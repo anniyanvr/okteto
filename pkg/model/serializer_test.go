@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	yaml "gopkg.in/yaml.v2"
 )
@@ -187,6 +188,11 @@ func TestCommandUnmashalling(t *testing.T) {
 			Command{Values: []string{"sh", "-c", "start.sh arg"}},
 		},
 		{
+			"double-command",
+			[]byte("mkdir myproject && cd myproject"),
+			Command{Values: []string{"sh", "-c", "mkdir myproject && cd myproject"}},
+		},
+		{
 			"multiple",
 			[]byte("['yarn', 'install']"),
 			Command{Values: []string{"yarn", "install"}},
@@ -277,27 +283,59 @@ func TestImageMashalling(t *testing.T) {
 	}
 }
 
-func TestHealthcheckMashalling(t *testing.T) {
+func TestProbesMashalling(t *testing.T) {
 	tests := []struct {
-		name         string
-		healthchecks Probes
-		expected     string
+		name     string
+		probes   Probes
+		expected string
 	}{
 		{
-			name:         "liveness-true-and-defaults",
-			healthchecks: Probes{Liveness: true},
-			expected:     "liveness: true\n",
+			name:     "liveness-true-and-defaults",
+			probes:   Probes{Liveness: true},
+			expected: "liveness: true\n",
 		},
 		{
-			name:         "all-healthchecks-true",
-			healthchecks: Probes{Liveness: true, Readiness: true, Startup: true},
-			expected:     "true\n",
+			name:     "all-probes-true",
+			probes:   Probes{Liveness: true, Readiness: true, Startup: true},
+			expected: "true\n",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			marshalled, err := yaml.Marshal(tt.healthchecks)
+			marshalled, err := yaml.Marshal(tt.probes)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if string(marshalled) != tt.expected {
+				t.Errorf("didn't marshal correctly. Actual '%s', Expected '%s'", marshalled, tt.expected)
+			}
+		})
+	}
+}
+
+func TestLifecycleMashalling(t *testing.T) {
+	tests := []struct {
+		name      string
+		lifecycle Lifecycle
+		expected  string
+	}{
+		{
+			name:      "true-and-false",
+			lifecycle: Lifecycle{PostStart: true},
+			expected:  "postStart: true\n",
+		},
+		{
+			name:      "all-lifecycle-true",
+			lifecycle: Lifecycle{PostStart: true, PostStop: true},
+			expected:  "true\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			marshalled, err := yaml.Marshal(tt.lifecycle)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -500,14 +538,29 @@ func TestEndpointUnmarshalling(t *testing.T) {
 					Service: "test",
 					Port:    8080,
 				}},
+				Labels:      Labels{},
+				Annotations: make(Annotations),
 			},
 		},
 		{
 			name: "full-endpoint",
 			data: []byte("labels:\n  key1: value1\nannotations:\n  key2: value2\nrules:\n- path: /\n  service: test\n  port: 8080"),
 			expected: Endpoint{
-				Labels:      map[string]string{"key1": "value1"},
-				Annotations: map[string]string{"key2": "value2"},
+				Labels:      Labels{},
+				Annotations: Annotations{"key1": "value1", "key2": "value2"},
+				Rules: []EndpointRule{{
+					Path:    "/",
+					Service: "test",
+					Port:    8080,
+				}},
+			},
+		},
+		{
+			name: "full-endpoint without labels",
+			data: []byte("annotations:\n  key2: value2\nrules:\n- path: /\n  service: test\n  port: 8080"),
+			expected: Endpoint{
+				Labels:      Labels{},
+				Annotations: Annotations{"key2": "value2"},
 				Rules: []EndpointRule{{
 					Path:    "/",
 					Service: "test",
@@ -519,7 +572,6 @@ func TestEndpointUnmarshalling(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-
 			var endpoint Endpoint
 			if err := yaml.UnmarshalStrict(tt.data, &endpoint); err != nil {
 				t.Fatal(err)
@@ -536,7 +588,337 @@ func TestEndpointUnmarshalling(t *testing.T) {
 			if !reflect.DeepEqual(endpoint.Rules, tt.expected.Rules) {
 				t.Errorf("didn't unmarshal correctly rules. Actual %v, Expected %v", endpoint.Rules, tt.expected.Rules)
 			}
+		})
+	}
+}
 
+func TestLabelsUnmashalling(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		expected Labels
+	}{
+		{
+			"key-value-list",
+			[]byte(`- env=production`),
+			Labels{"env": "production"},
+		},
+		{
+			"key-value-map",
+			[]byte(`env: production`),
+			Labels{"env": "production"},
+		},
+		{
+			"key-value-complex-list",
+			[]byte(`- env='production=11231231asa#$˜GADAFA'`),
+			Labels{"env": "'production=11231231asa#$˜GADAFA'"},
+		},
+		{
+			"key-value-with-env-var-list",
+			[]byte(`- env=$DEV_ENV`),
+			Labels{"env": "test_environment"},
+		},
+		{
+			"key-value-with-env-var-map",
+			[]byte(`env: $DEV_ENV`),
+			Labels{"env": "test_environment"},
+		},
+		{
+			"key-value-with-env-var-in-string-list",
+			[]byte(`- env=my_env;$DEV_ENV;prod`),
+			Labels{"env": "my_env;test_environment;prod"},
+		},
+		{
+			"key-value-with-env-var-in-string-map",
+			[]byte(`env: my_env;$DEV_ENV;prod`),
+			Labels{"env": "my_env;test_environment;prod"},
+		},
+		{
+			"simple-key-list",
+			[]byte(`- noenv`),
+			Labels{"noenv": ""},
+		},
+		{
+			"key-with-no-value-list",
+			[]byte(`- noenv=`),
+			Labels{"noenv": ""},
+		},
+		{
+			"key-with-no-value-map",
+			[]byte(`noenv:`),
+			Labels{"noenv": ""},
+		},
+		{
+			"key-with-env-var-not-defined-list",
+			[]byte(`- noenv=$UNDEFINED`),
+			Labels{"noenv": ""},
+		},
+		{
+			"key-with-env-var-not-defined-map",
+			[]byte(`noenv: $UNDEFINED`),
+			Labels{"noenv": ""},
+		},
+		{
+			"just-env-var-list",
+			[]byte(`- $DEV_ENV`),
+			Labels{"test_environment": ""},
+		},
+		{
+			"just-env-var-undefined-list",
+			[]byte(`- $UNDEFINED`),
+			Labels{"": ""},
+		},
+		{
+			"local_env_expanded-list",
+			[]byte(`- OKTETO_TEST_ENV_MARSHALLING`),
+			Labels{"OKTETO_TEST_ENV_MARSHALLING": "true"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := make(Labels)
+			if err := os.Setenv("DEV_ENV", "test_environment"); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.Setenv("OKTETO_TEST_ENV_MARSHALLING", "true"); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := yaml.UnmarshalStrict(tt.data, &result); err != nil {
+				t.Fatal(err)
+			}
+
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("didn't unmarshal correctly. Actual %+v, Expected %+v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestAnnotationsUnmashalling(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		expected Annotations
+	}{
+		{
+			"key-value-list",
+			[]byte(`- env=production`),
+			Annotations{"env": "production"},
+		},
+		{
+			"key-value-map",
+			[]byte(`env: production`),
+			Annotations{"env": "production"},
+		},
+		{
+			"key-value-complex-list",
+			[]byte(`- env='production=11231231asa#$˜GADAFA'`),
+			Annotations{"env": "'production=11231231asa#$˜GADAFA'"},
+		},
+		{
+			"key-value-with-env-var-list",
+			[]byte(`- env=$DEV_ENV`),
+			Annotations{"env": "test_environment"},
+		},
+		{
+			"key-value-with-env-var-map",
+			[]byte(`env: $DEV_ENV`),
+			Annotations{"env": "test_environment"},
+		},
+		{
+			"key-value-with-env-var-in-string-list",
+			[]byte(`- env=my_env;$DEV_ENV;prod`),
+			Annotations{"env": "my_env;test_environment;prod"},
+		},
+		{
+			"key-value-with-env-var-in-string-map",
+			[]byte(`env: my_env;$DEV_ENV;prod`),
+			Annotations{"env": "my_env;test_environment;prod"},
+		},
+		{
+			"simple-key-list",
+			[]byte(`- noenv`),
+			Annotations{"noenv": ""},
+		},
+		{
+			"key-with-no-value-list",
+			[]byte(`- noenv=`),
+			Annotations{"noenv": ""},
+		},
+		{
+			"key-with-no-value-map",
+			[]byte(`noenv:`),
+			Annotations{"noenv": ""},
+		},
+		{
+			"key-with-env-var-not-defined-list",
+			[]byte(`- noenv=$UNDEFINED`),
+			Annotations{"noenv": ""},
+		},
+		{
+			"key-with-env-var-not-defined-map",
+			[]byte(`noenv: $UNDEFINED`),
+			Annotations{"noenv": ""},
+		},
+		{
+			"just-env-var-list",
+			[]byte(`- $DEV_ENV`),
+			Annotations{"test_environment": ""},
+		},
+		{
+			"just-env-var-undefined-list",
+			[]byte(`- $UNDEFINED`),
+			Annotations{"": ""},
+		},
+		{
+			"local_env_expanded-list",
+			[]byte(`- OKTETO_TEST_ENV_MARSHALLING`),
+			Annotations{"OKTETO_TEST_ENV_MARSHALLING": "true"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := make(Annotations)
+			if err := os.Setenv("DEV_ENV", "test_environment"); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.Setenv("OKTETO_TEST_ENV_MARSHALLING", "true"); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := yaml.UnmarshalStrict(tt.data, &result); err != nil {
+				t.Fatal(err)
+			}
+
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("didn't unmarshal correctly. Actual %+v, Expected %+v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestEnvFileUnmashalling(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		expected EnvFiles
+	}{
+		{
+			"single value",
+			[]byte(`.env`),
+			EnvFiles{".env"},
+		},
+		{
+			"env files list",
+			[]byte("\n  - .env\n  - .env2"),
+			EnvFiles{".env", ".env2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := make(EnvFiles, 0)
+
+			if err := yaml.UnmarshalStrict(tt.data, &result); err != nil {
+				t.Fatal(err)
+			}
+
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("didn't unmarshal correctly. Actual %+v, Expected %+v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDurationUnmashalling(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		expected Duration
+	}{
+		{
+			name:     "No units",
+			data:     []byte(`10`),
+			expected: Duration(10 * time.Second),
+		},
+		{
+			name:     "Only one unit",
+			data:     []byte(`10s`),
+			expected: Duration(10 * time.Second),
+		},
+		{
+			name:     "Complex units",
+			data:     []byte(`1m10s`),
+			expected: Duration(70 * time.Second),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := Duration(0)
+
+			if err := yaml.UnmarshalStrict(tt.data, &result); err != nil {
+				t.Fatal(err)
+			}
+
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("didn't unmarshal correctly. Actual %+v, Expected %+v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestTimeoutUnmashalling(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		expected Timeout
+	}{
+		{
+			name:     "Direct default",
+			data:     []byte(`10`),
+			expected: Timeout{Default: 10 * time.Second},
+		},
+		{
+			name: "only default ",
+			data: []byte(`
+default: 30s
+`),
+			expected: Timeout{Default: 30 * time.Second},
+		},
+		{
+			name: "only resources",
+			data: []byte(`
+resources: 30s
+`),
+			expected: Timeout{Resources: 30 * time.Second},
+		},
+		{
+			name: "both set",
+			data: []byte(`
+default: 10s
+resources: 30s
+`),
+			expected: Timeout{Default: 10 * time.Second, Resources: 30 * time.Second},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := Timeout{}
+
+			if err := yaml.UnmarshalStrict(tt.data, &result); err != nil {
+				t.Fatal(err)
+			}
+
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("didn't unmarshal correctly. Actual %+v, Expected %+v", result, tt.expected)
+			}
 		})
 	}
 }

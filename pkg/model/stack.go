@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,11 +17,11 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/log"
 	yaml "gopkg.in/yaml.v2"
 	apiv1 "k8s.io/api/core/v1"
@@ -32,39 +32,45 @@ var (
 	errBadStackName = "must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character"
 )
 
-//Stack represents an okteto stack
+// Stack represents an okteto stack
 type Stack struct {
-	Manifest  []byte              `yaml:"-"`
-	Warnings  []string            `yaml:"-"`
-	IsCompose bool                `yaml:"-"`
-	Name      string              `yaml:"name"`
-	Namespace string              `yaml:"namespace,omitempty"`
-	Services  map[string]*Service `yaml:"services,omitempty"`
-	Endpoints map[string]Endpoint `yaml:"endpoints,omitempty"`
+	Manifest  []byte                 `yaml:"-"`
+	Warnings  StackWarnings          `yaml:"-"`
+	IsCompose bool                   `yaml:"-"`
+	Name      string                 `yaml:"name"`
+	Volumes   map[string]*VolumeSpec `yaml:"volumes,omitempty"`
+	Namespace string                 `yaml:"namespace,omitempty"`
+	Services  map[string]*Service    `yaml:"services,omitempty"`
+	Endpoints EndpointSpec           `yaml:"endpoints,omitempty"`
 }
 
-//Service represents an okteto stack service
+// Service represents an okteto stack service
 type Service struct {
 	Build      *BuildInfo         `yaml:"build,omitempty"`
 	CapAdd     []apiv1.Capability `yaml:"cap_add,omitempty"`
 	CapDrop    []apiv1.Capability `yaml:"cap_drop,omitempty"`
 	Entrypoint Entrypoint         `yaml:"entrypoint,omitempty"`
 	Command    Command            `yaml:"command,omitempty"`
-	EnvFiles   []string           `yaml:"env_file,omitempty"`
+	EnvFiles   EnvFiles           `yaml:"env_file,omitempty"`
+	DependsOn  DependsOn          `yaml:"depends_on,omitempty"`
 
-	Environment     []EnvVar          `yaml:"environment,omitempty"`
-	Expose          []int32           `yaml:"expose,omitempty"`
-	Image           string            `yaml:"image,omitempty"`
-	Labels          map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
-	Annotations     map[string]string `json:"annotations,omitempty" yaml:"annotations,omitempty"`
-	Ports           []Port            `yaml:"ports,omitempty"`
-	StopGracePeriod int64             `yaml:"stop_grace_period,omitempty"`
-	Volumes         []StackVolume     `yaml:"volumes,omitempty"`
-	WorkingDir      string            `yaml:"working_dir,omitempty"`
+	Environment     Environment         `yaml:"environment,omitempty"`
+	Image           string              `yaml:"image,omitempty"`
+	Labels          Labels              `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Annotations     Annotations         `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	Ports           []Port              `yaml:"ports,omitempty"`
+	RestartPolicy   apiv1.RestartPolicy `yaml:"restart,omitempty"`
+	StopGracePeriod int64               `yaml:"stop_grace_period,omitempty"`
+	Volumes         []StackVolume       `yaml:"volumes,omitempty"`
+	Workdir         string              `yaml:"workdir,omitempty"`
+	BackOffLimit    int32               `yaml:"max_attempts,omitempty"`
+	Healtcheck      *HealthCheck        `yaml:"healthcheck,omitempty"`
 
 	Public    bool            `yaml:"public,omitempty"`
 	Replicas  int32           `yaml:"replicas,omitempty"`
 	Resources *StackResources `yaml:"resources,omitempty"`
+
+	VolumeMounts []StackVolume `yaml:"-"`
 }
 
 type StackVolume struct {
@@ -72,44 +78,79 @@ type StackVolume struct {
 	RemotePath string
 }
 
+type VolumeSpec struct {
+	Labels      Labels      `yaml:"labels,omitempty"`
+	Annotations Annotations `yaml:"annotations,omitempty"`
+	Size        Quantity    `json:"size,omitempty" yaml:"size,omitempty"`
+	Class       string      `json:"class,omitempty" yaml:"class,omitempty"`
+}
 type Envs struct {
-	List []EnvVar
+	List Environment
+}
+type HealthCheck struct {
+	HTTP        *HTTPHealtcheck `yaml:"http,omitempty"`
+	Test        HealtcheckTest  `yaml:"test,omitempty"`
+	Interval    time.Duration   `yaml:"interval,omitempty"`
+	Timeout     time.Duration   `yaml:"timeout,omitempty"`
+	Retries     int             `yaml:"retries,omitempty"`
+	StartPeriod time.Duration   `yaml:"start_period,omitempty"`
+	Disable     bool            `yaml:"disable,omitempty"`
 }
 
-//StackResources represents an okteto stack resources
+type HTTPHealtcheck struct {
+	Path string `yaml:"path,omitempty"`
+	Port int32  `yaml:"port,omitempty"`
+}
+
+type HealtcheckTest []string
+
+// StackResources represents an okteto stack resources
 type StackResources struct {
 	Limits   ServiceResources `json:"limits,omitempty" yaml:"limits,omitempty"`
 	Requests ServiceResources `json:"requests,omitempty" yaml:"requests,omitempty"`
 }
 
-//ServiceResources represents an okteto stack service resources
+// ServiceResources represents an okteto stack service resources
 type ServiceResources struct {
 	CPU     Quantity        `json:"cpu,omitempty" yaml:"cpu,omitempty"`
 	Memory  Quantity        `json:"memory,omitempty" yaml:"memory,omitempty"`
 	Storage StorageResource `json:"storage,omitempty" yaml:"storage,omitempty"`
 }
 
-//StorageResource represents an okteto stack service storage resource
+// StorageResource represents an okteto stack service storage resource
 type StorageResource struct {
 	Size  Quantity `json:"size,omitempty" yaml:"size,omitempty"`
 	Class string   `json:"class,omitempty" yaml:"class,omitempty"`
 }
 
-//Quantity represents an okteto stack service storage resource
+// Quantity represents an okteto stack service storage resource
 type Quantity struct {
 	Value resource.Quantity
 }
 
 type Port struct {
-	Port     int32
-	Protocol apiv1.Protocol
+	HostPort      int32
+	ContainerPort int32
+	Protocol      apiv1.Protocol
 }
 
-//Endpoints represents an okteto stack ingress
+type EndpointSpec map[string]Endpoint
+
+// Endpoints represents an okteto stack ingress
 type Endpoint struct {
-	Labels      map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
-	Annotations map[string]string `json:"annotations,omitempty" yaml:"annotations,omitempty"`
-	Rules       []EndpointRule    `yaml:"rules,omitempty"`
+	Labels      Labels         `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Annotations Annotations    `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	Rules       []EndpointRule `yaml:"rules,omitempty"`
+}
+
+// CommandStack represents an okteto stack command
+type CommandStack struct {
+	Values []string
+}
+
+// ArgsStack represents an okteto stack args
+type ArgsStack struct {
+	Values []string
 }
 
 // EndpointRule represents an okteto ingress rule
@@ -119,7 +160,28 @@ type EndpointRule struct {
 	Port    int32  `yaml:"port,omitempty"`
 }
 
-//GetStack returns an okteto stack object from a given file
+type StackWarnings struct {
+	NotSupportedFields  []string          `yaml:"-"`
+	SanitizedServices   map[string]string `yaml:"-"`
+	VolumeMountWarnings []string          `yaml:"-"`
+}
+type DependsOn map[string]DependsOnConditionSpec
+
+type DependsOnConditionSpec struct {
+	Condition DependsOnCondition `json:"condition,omitempty" yaml:"condition,omitempty"`
+}
+
+type DependsOnCondition string
+
+const (
+	DependsOnServiceHealthy DependsOnCondition = "service_healthy"
+
+	DependsOnServiceRunning DependsOnCondition = "service_started"
+
+	DependsOnServiceCompleted DependsOnCondition = "service_completed_successfully"
+)
+
+// GetStack returns an okteto stack object from a given file
 func GetStack(name, stackPath string, isCompose bool) (*Stack, error) {
 	b, err := ioutil.ReadFile(stackPath)
 	if err != nil {
@@ -131,14 +193,14 @@ func GetStack(name, stackPath string, isCompose bool) (*Stack, error) {
 		return nil, err
 	}
 
-	if name != "" {
-		s.Name = name
+	s.Name, err = getStackName(name, stackPath, s.Name)
+	if err != nil {
+		return nil, err
 	}
-	if s.Name == "" {
-		s.Name, err = GetValidNameFromFolder(filepath.Dir(stackPath))
-		if err != nil {
-			return nil, err
-		}
+
+	if endpoint, ok := s.Endpoints[""]; ok {
+		s.Endpoints[s.Name] = endpoint
+		delete(s.Endpoints, "")
 	}
 
 	if err := s.validate(); err != nil {
@@ -151,19 +213,38 @@ func GetStack(name, stackPath string, isCompose bool) (*Stack, error) {
 	}
 
 	for _, svc := range s.Services {
-		svc.extendPorts()
-		svc.IgnoreSyncVolumes()
 		if svc.Build == nil {
 			continue
 		}
-		svc.Build.Context = loadAbsPath(stackDir, svc.Build.Context)
-		svc.Build.Dockerfile = loadAbsPath(stackDir, svc.Build.Dockerfile)
 
+		if uri, err := url.ParseRequestURI(svc.Build.Context); err == nil || (uri != nil && (uri.Scheme != "" || uri.Host != "")) {
+			svc.Build.Dockerfile = ""
+		} else {
+			svc.Build.Context = loadAbsPath(stackDir, svc.Build.Context)
+			svc.Build.Dockerfile = loadAbsPath(stackDir, svc.Build.Dockerfile)
+		}
 	}
 	return s, nil
 }
 
-//ReadStack reads an okteto stack
+func getStackName(name, stackPath, actualStackName string) (string, error) {
+	if name != "" {
+		return name, nil
+	}
+	if actualStackName == "" {
+		name, err := GetValidNameFromGitRepo(filepath.Dir(stackPath))
+		if err != nil {
+			name, err = GetValidNameFromFolder(filepath.Dir(stackPath))
+			if err != nil {
+				return "", err
+			}
+		}
+		return name, nil
+	}
+	return actualStackName, nil
+}
+
+// ReadStack reads an okteto stack
 func ReadStack(bytes []byte, isCompose bool) (*Stack, error) {
 	s := &Stack{
 		Manifest:  bytes,
@@ -181,7 +262,7 @@ func ReadStack(bytes []byte, isCompose bool) (*Stack, error) {
 				_, _ = sb.WriteString(fmt.Sprintf("    - %s\n", e))
 			}
 
-			_, _ = sb.WriteString("    See https://okteto.com/docs/reference/stacks for details")
+			_, _ = sb.WriteString("    See https://okteto.com/docs/reference/stacks/ for details")
 			return nil, errors.New(sb.String())
 		}
 
@@ -189,7 +270,7 @@ func ReadStack(bytes []byte, isCompose bool) (*Stack, error) {
 		msg = strings.TrimSuffix(msg, "in type model.Stack")
 		return nil, errors.New(msg)
 	}
-	for _, svc := range s.Services {
+	for svcName, svc := range s.Services {
 		if svc.Build != nil {
 			if svc.Build.Name != "" {
 				svc.Build.Context = svc.Build.Name
@@ -201,38 +282,37 @@ func ReadStack(bytes []byte, isCompose bool) (*Stack, error) {
 			svc.Resources.Requests.Storage.Size.Value = resource.MustParse("1Gi")
 		}
 
-		if svc.Replicas == 0 {
-			svc.Replicas = 1
-		}
+		if svc.IsJob() {
+			for idx, volume := range svc.Volumes {
+				volumeName := fmt.Sprintf("pvc-%s-0", svcName)
+				if volume.LocalPath == "" {
+					volume.LocalPath = volumeName
+					s.Volumes[volumeName] = &VolumeSpec{Size: svc.Resources.Requests.Storage.Size}
+				}
+				svc.Volumes[idx] = volume
 
-		if len(svc.Expose) > 0 && len(svc.Ports) == 0 {
-			svc.Public = false
+			}
 		}
-
-		if len(svc.Expose) > 0 {
-			svc.extendPorts()
+	}
+	for _, volume := range s.Volumes {
+		if volume.Size.Value.Cmp(resource.MustParse("0")) == 0 {
+			volume.Size.Value = resource.MustParse("1Gi")
 		}
-
 	}
 	return s, nil
 }
 
-func (svc *Service) IgnoreSyncVolumes() {
+func (svc *Service) IgnoreSyncVolumes(s *Stack) {
 	notIgnoredVolumes := make([]StackVolume, 0)
-	for _, volume := range svc.Volumes {
-		if volume.LocalPath == "" {
+	for _, volume := range svc.VolumeMounts {
+		if !strings.HasPrefix(volume.LocalPath, "/") {
 			notIgnoredVolumes = append(notIgnoredVolumes, volume)
 		}
 	}
-	svc.Volumes = notIgnoredVolumes
+	svc.VolumeMounts = notIgnoredVolumes
 }
 
 func (s *Stack) validate() error {
-	if len(s.Warnings) > 0 {
-		notSupportedFields := strings.Join(GroupWarningsBySvc(s.Warnings), "\n  - ")
-		log.Warning("The following fields are not supported in this version and will be omitted: \n  - %s", notSupportedFields)
-		log.Yellow("Help us to decide which fields should okteto implement next by filing an issue in https://github.com/okteto/okteto/issues/new")
-	}
 	if err := validateStackName(s.Name); err != nil {
 		return fmt.Errorf("Invalid stack name: %s", err)
 	}
@@ -242,10 +322,10 @@ func (s *Stack) validate() error {
 
 	for endpointName, endpoint := range s.Endpoints {
 		for _, endpointRule := range endpoint.Rules {
-			if service, ok := s.Services[endpointRule.Service]; !ok {
-				return fmt.Errorf("Invalid endpoint '%s': service '%s' does not exist.", endpointName, endpointRule.Service)
-			} else if !IsPortInService(endpointRule.Port, service.Ports) {
-				return fmt.Errorf("Invalid endpoint '%s': service '%s' does not have port '%d'.", endpointName, endpointRule.Service, endpointRule.Port)
+			if service, ok := s.Services[endpointRule.Service]; ok {
+				if !IsPortInService(endpointRule.Port, service.Ports) {
+					return fmt.Errorf("Invalid endpoint '%s': service '%s' does not have port '%d'.", endpointName, endpointRule.Service, endpointRule.Port)
+				}
 			}
 		}
 	}
@@ -259,26 +339,18 @@ func (s *Stack) validate() error {
 			return fmt.Errorf(fmt.Sprintf("Invalid service '%s': image cannot be empty", name))
 		}
 
-		for _, v := range svc.Volumes {
-			if v.LocalPath != "" {
-				log.Warning("[%s]: volume '%s:%s' will be ignored. You can synchronize code to your containers using 'okteto up'. More information available here: https://okteto.com/docs/reference/cli/index.html#up", name, v.LocalPath, v.RemotePath)
+		for _, v := range svc.VolumeMounts {
+			if strings.HasPrefix(v.LocalPath, "/") {
+				s.Warnings.VolumeMountWarnings = append(s.Warnings.VolumeMountWarnings, fmt.Sprintf("[%s]: volume '%s:%s' will be ignored. You can synchronize code to your containers using 'okteto up'. More information available here: https://okteto.com/docs/reference/cli/#up", name, v.LocalPath, v.RemotePath))
 			}
 			if !strings.HasPrefix(v.RemotePath, "/") {
-				return fmt.Errorf(fmt.Sprintf("Invalid volume '%s' in service '%s': must be an absolute path", v, name))
+				return fmt.Errorf(fmt.Sprintf("Invalid volume '%s' in service '%s': must be an absolute path", v.ToString(), name))
 			}
 		}
+		svc.IgnoreSyncVolumes(s)
 	}
 
 	return nil
-}
-
-func IsPortInService(port int32, portList []Port) bool {
-	for _, p := range portList {
-		if p.Port == port {
-			return true
-		}
-	}
-	return false
 }
 
 func validateStackName(name string) error {
@@ -308,35 +380,50 @@ func (s *Stack) UpdateNamespace(namespace string) error {
 
 //GetLabelSelector returns the label selector for the stack name
 func (s *Stack) GetLabelSelector() string {
-	return fmt.Sprintf("%s=%s", labels.StackNameLabel, s.Name)
+	return fmt.Sprintf("%s=%s", StackNameLabel, s.Name)
 }
 
 //GetLabelSelector returns the label selector for the stack name
-func (s *Stack) GetConfigMapName() string {
-	return fmt.Sprintf("okteto-%s", s.Name)
+func GetStackConfigMapName(stackName string) string {
+	return fmt.Sprintf("okteto-%s", stackName)
+}
+
+func IsPortInService(port int32, ports []Port) bool {
+	for _, p := range ports {
+		if p.ContainerPort == port {
+			return true
+		}
+	}
+	return false
 }
 
 //SetLastBuiltAnnotation sets the dev timestamp
 func (svc *Service) SetLastBuiltAnnotation() {
 	if svc.Annotations == nil {
-		svc.Annotations = map[string]string{}
+		svc.Annotations = Annotations{}
 	}
-	svc.Annotations[labels.LastBuiltAnnotation] = time.Now().UTC().Format(labels.TimeFormat)
-}
-
-//extendPorts adds the ports that are in expose field to the port list.
-func (svc *Service) extendPorts() {
-	for _, port := range svc.Expose {
-		if !svc.isAlreadyAdded(port) {
-			svc.Ports = append(svc.Ports, Port{Port: port, Protocol: apiv1.ProtocolTCP})
-		}
-	}
+	svc.Annotations[LastBuiltAnnotation] = time.Now().UTC().Format(TimeFormat)
 }
 
 //isAlreadyAdded checks if a port is already on port list
-func (svc *Service) isAlreadyAdded(p int32) bool {
-	for _, port := range svc.Ports {
-		if port.Port == p {
+func IsAlreadyAdded(p Port, ports []Port) bool {
+	for _, port := range ports {
+		if port.ContainerPort == p.ContainerPort {
+			log.Infof("Port '%d:%d' is already declared on port '%d:%d'", p.HostPort, p.HostPort, port.HostPort, port.ContainerPort)
+			return true
+		}
+	}
+	return false
+}
+
+func IsAlreadyAddedExpose(p Port, ports []Port) bool {
+	for _, port := range ports {
+		if p.HostPort == 0 && (port.ContainerPort == p.ContainerPort || port.HostPort == p.ContainerPort) {
+			log.Infof("Expose port '%d:%d' is already declared on port '%d:%d'", p.HostPort, p.HostPort, port.HostPort, port.ContainerPort)
+			return true
+
+		} else if p.HostPort != 0 && (port.ContainerPort == p.ContainerPort || port.ContainerPort == p.HostPort || port.HostPort == p.HostPort || port.HostPort == p.ContainerPort) {
+			log.Infof("Expose port '%d:%d' is already declared on port '%d:%d'", p.HostPort, p.HostPort, port.HostPort, port.ContainerPort)
 			return true
 		}
 	}
@@ -372,4 +459,19 @@ func GroupWarningsBySvc(fields []string) []string {
 		result = append(result, fmt.Sprintf(f, names))
 	}
 	return result
+}
+
+func isInVolumesTopLevelSection(volumeName string, s *Stack) bool {
+	_, ok := s.Volumes[volumeName]
+	return ok
+}
+
+func (svc *Service) IsDeployment() bool {
+	return len(svc.Volumes) == 0 && (svc.RestartPolicy == apiv1.RestartPolicyAlways || (svc.RestartPolicy == apiv1.RestartPolicyOnFailure && svc.BackOffLimit == 0))
+}
+func (svc *Service) IsStatefulset() bool {
+	return len(svc.Volumes) != 0 && (svc.RestartPolicy == apiv1.RestartPolicyAlways || (svc.RestartPolicy == apiv1.RestartPolicyOnFailure && svc.BackOffLimit == 0))
+}
+func (svc *Service) IsJob() bool {
+	return svc.RestartPolicy == apiv1.RestartPolicyNever || (svc.RestartPolicy == apiv1.RestartPolicyOnFailure && svc.BackOffLimit != 0)
 }

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -42,12 +42,12 @@ var (
 	localClusters  = []string{"127.", "172.", "192.", "169.", model.Localhost, "::1", "fe80::", "fc00::"}
 )
 
-//GetLocal returns a kubernetes client with the local configuration. It will detect if KUBECONFIG is defined.
+// GetLocal returns a kubernetes client with the local configuration. It will detect if KUBECONFIG is defined.
 func GetLocal() (*kubernetes.Clientset, *rest.Config, error) {
 	return GetLocalWithContext(os.Getenv(OktetoContextVariableName))
 }
 
-//GetLocalWithContext returns a kubernetes client for a given context. It will detect if KUBECONFIG is defined.
+// GetLocalWithContext returns a kubernetes client for a given context. It will detect if KUBECONFIG is defined.
 func GetLocalWithContext(thisContext string) (*kubernetes.Clientset, *rest.Config, error) {
 	thisContext = GetSessionContext(thisContext)
 	clientConfig := getClientConfig(thisContext)
@@ -78,7 +78,7 @@ func getClientConfig(k8sContext string) clientcmd.ClientConfig {
 	)
 }
 
-//GetSessionContext sets the client config for the context in use
+// GetSessionContext sets the client config for the context in use
 func GetSessionContext(k8sContext string) string {
 	if k8sContext != "" {
 		return k8sContext
@@ -95,7 +95,7 @@ func GetSessionContext(k8sContext string) string {
 	return sessionContext
 }
 
-//GetContextNamespace returns the name of the namespace in use by a given context
+// GetContextNamespace returns the name of the namespace in use by a given context
 func GetContextNamespace(k8sContext string) string {
 	if k8sContext == "" {
 		k8sContext = os.Getenv(OktetoContextVariableName)
@@ -107,7 +107,7 @@ func GetContextNamespace(k8sContext string) string {
 	return namespace
 }
 
-//Reset cleans the cached client
+// Reset cleans the cached client
 func Reset() {
 	sessionContext = ""
 }

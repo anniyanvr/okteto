@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
+	"strings"
 
 	"github.com/okteto/okteto/pkg/analytics"
 	okErrors "github.com/okteto/okteto/pkg/errors"
@@ -35,11 +35,7 @@ func Run(ctx context.Context, namespace, buildKitHost string, isOktetoCluster bo
 		return err
 	}
 
-	if dockerFile == "" {
-		dockerFile = filepath.Join(path, "Dockerfile")
-	}
-
-	if buildKitHost == okteto.CloudBuildKitURL {
+	if buildKitHost == okteto.CloudBuildKitURL && dockerFile != "" {
 		dockerFile, err = registry.GetDockerfile(path, dockerFile)
 		if err != nil {
 			return err
@@ -47,6 +43,12 @@ func Run(ctx context.Context, namespace, buildKitHost string, isOktetoCluster bo
 		defer os.Remove(dockerFile)
 	}
 
+	if tag != "" {
+		err = validateImage(tag)
+		if err != nil {
+			return err
+		}
+	}
 	tag, err = registry.ExpandOktetoDevRegistry(ctx, namespace, tag)
 	if err != nil {
 		return err
@@ -63,27 +65,33 @@ func Run(ctx context.Context, namespace, buildKitHost string, isOktetoCluster bo
 	}
 
 	err = solveBuild(ctx, buildkitClient, opt, progress)
+	if err != nil {
+		log.Infof("Failed to build image: %s", err.Error())
+	}
 	if registry.IsTransientError(err) {
 		log.Yellow("Failed to push '%s' to the registry, retrying ...", tag)
 		success := true
 		err := solveBuild(ctx, buildkitClient, opt, progress)
 		if err != nil {
 			success = false
+			log.Infof("Failed to build image: %s", err.Error())
 		}
+		err = registry.GetErrorMessage(err, tag)
 		analytics.TrackBuildTransientError(buildKitHost, success)
 		return err
 	}
-	if err != nil {
-		imageRegistry, imageTag := registry.GetRegistryAndRepo(tag)
-		if registry.IsLoggedIntoRegistryButDontHavePermissions(err) {
-			err = okErrors.UserError{E: fmt.Errorf("You are not authorized to push image '%s'.", imageTag),
-				Hint: fmt.Sprintf("Please login into the registry '%s' with a user with push permissions to '%s' or use another image.", imageRegistry, imageTag)}
-		}
-		if registry.IsNotLoggedIntoRegistry(err) {
-			err = okErrors.UserError{E: fmt.Errorf("You are not authorized to push image '%s'.", imageTag),
-				Hint: fmt.Sprintf("Login into the registry '%s' and verify that you have permissions to push the image '%s'.", imageRegistry, imageTag)}
-		}
-	}
+
+	err = registry.GetErrorMessage(err, tag)
 
 	return err
+}
+
+func validateImage(imageTag string) error {
+	if strings.HasPrefix(imageTag, okteto.DevRegistry) && strings.Count(imageTag, "/") != 1 {
+		return okErrors.UserError{
+			E:    fmt.Errorf("Can not use '%s' as the image tag.", imageTag),
+			Hint: fmt.Sprintf("The syntax for using okteto registry is: '%s/image_name'", okteto.DevRegistry),
+		}
+	}
+	return nil
 }

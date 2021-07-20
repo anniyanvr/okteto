@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 package model
 
 import (
+	"reflect"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -74,11 +75,11 @@ services:
 	if s.Services["vote"].Build.Context != "vote" {
 		t.Errorf("'vote.build' was not parsed: %+v", s.Services["vote"].Build)
 	}
-	if len(s.Services["vote"].Entrypoint.Values) != 3 {
-		t.Errorf("'vote.entrypoint' was not parsed: %+v", s)
+	if len(s.Services["vote"].Entrypoint.Values) != 2 {
+		t.Errorf("'vote.entrypoint' was not parsed: %+v", s.Services["vote"].Entrypoint.Values)
 	}
-	if s.Services["vote"].Entrypoint.Values[0] != "sh" || s.Services["vote"].Entrypoint.Values[1] != "-c" || s.Services["vote"].Entrypoint.Values[2] != "python app.py" {
-		t.Errorf("'vote.entrypoint' was not parsed: %+v", s)
+	if s.Services["vote"].Entrypoint.Values[0] != "python" && s.Services["vote"].Entrypoint.Values[0] != "app.py" {
+		t.Errorf("'vote.entrypoint' was not parsed: %+v", s.Services["vote"].Entrypoint.Values)
 	}
 	if s.Services["vote"].Replicas != 2 {
 		t.Errorf("'vote.deploy.replicas' was not parsed: %+v", s)
@@ -86,16 +87,19 @@ services:
 	if len(s.Services["vote"].Environment) != 2 {
 		t.Errorf("'vote.env' was not parsed: %+v", s)
 	}
-	if s.Services["vote"].Environment[0].Name != "OPTION_A" || s.Services["vote"].Environment[0].Value != "Cats" {
-		t.Errorf("'vote.env[0]' was not parsed: %+v", s)
-	}
-	if s.Services["vote"].Environment[1].Name != "OPTION_B" || s.Services["vote"].Environment[1].Value != "Dogs" {
-		t.Errorf("'vote.env[1]' was not parsed: %+v", s)
+	for _, env := range s.Services["vote"].Environment {
+		if env.Name == "OPTION_A" && env.Value == "Cats" {
+			continue
+		} else if env.Name == "OPTION_B" && env.Value == "Dogs" {
+			continue
+		} else {
+			t.Errorf("'vote.env' was not parsed correctly: %+v", s.Services["vote"].Environment)
+		}
 	}
 	if len(s.Services["vote"].Ports) != 1 {
 		t.Errorf("'vote.ports' was not parsed: %+v", s)
 	}
-	if s.Services["vote"].Ports[0].Port != 80 {
+	if s.Services["vote"].Ports[0].ContainerPort != 80 {
 		t.Errorf("'vote.ports[0]' was not parsed: %+v", s)
 	}
 	if s.Services["vote"].StopGracePeriod != 5 {
@@ -175,6 +179,8 @@ services:
       cpu: 100m
       memory: 258Mi
       storage: 1Gi
+    labels:
+      - traeffick.routes=Path("/")
   db:
     image: postgres:9.4
     resources:
@@ -211,11 +217,11 @@ services:
 	if s.Services["vote"].Build.Context != "vote" {
 		t.Errorf("'vote.build' was not parsed: %+v", s.Services["vote"].Build)
 	}
-	if len(s.Services["vote"].Entrypoint.Values) != 3 {
-		t.Errorf("'vote.entrypoint' was not parsed: %+v", s)
+	if len(s.Services["vote"].Entrypoint.Values) != 2 {
+		t.Errorf("'vote.entrypoint' was not parsed: %+v", s.Services["vote"].Entrypoint.Values)
 	}
-	if s.Services["vote"].Entrypoint.Values[0] != "sh" || s.Services["vote"].Entrypoint.Values[1] != "-c" || s.Services["vote"].Entrypoint.Values[2] != "python app.py" {
-		t.Errorf("'vote.entrypoint' was not parsed: %+v", s)
+	if s.Services["vote"].Entrypoint.Values[0] != "python" && s.Services["vote"].Entrypoint.Values[0] != "app.py" {
+		t.Errorf("'vote.entrypoint' was not parsed: %+v", s.Services["vote"].Entrypoint.Values)
 	}
 	if s.Services["vote"].Replicas != 2 {
 		t.Errorf("'vote.deploy.replicas' was not parsed: %+v", s)
@@ -223,16 +229,19 @@ services:
 	if len(s.Services["vote"].Environment) != 2 {
 		t.Errorf("'vote.env' was not parsed: %+v", s)
 	}
-	if s.Services["vote"].Environment[0].Name != "OPTION_A" || s.Services["vote"].Environment[0].Value != "Cats" {
-		t.Errorf("'vote.env[0]' was not parsed: %+v", s)
-	}
-	if s.Services["vote"].Environment[1].Name != "OPTION_B" || s.Services["vote"].Environment[1].Value != "Dogs" {
-		t.Errorf("'vote.env[1]' was not parsed: %+v", s)
+	for _, env := range s.Services["vote"].Environment {
+		if env.Name == "OPTION_A" && env.Value == "Cats" {
+			continue
+		} else if env.Name == "OPTION_B" && env.Value == "Dogs" {
+			continue
+		} else {
+			t.Errorf("'vote.env' was not parsed correctly: %+v", s.Services["vote"].Environment)
+		}
 	}
 	if len(s.Services["vote"].Ports) != 1 {
 		t.Errorf("'vote.ports' was not parsed: %+v", s)
 	}
-	if s.Services["vote"].Ports[0].Port != 80 {
+	if s.Services["vote"].Ports[0].ContainerPort != 80 {
 		t.Errorf("'vote.ports[0]' was not parsed: %+v", s)
 	}
 	if s.Services["vote"].StopGracePeriod != 5 {
@@ -251,6 +260,17 @@ services:
 	storage := s.Services["vote"].Resources.Requests.Storage.Size.Value
 	if storage.Cmp(resource.MustParse("1Gi")) != 0 {
 		t.Errorf("'vote.resources.storage' was not parsed: %+v", s)
+	}
+	for key, value := range s.Services["vote"].Annotations {
+		if key == "traeffick.routes" && value == `Path("/")` {
+			continue
+		} else {
+			t.Errorf("'vote.annotations' was not parsed correctly: %+v", s.Services["vote"].Annotations)
+		}
+	}
+
+	if len(s.Services["vote"].Labels) > 0 {
+		t.Errorf("'vote.labels' has labels inside")
 	}
 	if _, ok := s.Services["db"]; !ok {
 		t.Errorf("'db' was not parsed: %+v", s)
@@ -364,22 +384,6 @@ func TestStack_validate(t *testing.T) {
 			},
 		},
 		{
-			name: "endpoint-of-undefined-service",
-			stack: &Stack{
-				Name: "name",
-				Endpoints: map[string]Endpoint{
-					"endpoint1": {
-						Rules: []EndpointRule{
-							{Service: "app"},
-						},
-					},
-				},
-				Services: map[string]*Service{
-					"name": {},
-				},
-			},
-		},
-		{
 			name: "endpoint-of-unexported-port",
 			stack: &Stack{
 				Name: "name",
@@ -392,10 +396,10 @@ func TestStack_validate(t *testing.T) {
 					},
 				},
 				Services: map[string]*Service{
-					"name": {Image: "test",
+					"app": {Image: "test",
 						Ports: []Port{
 							{
-								Port: 8080,
+								ContainerPort: 8080,
 							},
 						}},
 				},
@@ -428,6 +432,50 @@ func Test_validateStackName(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := validateStackName(tt.stackName); (err != nil) != tt.wantErr {
 				t.Errorf("Stack.validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestStack_readImageContext(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest []byte
+		expected *BuildInfo
+	}{
+		{
+			name: "context pointing to url",
+			manifest: []byte(`services:
+  test:
+    build:
+      context: https://github.com/okteto/okteto.git
+`),
+			expected: &BuildInfo{
+				Context: "https://github.com/okteto/okteto.git",
+			},
+		},
+		{
+			name: "context pointing to path",
+			manifest: []byte(`services:
+  test:
+    build:
+      context: .
+`),
+			expected: &BuildInfo{
+				Context:    ".",
+				Dockerfile: "Dockerfile",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stack, err := ReadStack(tt.manifest, true)
+			if err != nil {
+				t.Fatalf("Wrong unmarshalling: %s", err.Error())
+			}
+
+			if !reflect.DeepEqual(stack.Services["test"].Build, tt.expected) {
+				t.Fatalf("Expected %v but got %v", tt.expected, stack.Services["test"].Build)
 			}
 		})
 	}

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -92,6 +92,7 @@ type Syncthing struct {
 	LocalPort        int           `yaml:"-"`
 	Type             string        `yaml:"-"`
 	IgnoreDelete     bool          `yaml:"-"`
+	Verbose          bool          `yaml:"-"`
 	pid              int           `yaml:"-"`
 	RescanInterval   string        `yaml:"-"`
 	Compression      string        `yaml:"-"`
@@ -206,10 +207,11 @@ func New(dev *model.Dev) (*Syncthing, error) {
 		RemotePort:       remotePort,
 		Type:             "sendonly",
 		IgnoreDelete:     true,
+		Verbose:          dev.Sync.Verbose,
 		Folders:          []*Folder{},
 		RescanInterval:   strconv.Itoa(dev.Sync.RescanInterval),
 		Compression:      compression,
-		timeout:          dev.Timeout,
+		timeout:          time.Duration(dev.Timeout.Default),
 	}
 	index := 1
 	for _, sync := range dev.Sync.Folders {
@@ -284,9 +286,11 @@ func (s *Syncthing) Run(ctx context.Context) error {
 	cmdArgs := []string{
 		"-home", s.Home,
 		"-no-browser",
-		"-verbose",
 		"-logfile", s.LogPath,
 		"-log-max-old-files=0",
+	}
+	if s.Verbose {
+		cmdArgs = append(cmdArgs, "-verbose")
 	}
 
 	s.cmd = exec.Command(s.binPath, cmdArgs...) //nolint: gas, gosec
@@ -311,17 +315,17 @@ func (s *Syncthing) WaitForPing(ctx context.Context, local bool) error {
 	to := time.Now().Add(s.timeout)
 
 	log.Infof("waiting for syncthing local=%t to be ready", local)
-	for i := 0; ; i++ {
+	for retries := 0; ; retries++ {
 		select {
 		case <-ticker.C:
 			if s.Ping(ctx, local) {
 				return nil
 			}
-			if i%5 == 0 {
+			if retries%5 == 0 {
 				log.Infof("syncthing local=%t is not ready yet", local)
 			}
 
-			if time.Now().After(to) {
+			if time.Now().After(to) && retries > 10 {
 				return fmt.Errorf("syncthing local=%t didn't respond after %s", local, s.timeout.String())
 			}
 
@@ -377,7 +381,7 @@ func (s *Syncthing) WaitForConnected(ctx context.Context, dev *model.Dev) error 
 	ticker := time.NewTicker(100 * time.Millisecond)
 	log.Info("waiting for remote device to be connected")
 	to := time.Now().Add(s.timeout)
-	for i := 0; ; i++ {
+	for retries := 0; ; retries++ {
 		connections := &Connections{}
 		body, err := s.APICall(ctx, "rest/system/connections", "GET", 200, nil, true, nil, true, 3)
 		if err != nil {
@@ -399,8 +403,9 @@ func (s *Syncthing) WaitForConnected(ctx context.Context, dev *model.Dev) error 
 			}
 		}
 
-		if time.Now().After(to) {
-			return fmt.Errorf("remote syncthing connection not completed after %s, please try again", s.timeout.String())
+		if time.Now().After(to) && retries > 10 {
+			log.Infof("remote syncthing connection not completed after %s, please try again", s.timeout.String())
+			return errors.ErrLostSyncthing
 		}
 
 		select {
@@ -429,23 +434,24 @@ func (s *Syncthing) waitForFolderScanning(ctx context.Context, folder *Folder, l
 
 	to := time.Now().Add(s.timeout * 10) // 5 minutes
 
-	for i := 0; ; i++ {
+	for retries := 0; ; retries++ {
 		status, err := s.GetStatus(ctx, folder, local)
 		if err != nil && err != errors.ErrBusySyncthing {
-			return errors.ErrUnknownSyncError
+			return err
 		}
 
 		if status != nil {
-			if i%100 == 0 {
+			if retries%100 == 0 {
 				// one log every 10 seconds
 				log.Infof("syncthing folder local=%t is '%s'", local, status.State)
 			}
 			if status.State != "scanning" && status.State != "scan-waiting" {
+				log.Infof("syncthing folder local=%t finished scanning: '%s'", local, status.State)
 				return nil
 			}
 		}
 
-		if time.Now().After(to) {
+		if time.Now().After(to) && retries > 10 {
 			return fmt.Errorf("initial file scan not completed after %s, please try again", s.timeout.String())
 		}
 
@@ -651,7 +657,7 @@ func (s *Syncthing) HardTerminate() error {
 		if name == "" && runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 			pr, err := gops.FindProcess(int(p.Pid))
 			if err != nil {
-				log.Infof("error getting process  %d: %s", p.Pid, err.Error())
+				log.Infof("error getting process %d: %s", p.Pid, err.Error())
 				continue
 			}
 
@@ -664,6 +670,7 @@ func (s *Syncthing) HardTerminate() error {
 		}
 
 		if name == "" {
+			log.Infof("ignoring pid %d with no name: %v", p.Pid, p)
 			continue
 		}
 
@@ -676,6 +683,7 @@ func (s *Syncthing) HardTerminate() error {
 			return err
 		}
 
+		log.Infof("checking syncthing home '%s' with command '%s'", s.Home, cmdline)
 		if !strings.Contains(cmdline, fmt.Sprintf("-home %s", s.Home)) {
 			continue
 		}

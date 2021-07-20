@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,15 +14,18 @@
 package utils
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
 	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/k8s/client"
 	"github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
 )
 
 const (
@@ -176,4 +179,48 @@ func CheckIfRegularFile(path string) error {
 		return nil
 	}
 	return fmt.Errorf("'%s' is not a regular file", path)
+}
+
+//LoadEnvironment taking into account .env files and Okteto Secrets
+func LoadEnvironment(ctx context.Context, getSecrets bool) error {
+	if model.FileExists(".env") {
+		err := godotenv.Load()
+		if err != nil {
+			log.Errorf("error loading .env file: %s", err.Error())
+		}
+	}
+
+	if okteto.GetUsername() != "" {
+		os.Setenv("OKTETO_USERNAME", okteto.GetUsername())
+	}
+
+	if !getSecrets {
+		return nil
+	}
+
+	currentContext := client.GetSessionContext("")
+	if okteto.GetClusterContext() == currentContext {
+		secrets, err := okteto.GetSecrets(ctx)
+		if err != nil {
+			return fmt.Errorf("error loading Okteto Secrets: %s", err.Error())
+		}
+
+		currentEnv := map[string]bool{}
+		rawEnv := os.Environ()
+		for _, rawEnvLine := range rawEnv {
+			key := strings.Split(rawEnvLine, "=")[0]
+			currentEnv[key] = true
+		}
+
+		for _, secret := range secrets {
+			if strings.HasPrefix(secret.Name, "github.") {
+				continue
+			}
+			if !currentEnv[secret.Name] {
+				os.Setenv(secret.Name, secret.Value)
+			}
+		}
+	}
+
+	return nil
 }

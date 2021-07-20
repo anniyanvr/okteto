@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,8 +26,8 @@ import (
 	"github.com/okteto/okteto/pkg/k8s/client"
 	"github.com/okteto/okteto/pkg/k8s/configmaps"
 	"github.com/okteto/okteto/pkg/k8s/deployments"
-	"github.com/okteto/okteto/pkg/k8s/ingress"
-	okLabels "github.com/okteto/okteto/pkg/k8s/labels"
+	"github.com/okteto/okteto/pkg/k8s/ingresses"
+	"github.com/okteto/okteto/pkg/k8s/jobs"
 	"github.com/okteto/okteto/pkg/k8s/pods"
 	"github.com/okteto/okteto/pkg/k8s/services"
 	"github.com/okteto/okteto/pkg/k8s/statefulsets"
@@ -38,7 +39,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-//Destroy destroys a stack
+// Destroy destroys a stack
 func Destroy(ctx context.Context, s *model.Stack, removeVolumes bool, timeout time.Duration) error {
 	if s.Namespace == "" {
 		s.Namespace = client.GetContextNamespace("")
@@ -78,6 +79,7 @@ func destroy(ctx context.Context, s *model.Stack, removeVolumes bool, c *kuberne
 	}
 
 	s.Services = nil
+	s.Endpoints = nil
 	if err := destroyServicesNotInStack(ctx, spinner, s, c); err != nil {
 		return err
 	}
@@ -94,7 +96,7 @@ func destroy(ctx context.Context, s *model.Stack, removeVolumes bool, c *kuberne
 		}
 	}
 
-	return configmaps.Destroy(ctx, s.GetConfigMapName(), s.Namespace, c)
+	return configmaps.Destroy(ctx, model.GetStackConfigMapName(s.Name), s.Namespace, c)
 }
 
 func helmReleaseExist(c *action.List, name string) (bool, error) {
@@ -138,6 +140,27 @@ func destroyHelmRelease(ctx context.Context, spinner *utils.Spinner, s *model.St
 }
 
 func destroyServicesNotInStack(ctx context.Context, spinner *utils.Spinner, s *model.Stack, c *kubernetes.Clientset) error {
+	if err := destroyDeployments(ctx, spinner, s, c); err != nil {
+		return err
+	}
+
+	if err := destroyStatefulsets(ctx, spinner, s, c); err != nil {
+		return err
+	}
+
+	if err := destroyJobs(ctx, spinner, s, c); err != nil {
+		return err
+	}
+
+	err := destroyIngresses(ctx, spinner, s, c)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func destroyDeployments(ctx context.Context, spinner *utils.Spinner, s *model.Stack, c *kubernetes.Clientset) error {
 	dList, err := deployments.List(ctx, s.Namespace, s.GetLabelSelector(), c)
 	if err != nil {
 		return err
@@ -156,7 +179,10 @@ func destroyServicesNotInStack(ctx context.Context, spinner *utils.Spinner, s *m
 		log.Success("Destroyed service '%s'", dList[i].Name)
 		spinner.Start()
 	}
+	return nil
+}
 
+func destroyStatefulsets(ctx context.Context, spinner *utils.Spinner, s *model.Stack, c *kubernetes.Clientset) error {
 	sfsList, err := statefulsets.List(ctx, s.Namespace, s.GetLabelSelector(), c)
 	if err != nil {
 		return err
@@ -175,31 +201,103 @@ func destroyServicesNotInStack(ctx context.Context, spinner *utils.Spinner, s *m
 		log.Success("Destroyed service '%s'", sfsList[i].Name)
 		spinner.Start()
 	}
-
-	ingressesList, err := ingress.List(ctx, s.Namespace, s.GetLabelSelector(), c)
+	return nil
+}
+func destroyJobs(ctx context.Context, spinner *utils.Spinner, s *model.Stack, c *kubernetes.Clientset) error {
+	jobsList, err := jobs.List(ctx, s.Namespace, s.GetLabelSelector(), c)
 	if err != nil {
 		return err
 	}
-	for i := range ingressesList {
-		if _, ok := s.Endpoints[ingressesList[i].Name]; ok {
+	for i := range jobsList {
+		if _, ok := s.Services[jobsList[i].Name]; ok {
 			continue
 		}
-		if err := ingress.Destroy(ctx, ingressesList[i].Name, ingressesList[i].Namespace, c); err != nil {
-			return fmt.Errorf("error destroying ingress '%s': %s", ingressesList[i].Name, err)
+		if err := jobs.Destroy(ctx, jobsList[i].Name, jobsList[i].Namespace, c); err != nil {
+			return fmt.Errorf("error destroying job of service '%s': %s", jobsList[i].Name, err)
+		}
+		if err := services.Destroy(ctx, jobsList[i].Name, jobsList[i].Namespace, c); err != nil {
+			return fmt.Errorf("error destroying service '%s': %s", jobsList[i].Name, err)
 		}
 		spinner.Stop()
-		log.Success("Destroyed endpoint '%s'", ingressesList[i].Name)
+		log.Success("Destroyed service '%s'", jobsList[i].Name)
 		spinner.Start()
 	}
-
 	return nil
+}
+
+func destroyIngresses(ctx context.Context, spinner *utils.Spinner, s *model.Stack, c *kubernetes.Clientset) error {
+	iClient, err := ingresses.GetClient(ctx, c)
+	if err != nil {
+		return fmt.Errorf("error getting ingress client: %s", err.Error())
+	}
+
+	iList, err := iClient.List(ctx, s.Namespace, s.GetLabelSelector())
+	if err != nil {
+		return err
+	}
+	for i := range iList {
+		if _, ok := s.Endpoints[iList[i].GetName()]; ok {
+			continue
+		}
+		if iList[i].GetLabels()[model.StackEndpointNameLabel] == "" {
+			//ingress created with "public"
+			continue
+		}
+		if err := iClient.Destroy(ctx, iList[i].GetName(), iList[i].GetNamespace()); err != nil {
+			return fmt.Errorf("error destroying ingress '%s': %s", iList[i].GetName(), err)
+		}
+		spinner.Stop()
+		log.Success("Destroyed endpoint '%s'", iList[i].GetName())
+		spinner.Start()
+	}
+	return nil
+}
+
+func isRemovable(s *model.Stack, pvcName string) bool {
+	isInList := false
+	for volumeName := range s.Volumes {
+		if volumeName == pvcName {
+			isInList = true
+			break
+		}
+		if isAutocreatedVolume(s, pvcName) {
+			isInList = true
+			break
+		}
+	}
+	return isInList
+}
+
+func isAutocreatedVolume(s *model.Stack, volumeName string) bool {
+	if strings.Contains(volumeName, "-") {
+		splitted := strings.Split(volumeName, "-")
+		if len(splitted) == 3 {
+			svcName := splitted[1]
+			volumeIdx, err := strconv.Atoi(splitted[2])
+			if err != nil {
+				return false
+			}
+			if svc, ok := s.Services[svcName]; ok {
+				i := 0
+				for _, volume := range svc.Volumes {
+					if volume.LocalPath == "" {
+						if volumeIdx == i {
+							return true
+						}
+						i++
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 func waitForPodsToBeDestroyed(ctx context.Context, s *model.Stack, c *kubernetes.Clientset) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	timeout := time.Now().Add(300 * time.Second)
 
-	selector := map[string]string{okLabels.StackNameLabel: s.Name}
+	selector := map[string]string{model.StackNameLabel: s.Name}
 	for time.Now().Before(timeout) {
 		<-ticker.C
 		podList, err := pods.ListBySelector(ctx, s.Namespace, selector, c)
@@ -219,7 +317,7 @@ func destroyStackVolumes(ctx context.Context, spinner *utils.Spinner, s *model.S
 		return err
 	}
 	for _, v := range vList {
-		if v.Labels[okLabels.StackNameLabel] == s.Name {
+		if v.Labels[model.StackNameLabel] == s.Name {
 			if err := volumes.Destroy(ctx, v.Name, v.Namespace, c, timeout); err != nil {
 				return fmt.Errorf("error destroying volume '%s': %s", v.Name, err)
 			}

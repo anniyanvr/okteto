@@ -1,4 +1,17 @@
-package ingress
+// Copyright 2021 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ingressesv1
 
 import (
 	"context"
@@ -8,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	extensions "k8s.io/api/extensions/v1beta1"
+	networkingv1 "k8s.io/api/networking/v1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -16,9 +29,9 @@ import (
 	k8sTesting "k8s.io/client-go/testing"
 )
 
-func TestCreate(t *testing.T) {
+func TestDeployCreate(t *testing.T) {
 	ctx := context.Background()
-	ingress := &extensions.Ingress{
+	ingress := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "fake",
 			Namespace: "test",
@@ -26,11 +39,11 @@ func TestCreate(t *testing.T) {
 	}
 
 	clientset := fake.NewSimpleClientset()
-	err := Create(ctx, ingress, clientset)
+	err := Deploy(ctx, ingress, clientset)
 	if err != nil {
 		t.Fatal(err)
 	}
-	retrieved, err := clientset.ExtensionsV1beta1().Ingresses(ingress.Namespace).Get(ctx, ingress.Name, metav1.GetOptions{})
+	retrieved, err := clientset.NetworkingV1().Ingresses(ingress.Namespace).Get(ctx, ingress.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,9 +52,44 @@ func TestCreate(t *testing.T) {
 	}
 }
 
+func TestDeployUpdate(t *testing.T) {
+	ctx := context.Background()
+	labels := map[string]string{"key": "value"}
+	ingress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fake",
+			Namespace: "test",
+			Labels:    labels,
+		},
+	}
+
+	clientset := fake.NewSimpleClientset(ingress)
+
+	updatedLabels := map[string]string{"key": "value", "key2": "value2"}
+	updatedIngress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fake",
+			Namespace: "test",
+			Labels:    updatedLabels,
+		},
+	}
+	err := Deploy(ctx, updatedIngress, clientset)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	retrieved, err := clientset.NetworkingV1().Ingresses(ingress.Namespace).Get(ctx, ingress.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(retrieved, updatedIngress) {
+		t.Fatalf("Didn't updated correctly")
+	}
+}
+
 func TestList(t *testing.T) {
 	ctx := context.Background()
-	ingress := &extensions.Ingress{
+	ingress := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "fake",
 			Namespace: "test",
@@ -65,13 +113,13 @@ func TestDestroy(t *testing.T) {
 		name        string
 		ingressName string
 		namespace   string
-		ingress     *extensions.Ingress
+		ingress     *networkingv1.Ingress
 	}{
 		{
 			name:        "existent-ingress",
 			ingressName: "ingress-test",
 			namespace:   "test",
-			ingress: &extensions.Ingress{
+			ingress: &networkingv1.Ingress{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "ingress-test",
 					Namespace: "test",
@@ -82,7 +130,7 @@ func TestDestroy(t *testing.T) {
 			name:        "ingress-not-found",
 			ingressName: "ingress-test",
 			namespace:   "test",
-			ingress: &extensions.Ingress{
+			ingress: &networkingv1.Ingress{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "non-existent-ingress",
 					Namespace: "another-space",
@@ -123,40 +171,5 @@ func TestDestroyWithError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), kubernetesError) {
 		t.Fatalf("Got '%s' error but expected '%s'", err.Error(), kubernetesError)
-	}
-}
-
-func TestUpdate(t *testing.T) {
-	ctx := context.Background()
-	labels := map[string]string{"key": "value"}
-	ingress := &extensions.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "fake",
-			Namespace: "test",
-			Labels:    labels,
-		},
-	}
-
-	clientset := fake.NewSimpleClientset(ingress)
-
-	updatedLabels := map[string]string{"key": "value", "key2": "value2"}
-	updatedIngress := &extensions.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "fake",
-			Namespace: "test",
-			Labels:    updatedLabels,
-		},
-	}
-	err := Update(ctx, updatedIngress, clientset)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	retrieved, err := clientset.ExtensionsV1beta1().Ingresses(ingress.Namespace).Get(ctx, ingress.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(retrieved, updatedIngress) {
-		t.Fatalf("Didn't updated correctly")
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -283,6 +283,18 @@ func Test_GetResgistryAndRepo(t *testing.T) {
 			image:            "okteto.dev/test/ubuntu",
 			expectedRegistry: "okteto.dev",
 			expectedRepo:     "test/ubuntu",
+		},
+		{
+			name:             "okteto-registry-only-two",
+			image:            "okteto.dev/ubuntu",
+			expectedRegistry: "okteto.dev",
+			expectedRepo:     "ubuntu",
+		},
+		{
+			name:             "official-with-registry",
+			image:            "docker.io/ubuntu",
+			expectedRegistry: "docker.io",
+			expectedRepo:     "ubuntu",
 		},
 	}
 	for _, tt := range tests {

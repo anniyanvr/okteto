@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,6 +16,14 @@ package okteto
 import (
 	"context"
 	"fmt"
+	"regexp"
+
+	"github.com/okteto/okteto/pkg/errors"
+)
+
+const (
+	// Maximum number of characters allowed in a namespace name
+	MAX_ALLOWED_CHARS = 63
 )
 
 // CreateBody top body answer
@@ -35,11 +43,15 @@ type Spaces struct {
 
 //Namespace represents an Okteto k8s namespace
 type Namespace struct {
-	ID string `json:"id" yaml:"id"`
+	ID       string `json:"id" yaml:"id"`
+	Sleeping bool   `json:"sleeping" yaml:"sleeping"`
 }
 
 // CreateNamespace creates a namespace
 func CreateNamespace(ctx context.Context, namespace string) (string, error) {
+	if err := validateNamespace(namespace); err != nil {
+		return "", err
+	}
 	q := fmt.Sprintf(`mutation{
 		createSpace(name: "%s"){
 			id
@@ -58,7 +70,8 @@ func CreateNamespace(ctx context.Context, namespace string) (string, error) {
 func ListNamespaces(ctx context.Context) ([]Namespace, error) {
 	q := `query{
 		spaces{
-			id
+			id,
+			sleeping
 		},
 	}`
 
@@ -107,4 +120,21 @@ func DeleteNamespace(ctx context.Context, namespace string) error {
 
 	var body DeleteBody
 	return query(ctx, q, &body)
+}
+
+func validateNamespace(namespace string) error {
+	if len(namespace) > MAX_ALLOWED_CHARS {
+		return errors.UserError{
+			E:    fmt.Errorf("Invalid namespace name."),
+			Hint: "Namespace name must be shorter than 63 characters.",
+		}
+	}
+	nameValidationRegex := regexp.MustCompile("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+	if !nameValidationRegex.MatchString(namespace) {
+		return errors.UserError{
+			E:    fmt.Errorf("Invalid namespace name."),
+			Hint: "Namespace name must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character",
+		}
+	}
+	return nil
 }

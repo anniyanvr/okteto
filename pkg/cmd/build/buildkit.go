@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -40,7 +40,7 @@ const (
 	frontend = "dockerfile.v0"
 )
 
-//GetBuildKitHost returns the buildkit url and if Okteto Build Service is configured, or an error
+// GetBuildKitHost returns the buildkit url and if Okteto Build Service is configured, or an error
 func GetBuildKitHost() (string, bool, error) {
 	buildKitHost := os.Getenv("BUILDKIT_HOST")
 	if buildKitHost != "" {
@@ -53,22 +53,32 @@ func GetBuildKitHost() (string, bool, error) {
 	return buildkitURL, true, nil
 }
 
-//getSolveOpt returns the buildkit solve options
+// getSolveOpt returns the buildkit solve options
 func getSolveOpt(buildCtx, file, imageTag, target string, noCache bool, cacheFrom, buildArgs, secrets []string) (*client.SolveOpt, error) {
-	if file == "" {
-		file = filepath.Join(buildCtx, "Dockerfile")
-	}
-	if _, err := os.Stat(file); os.IsNotExist(err) {
-		return nil, fmt.Errorf("Dockerfile '%s' does not exist", file)
-	}
-	localDirs := map[string]string{
-		"context":    buildCtx,
-		"dockerfile": filepath.Dir(file),
+	var localDirs map[string]string
+	var frontendAttrs map[string]string
+
+	if uri, err := url.ParseRequestURI(buildCtx); err != nil || (uri != nil && (uri.Scheme == "" || uri.Host == "")) {
+
+		if file == "" {
+			file = filepath.Join(buildCtx, "Dockerfile")
+		}
+		if _, err := os.Stat(file); os.IsNotExist(err) {
+			return nil, fmt.Errorf("Dockerfile '%s' does not exist", file)
+		}
+		localDirs = map[string]string{
+			"context":    buildCtx,
+			"dockerfile": filepath.Dir(file),
+		}
+		frontendAttrs = map[string]string{
+			"filename": filepath.Base(file),
+		}
+	} else {
+		frontendAttrs = map[string]string{
+			"context": buildCtx,
+		}
 	}
 
-	frontendAttrs := map[string]string{
-		"filename": filepath.Base(file),
-	}
 	if target != "" {
 		frontendAttrs["target"] = target
 	}

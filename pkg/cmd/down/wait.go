@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,7 +18,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/k8s/pods"
 	"github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
@@ -26,8 +25,8 @@ import (
 )
 
 func waitForDevPodsTermination(ctx context.Context, c kubernetes.Interface, d *model.Dev, t int) {
-	interactive := map[string]string{labels.InteractiveDevLabel: d.Name}
-	detached := map[string]string{labels.DetachedDevLabel: d.Name}
+	interactive := map[string]string{model.InteractiveDevLabel: d.Name}
+	detached := map[string]string{model.DetachedDevLabel: d.Name}
 
 	wg := &sync.WaitGroup{}
 

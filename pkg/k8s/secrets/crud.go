@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,7 +19,6 @@ import (
 	"io/ioutil"
 	"strings"
 
-	"github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/syncthing"
@@ -41,7 +40,7 @@ func Get(ctx context.Context, name, namespace string, c *kubernetes.Clientset) (
 	return secret, nil
 }
 
-//Create creates the syncthing config secret
+// Create creates the syncthing config secret
 func Create(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset, s *syncthing.Syncthing) error {
 	secretName := GetSecretName(dev)
 
@@ -58,7 +57,7 @@ func Create(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset, s *syn
 		ObjectMeta: metav1.ObjectMeta{
 			Name: secretName,
 			Labels: map[string]string{
-				labels.DevLabel: "true",
+				model.DevLabel: "true",
 			},
 		},
 		Type: v1.SecretTypeOpaque,
@@ -95,8 +94,8 @@ func Create(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset, s *syn
 	return nil
 }
 
-//Destroy deletes the syncthing config secret
-func Destroy(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset) error {
+// Destroy deletes the syncthing config secret
+func Destroy(ctx context.Context, dev *model.Dev, c kubernetes.Interface) error {
 	secretName := GetSecretName(dev)
 	err := c.CoreV1().Secrets(dev.Namespace).Delete(ctx, secretName, metav1.DeleteOptions{})
 	if err != nil {
@@ -108,7 +107,7 @@ func Destroy(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset) error
 	return nil
 }
 
-//GetSecretName returns the okteto secret name for a given development container
+// GetSecretName returns the okteto secret name for a given development container
 func GetSecretName(dev *model.Dev) string {
 	return fmt.Sprintf(oktetoSecretTemplate, dev.Name)
 }

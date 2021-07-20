@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,18 +15,30 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/k8s/client"
 	"github.com/okteto/okteto/pkg/k8s/namespaces"
 	"github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/model"
 	"github.com/okteto/okteto/pkg/okteto"
+	v1 "k8s.io/api/core/v1"
 )
 
-//GetImageTagWithDigest returns the image tag digest
+type ImageInfo struct {
+	Config *ConfigInfo `json:"config"`
+}
+
+type ConfigInfo struct {
+	ExposedPorts *map[string]*interface{} `json:"ExposedPorts"`
+}
+
+// GetImageTagWithDigest returns the image tag digest
 func GetImageTagWithDigest(ctx context.Context, namespace, imageTag string) (string, error) {
 	registryURL, err := okteto.GetRegistry()
 	if err != nil {
@@ -79,7 +91,7 @@ func GetImageTagWithDigest(ctx context.Context, namespace, imageTag string) (str
 	return fmt.Sprintf("%s@%s", repoName, digest.String()), nil
 }
 
-//ExpandOktetoDevRegistry translates okteto.dev
+// ExpandOktetoDevRegistry translates okteto.dev
 func ExpandOktetoDevRegistry(ctx context.Context, namespace, tag string) (string, error) {
 	if !strings.HasPrefix(tag, okteto.DevRegistry) {
 		return tag, nil
@@ -111,31 +123,6 @@ func ExpandOktetoDevRegistry(ctx context.Context, namespace, tag string) (string
 	return tag, nil
 }
 
-// IsTransientError returns true if err represents a transient registry error
-func IsTransientError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	switch {
-	case strings.Contains(err.Error(), "failed commit on ref") && strings.Contains(err.Error(), "500 Internal Server Error"),
-		strings.Contains(err.Error(), "transport is closing"):
-		return true
-	default:
-		return false
-	}
-}
-
-// IsLoggedIntoRegistryButDontHavePermissions returns true when the error is because the user is logged into the registry but doesn't have permissions to push the image
-func IsLoggedIntoRegistryButDontHavePermissions(err error) bool {
-	return strings.Contains(err.Error(), "insufficient_scope: authorization failed")
-}
-
-// IsNotLoggedIntoRegistry returns true when the error is because the user is not logged into the registry
-func IsNotLoggedIntoRegistry(err error) bool {
-	return strings.Contains(err.Error(), "failed to authorize: failed to fetch anonymous token")
-}
-
 // SplitRegistryAndImage returns image tag and the registry to push the image
 func GetRegistryAndRepo(tag string) (string, string) {
 	var imageTag string
@@ -145,10 +132,90 @@ func GetRegistryAndRepo(tag string) (string, string) {
 	if len(splittedImage) == 1 {
 		imageTag = splittedImage[0]
 	} else if len(splittedImage) == 2 {
+		if strings.Contains(splittedImage[0], ".") {
+			return splittedImage[0], splittedImage[1]
+		}
 		imageTag = strings.Join(splittedImage[len(splittedImage)-2:], "/")
 	} else {
 		imageTag = strings.Join(splittedImage[len(splittedImage)-2:], "/")
 		registryTag = strings.Join(splittedImage[:len(splittedImage)-2], "/")
 	}
 	return registryTag, imageTag
+}
+
+func GetHiddenExposePorts(ctx context.Context, namespace, image string) []model.Port {
+	exposedPorts := make([]model.Port, 0)
+	var err error
+	var username string
+	var token string
+	if strings.HasPrefix(image, okteto.DevRegistry) {
+		image, err = ExpandOktetoDevRegistry(ctx, namespace, image)
+		if err != nil {
+			log.Infof("Could not expand okteto dev registry: %s", err.Error())
+		}
+		username = okteto.GetUserID()
+		okToken, err := okteto.GetToken()
+		if err != nil {
+			log.Infof("Could not expand okteto dev registry: %s", err.Error())
+			return exposedPorts
+		}
+		token = okToken.Token
+	}
+
+	registry := getRegistryURL(ctx, namespace, image)
+
+	c, err := NewRegistryClient(registry, username, token)
+	if err != nil {
+		log.Infof("error creating registry client: %s", err.Error())
+		return exposedPorts
+	}
+
+	_, repo := GetRegistryAndRepo(image)
+	repoName, tag := GetRepoNameAndTag(repo)
+	if !strings.Contains(repoName, "/") {
+		repoName = fmt.Sprintf("library/%s", repoName)
+	}
+
+	digest, err := c.ManifestV2(repoName, tag)
+	if err != nil {
+		log.Infof("error getting digest of %s/%s: %s", repoName, tag, err.Error())
+		return exposedPorts
+	}
+
+	response, err := c.DownloadBlob(repoName, digest.Config.Digest)
+	if err != nil {
+		log.Infof("error getting digest of %s/%s: %s", repoName, tag, err.Error())
+		return exposedPorts
+	}
+
+	info := ImageInfo{Config: &ConfigInfo{}}
+	decoder := json.NewDecoder(response)
+	decoder.Decode(&info)
+
+	if info.Config.ExposedPorts != nil {
+
+		for port := range *info.Config.ExposedPorts {
+			if strings.Contains(port, "/") {
+				port = port[:strings.Index(port, "/")]
+				portInt, err := strconv.Atoi(port)
+				if err != nil {
+					continue
+				}
+				exposedPorts = append(exposedPorts, model.Port{ContainerPort: int32(portInt), Protocol: v1.ProtocolTCP})
+			}
+		}
+	}
+	return exposedPorts
+}
+
+func getRegistryURL(ctx context.Context, namespace, image string) string {
+	registry, _ := GetRegistryAndRepo(image)
+	if registry == "docker.io" {
+		return "https://registry.hub.docker.com"
+	} else {
+		if !strings.HasPrefix(registry, "https://") {
+			registry = fmt.Sprintf("https://%s", registry)
+		}
+		return registry
+	}
 }

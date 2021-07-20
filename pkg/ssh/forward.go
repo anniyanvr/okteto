@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,6 +19,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/log"
@@ -68,6 +69,7 @@ func (f *forward) start(ctx context.Context) {
 
 	f.setConnected()
 
+	tick := time.NewTicker(100 * time.Millisecond)
 	for {
 		log.Infof("%s -> listening for local connections", f.String())
 		localConn, err := localListener.Accept()
@@ -77,6 +79,7 @@ func (f *forward) start(ctx context.Context) {
 			}
 
 			log.Infof("%s -> failed to accept connection: %v", f.String(), err)
+			<-tick.C
 			continue
 		}
 		go f.handle(localConn)

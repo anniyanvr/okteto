@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,9 +18,10 @@ import (
 	"strings"
 
 	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
 )
 
-//GetRepoNameAndTag returns the image name without the tag and the tag
+// GetRepoNameAndTag returns the image name without the tag and the tag
 func GetRepoNameAndTag(name string) (string, string) {
 	var domain, remainder string
 	i := strings.IndexRune(name, '@')
@@ -43,10 +44,10 @@ func GetRepoNameAndTag(name string) (string, string) {
 	return fmt.Sprintf("%s/%s", domain, remainder[:i]), remainder[i+1:]
 }
 
-//GetImageTag returns the image tag to build for a given services
+// GetImageTag returns the image tag to build for a given services
 func GetImageTag(image, service, namespace, oktetoRegistryURL string) string {
 	if oktetoRegistryURL != "" {
-		if strings.HasPrefix(image, "okteto.dev") {
+		if strings.HasPrefix(image, okteto.DevRegistry) {
 			return image
 		}
 		return fmt.Sprintf("%s/%s/%s:okteto", oktetoRegistryURL, namespace, service)
@@ -55,7 +56,7 @@ func GetImageTag(image, service, namespace, oktetoRegistryURL string) string {
 	return fmt.Sprintf("%s:okteto", imageWithoutTag)
 }
 
-//GetDevImageTag returns the image tag to build and push
+// GetDevImageTag returns the image tag to build and push
 func GetDevImageTag(dev *model.Dev, imageTag, imageFromDeployment, oktetoRegistryURL string) string {
 	if imageTag != "" && imageTag != model.DefaultImage {
 		return imageTag

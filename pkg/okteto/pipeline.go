@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,8 +16,12 @@ package okteto
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/machinebox/graphql"
+	"github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/log"
+	giturls "github.com/whilp/git-urls"
 )
 
 // DeployPipelineBody top body answer
@@ -37,9 +41,10 @@ type DestroyPipelineBody struct {
 
 //PipelineRun represents an Okteto pipeline status
 type PipelineRun struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Repository string `json:"repository"`
+	Status     string `json:"status"`
 }
 
 // Space represents the contents of an Okteto Cloud space
@@ -47,23 +52,47 @@ type Space struct {
 	GitDeploys []PipelineRun `json:"gitDeploys"`
 }
 
-// DeployPipeline creates a pipeline
-func DeployPipeline(ctx context.Context, name, namespace, repository, branch string) (string, error) {
-	q := fmt.Sprintf(`mutation{
-		deployGitRepository(name: "%s", repository: "%s", space: "%s", branch: "%s"){
-			id,status
-		},
-	}`, name, repository, namespace, branch)
+// Variable represents a pipeline variable
+type Variable struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
 
+// DeployPipeline creates a pipeline
+func DeployPipeline(ctx context.Context, name, namespace, repository, branch, filename string, variables []Variable) (string, error) {
+	filenameParameter := ""
+	if filename != "" {
+		filenameParameter = fmt.Sprintf(`, filename: "%s"`, filename)
+	}
 	var body DeployPipelineBody
-	if err := query(ctx, q, &body); err != nil {
-		return "", err
+	if len(variables) > 0 {
+		q := fmt.Sprintf(`mutation deployGitRepository($variables: [InputVariable]){
+			deployGitRepository(name: "%s", repository: "%s", space: "%s", branch: "%s", variables: $variables%s){
+				id,status
+			},
+		}`, name, repository, namespace, branch, filenameParameter)
+		req := graphql.NewRequest(q)
+		req.Var("variables", variables)
+
+		if err := queryWithRequest(ctx, req, &body); err != nil {
+			return "", err
+		}
+	} else {
+		q := fmt.Sprintf(`mutation{
+			deployGitRepository(name: "%s", repository: "%s", space: "%s", branch: "%s"%s){
+				id,status
+			},
+		}`, name, repository, namespace, branch, filenameParameter)
+
+		if err := query(ctx, q, &body); err != nil {
+			return "", err
+		}
 	}
 
 	return body.PipelineRun.Status, nil
 }
 
-// GetPipelineByName creates a namespace
+// GetPipelineByName gets a pipeline given its name
 func GetPipelineByName(ctx context.Context, name, namespace string) (*PipelineRun, error) {
 	q := fmt.Sprintf(`query{
 		space(id: "%s"){
@@ -84,7 +113,47 @@ func GetPipelineByName(ctx context.Context, name, namespace string) (*PipelineRu
 		}
 	}
 
-	return nil, fmt.Errorf("pipeline '%s' doesn't exist in namespace '%s'", name, namespace)
+	return nil, errors.ErrNotFound
+}
+
+// GetPipelineByRepository gets a pipeline given its repo url
+func GetPipelineByRepository(ctx context.Context, namespace, repository string) (*PipelineRun, error) {
+	q := fmt.Sprintf(`query{
+		space(id: "%s"){
+			gitDeploys{
+				id,repository,status
+			}
+		},
+	}`, namespace)
+
+	var body SpaceBody
+	if err := query(ctx, q, &body); err != nil {
+		return nil, err
+	}
+
+	for _, g := range body.Space.GitDeploys {
+		if areSameRepository(g.Repository, repository) {
+			return &g, nil
+		}
+	}
+
+	return nil, errors.ErrNotFound
+}
+
+func areSameRepository(repoA, repoB string) bool {
+	parsedRepoA, _ := giturls.Parse(repoA)
+	parsedRepoB, _ := giturls.Parse(repoB)
+
+	if parsedRepoA.Hostname() != parsedRepoB.Hostname() {
+		return false
+	}
+
+	//In short SSH URLs like git@github.com:okteto/movies.git, path doesn't start with '/', so we need to remove it
+	//in case it exists. It also happens with '.git' suffix. You don't have to specify it, so we remove in both cases
+	repoPathA := strings.TrimSuffix(strings.TrimPrefix(parsedRepoA.Path, "/"), ".git")
+	repoPathB := strings.TrimSuffix(strings.TrimPrefix(parsedRepoB.Path, "/"), ".git")
+
+	return repoPathA == repoPathB
 }
 
 // DeletePipeline deletes a pipeline

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -107,4 +107,30 @@ func Test_GetValidNameFromFolder(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_GetValidNameFromGitRepo(t *testing.T) {
+	var tests = []struct {
+		name     string
+		gitRepo  string
+		expected string
+	}{
+		{name: "https url", gitRepo: "https://github.com/okteto/stacks-getting-started", expected: "stacks-getting-started"},
+		{name: "https with slash at the end", gitRepo: "https://github.com/okteto/stacks-getting-started/", expected: "stacks-getting-started"},
+		{name: "ssh url", gitRepo: "git@github.com:okteto/stacks-getting-started.git", expected: "stacks-getting-started"},
+		{name: "ssh url with slash at the end", gitRepo: "git@github.com:okteto/stacks-getting-started.git/", expected: "stacks-getting-started"},
+		{name: "https with dots", gitRepo: "https://github.com/okteto/stacks.getting.started", expected: "stacks-getting-started"},
+		{name: "URL with uppers", gitRepo: "https://github.com/okteto/StacksGettingStarted", expected: "stacksgettingstarted"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := translateURLToName(tt.gitRepo)
+
+			if result != tt.expected {
+				t.Errorf("'%s' got '%s' expected '%s'", tt.name, result, tt.expected)
+			}
+		})
+	}
+
 }

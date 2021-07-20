@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,7 +14,6 @@
 package services
 
 import (
-	"github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/model"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,7 +25,7 @@ const (
 )
 
 func translate(dev *model.Dev) *apiv1.Service {
-	annotations := map[string]string{}
+	annotations := model.Annotations{}
 	if len(dev.Services) == 0 {
 		annotations[oktetoAutoIngressAnnotation] = "true"
 	}
@@ -38,7 +37,7 @@ func translate(dev *model.Dev) *apiv1.Service {
 			Name:      dev.Name,
 			Namespace: dev.Namespace,
 			Labels: map[string]string{
-				labels.DevLabel: "true",
+				model.DevLabel: "true",
 			},
 			Annotations: annotations,
 		},

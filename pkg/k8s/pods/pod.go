@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -25,8 +25,8 @@ import (
 
 	"github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/k8s/deployments"
+	"github.com/okteto/okteto/pkg/k8s/events"
 	"github.com/okteto/okteto/pkg/k8s/exec"
-	okLabels "github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/k8s/replicasets"
 	"github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
@@ -93,9 +93,9 @@ func ListBySelector(ctx context.Context, namespace string, selector map[string]s
 func GetDevPodInLoop(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset, waitUntilDeployed bool) (*apiv1.Pod, error) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	start := time.Now()
-	to := start.Add(dev.Timeout * 4) // 120 seconds
+	to := start.Add(dev.Timeout.Resources)
 
-	for i := 0; ; i++ {
+	for retries := 0; ; retries++ {
 		pod, err := GetDevPod(ctx, dev, c, waitUntilDeployed)
 		if err != nil {
 			return nil, err
@@ -104,13 +104,13 @@ func GetDevPodInLoop(ctx context.Context, dev *model.Dev, c *kubernetes.Clientse
 			return pod, nil
 		}
 
-		if time.Now().After(to) {
+		if time.Now().After(to) && retries > 10 {
 			return nil, fmt.Errorf("kubernetes is taking too long to create your development container. Please check for errors and try again")
 		}
 
 		select {
 		case <-ticker.C:
-			if i%5 == 0 {
+			if retries%5 == 0 {
 				log.Info("development container is not ready yet, will retry")
 			}
 
@@ -130,7 +130,7 @@ func GetDevPod(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset, wai
 		return nil, err
 	}
 
-	labels := fmt.Sprintf("%s=%s", okLabels.InteractiveDevLabel, dev.Name)
+	labels := fmt.Sprintf("%s=%s", model.InteractiveDevLabel, dev.Name)
 	rs, err := replicasets.GetReplicaSetByDeployment(ctx, d, labels, c)
 	if rs == nil {
 		if err == nil {
@@ -175,6 +175,16 @@ func GetUserByPod(ctx context.Context, p *apiv1.Pod, container string, config *r
 		return 0, err
 	}
 	return userID, nil
+}
+
+//HasPackageJson returns if the container has node_modules
+func HasPackageJson(ctx context.Context, p *apiv1.Pod, container string, config *rest.Config, c *kubernetes.Clientset) bool {
+	cmd := []string{"sh", "-c", "[ -f 'package.json' ] && echo 'package.json exists'"}
+	out, err := execCommandInPod(ctx, p, container, cmd, config, c)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, "package.json exists")
 }
 
 //GetWorkdirByPod returns the workdir of a running pod
@@ -244,7 +254,7 @@ func Destroy(ctx context.Context, podName, namespace string, c kubernetes.Interf
 func GetDevPodUserID(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset) int64 {
 	devPodLogs, err := GetDevPodLogs(ctx, dev, false, c)
 	if err != nil {
-		log.Errorf("failed to access development container logs: %s", err)
+		log.Infof("failed to access development container logs: %s", err)
 		return -1
 	}
 	return parseUserID(devPodLogs)
@@ -324,7 +334,7 @@ func Restart(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset, sn st
 	pods, err := c.CoreV1().Pods(dev.Namespace).List(
 		ctx,
 		metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("%s=%s", okLabels.DetachedDevLabel, dev.Name),
+			LabelSelector: fmt.Sprintf("%s=%s", model.DetachedDevLabel, dev.Name),
 		},
 	)
 	if err != nil {
@@ -352,7 +362,7 @@ func Restart(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset, sn st
 	if !found {
 		return fmt.Errorf("Unable to find any service with the provided name")
 	}
-	return waitUntilRunning(ctx, dev.Namespace, fmt.Sprintf("%s=%s", okLabels.DetachedDevLabel, dev.Name), c)
+	return waitUntilRunning(ctx, dev.Namespace, fmt.Sprintf("%s=%s", model.DetachedDevLabel, dev.Name), c)
 }
 
 func waitUntilRunning(ctx context.Context, namespace, selector string, c *kubernetes.Clientset) error {
@@ -434,4 +444,28 @@ func isRunning(p *apiv1.Pod) bool {
 	}
 
 	return false
+}
+
+func GetHealthcheckFailure(ctx context.Context, namespace, svcName, stackName string, c kubernetes.Interface) string {
+	selector := fmt.Sprintf("%s=%s,%s=%s", model.StackNameLabel, stackName, model.StackServiceNameLabel, svcName)
+	pods, err := c.CoreV1().Pods(namespace).List(
+		ctx,
+		metav1.ListOptions{
+			LabelSelector: selector,
+		},
+	)
+	if err != nil {
+		return ""
+	}
+	for _, pod := range pods.Items {
+		for _, containerStatus := range pod.Status.ContainerStatuses {
+			if containerStatus.RestartCount > 0 {
+				if failureReason := events.GetUnhealthyEventFailure(ctx, namespace, pod.Name, c); failureReason != "" {
+					return failureReason
+				}
+			}
+		}
+
+	}
+	return ""
 }

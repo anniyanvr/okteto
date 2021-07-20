@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,9 +16,12 @@ package model
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/kballard/go-shellquote"
 	"github.com/okteto/okteto/pkg/log"
 	apiv1 "k8s.io/api/core/v1"
 	resource "k8s.io/apimachinery/pkg/api/resource"
@@ -26,16 +29,17 @@ import (
 
 // BuildInfoRaw represents the build info for serialization
 type buildInfoRaw struct {
-	Name       string   `yaml:"name,omitempty"`
-	Context    string   `yaml:"context,omitempty"`
-	Dockerfile string   `yaml:"dockerfile,omitempty"`
-	CacheFrom  []string `yaml:"cache_from,omitempty"`
-	Target     string   `yaml:"target,omitempty"`
-	Args       []EnvVar `yaml:"args,omitempty"`
+	Name       string      `yaml:"name,omitempty"`
+	Context    string      `yaml:"context,omitempty"`
+	Dockerfile string      `yaml:"dockerfile,omitempty"`
+	CacheFrom  []string    `yaml:"cache_from,omitempty"`
+	Target     string      `yaml:"target,omitempty"`
+	Args       Environment `yaml:"args,omitempty"`
 }
 
 type syncRaw struct {
 	Compression    bool         `json:"compression" yaml:"compression"`
+	Verbose        bool         `json:"verbose" yaml:"verbose"`
 	RescanInterval int          `json:"rescanInterval,omitempty" yaml:"rescanInterval,omitempty"`
 	Folders        []SyncFolder `json:"folders,omitempty" yaml:"folders,omitempty"`
 	LocalPath      string
@@ -47,11 +51,17 @@ type storageResourceRaw struct {
 	Class string   `json:"class,omitempty" yaml:"class,omitempty"`
 }
 
-// healthCheckProbesRaw represents the healthchecks info for serialization
-type healthCheckProbesRaw struct {
+// probesRaw represents the healthchecks info for serialization
+type probesRaw struct {
 	Liveness  bool `json:"liveness,omitempty" yaml:"liveness,omitempty"`
 	Readiness bool `json:"readiness,omitempty" yaml:"readiness,omitempty"`
 	Startup   bool `json:"startup,omitempty" yaml:"startup,omitempty"`
+}
+
+// lifecycleRaw represents the lifecycle info for serialization
+type lifecycleRaw struct {
+	PostStart bool `json:"postStart,omitempty" yaml:"postStart,omitempty"`
+	PostStop  bool `json:"postStop,omitempty" yaml:"postStop,omitempty"`
 }
 
 // UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
@@ -95,10 +105,13 @@ func (e *Entrypoint) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		if err != nil {
 			return err
 		}
-		if strings.Contains(single, " ") {
+		if strings.Contains(single, " && ") {
 			e.Values = []string{"sh", "-c", single}
 		} else {
-			e.Values = []string{single}
+			e.Values, err = shellquote.Split(single)
+			if err != nil {
+				return err
+			}
 		}
 	} else {
 		e.Values = multi
@@ -170,18 +183,21 @@ func (sync *Sync) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var rawFolders []SyncFolder
 	err := unmarshal(&rawFolders)
 	if err == nil {
+		sync.Verbose = true
 		sync.RescanInterval = DefaultSyncthingRescanInterval
 		sync.Folders = rawFolders
 		return nil
 	}
 
 	var rawSync syncRaw
+	rawSync.Verbose = true
 	err = unmarshal(&rawSync)
 	if err != nil {
 		return err
 	}
 
 	sync.Compression = rawSync.Compression
+	sync.Verbose = rawSync.Verbose
 	sync.RescanInterval = rawSync.RescanInterval
 	sync.Folders = rawSync.Folders
 	return nil
@@ -478,34 +494,63 @@ func (v ExternalVolume) MarshalYAML() (interface{}, error) {
 }
 
 // UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
-func (healthcheckProbes *Probes) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (p *Probes) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var rawBool bool
 	err := unmarshal(&rawBool)
 	if err == nil {
-		healthcheckProbes.Liveness = rawBool
-		healthcheckProbes.Startup = rawBool
-		healthcheckProbes.Readiness = rawBool
+		p.Liveness = rawBool
+		p.Startup = rawBool
+		p.Readiness = rawBool
 		return nil
 	}
 
-	var healthCheckProbesRaw healthCheckProbesRaw
+	var healthCheckProbesRaw probesRaw
 	err = unmarshal(&healthCheckProbesRaw)
 	if err != nil {
 		return err
 	}
 
-	healthcheckProbes.Liveness = healthCheckProbesRaw.Liveness
-	healthcheckProbes.Startup = healthCheckProbesRaw.Startup
-	healthcheckProbes.Readiness = healthCheckProbesRaw.Readiness
+	p.Liveness = healthCheckProbesRaw.Liveness
+	p.Startup = healthCheckProbesRaw.Startup
+	p.Readiness = healthCheckProbesRaw.Readiness
 	return nil
 }
 
 // MarshalYAML Implements the marshaler interface of the yaml pkg.
-func (healthcheckProbes Probes) MarshalYAML() (interface{}, error) {
-	if healthcheckProbes.Liveness && healthcheckProbes.Readiness && healthcheckProbes.Startup {
+func (p Probes) MarshalYAML() (interface{}, error) {
+	if p.Liveness && p.Readiness && p.Startup {
 		return true, nil
 	}
-	return healthCheckProbesRaw(healthcheckProbes), nil
+	return probesRaw(p), nil
+}
+
+// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
+func (l *Lifecycle) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var rawBool bool
+	err := unmarshal(&rawBool)
+	if err == nil {
+		l.PostStart = rawBool
+		l.PostStop = rawBool
+		return nil
+	}
+
+	var lifecycleRaw lifecycleRaw
+	err = unmarshal(&lifecycleRaw)
+	if err != nil {
+		return err
+	}
+
+	l.PostStart = lifecycleRaw.PostStart
+	l.PostStop = lifecycleRaw.PostStop
+	return nil
+}
+
+// MarshalYAML Implements the marshaler interface of the yaml pkg.
+func (l Lifecycle) MarshalYAML() (interface{}, error) {
+	if l.PostStart && l.PostStop {
+		return true, nil
+	}
+	return lifecycleRaw(l), nil
 }
 
 func checkFileAndNotDirectory(path string) error {
@@ -525,7 +570,7 @@ func (d Dev) MarshalYAML() (interface{}, error) {
 	if isDefaultProbes(&d) {
 		toMarshall.Probes = nil
 	}
-	if areAllHealthchecksEnabled(d.Probes) {
+	if areAllProbesEnabled(d.Probes) {
 		toMarshall.Probes = nil
 		toMarshall.Healthchecks = true
 	}
@@ -550,8 +595,10 @@ func isDefaultProbes(d *Dev) bool {
 func (endpoint *Endpoint) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var rules []EndpointRule
 	err := unmarshal(&rules)
+	endpoint.Labels = make(Labels)
 	if err == nil {
 		endpoint.Rules = rules
+		endpoint.Annotations = make(map[string]string)
 		return nil
 	}
 	type endpointType Endpoint // prevent recursion
@@ -560,8 +607,149 @@ func (endpoint *Endpoint) UnmarshalYAML(unmarshal func(interface{}) error) error
 	if err != nil {
 		return err
 	}
-	endpoint.Annotations = endpointRaw.Annotations
+
 	endpoint.Rules = endpointRaw.Rules
-	endpoint.Labels = endpointRaw.Labels
+	endpoint.Annotations = endpointRaw.Annotations
+	if endpoint.Annotations == nil {
+		endpoint.Annotations = make(Annotations)
+	}
+	for key, value := range endpointRaw.Labels {
+		endpoint.Annotations[key] = value
+	}
+
+	return nil
+}
+
+func (l *Labels) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	labels := make(Labels)
+	result, err := getKeyValue(unmarshal)
+	if err != nil {
+		return err
+	}
+	for key, value := range result {
+		labels[key] = value
+	}
+	*l = labels
+	return nil
+}
+
+func (a *Annotations) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	annotations := make(Annotations)
+	result, err := getKeyValue(unmarshal)
+	if err != nil {
+		return err
+	}
+	for key, value := range result {
+		annotations[key] = value
+	}
+	*a = annotations
+	return nil
+}
+
+func (e *Environment) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	envs := make(Environment, 0)
+	result, err := getKeyValue(unmarshal)
+	if err != nil {
+		return err
+	}
+	for key, value := range result {
+		envs = append(envs, EnvVar{Name: key, Value: value})
+	}
+	sort.SliceStable(envs, func(i, j int) bool {
+		return strings.Compare(envs[i].Name, envs[j].Name) < 0
+	})
+	*e = envs
+	return nil
+}
+
+func getKeyValue(unmarshal func(interface{}) error) (map[string]string, error) {
+	result := make(map[string]string)
+
+	var rawList []EnvVar
+	err := unmarshal(&rawList)
+	if err == nil {
+		for _, label := range rawList {
+			result[label.Name] = label.Value
+		}
+		return result, nil
+	}
+	var rawMap map[string]string
+	err = unmarshal(&rawMap)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range rawMap {
+		value, err = ExpandEnv(value)
+		if err != nil {
+			return nil, err
+		}
+		result[key] = value
+	}
+	return result, nil
+}
+
+// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
+func (envFiles *EnvFiles) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	result := make(EnvFiles, 0)
+	var single string
+	err := unmarshal(&single)
+	if err != nil {
+		var multi []string
+		err := unmarshal(&multi)
+		if err != nil {
+			return err
+		}
+		result = multi
+		*envFiles = result
+		return nil
+	}
+
+	result = append(result, single)
+	*envFiles = result
+	return nil
+}
+
+// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
+func (t *Timeout) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type timeout Timeout // prevent recursion
+	var extendedNotation timeout
+	err := unmarshal(&extendedNotation)
+	if err != nil {
+		var reducedNotation Duration
+		err := unmarshal(&reducedNotation)
+		if err != nil {
+			return err
+		}
+		t.Default = time.Duration(reducedNotation)
+		return nil
+	}
+	t.Default = extendedNotation.Default
+	t.Resources = extendedNotation.Resources
+	return nil
+}
+
+// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
+func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var durationString string
+	err := unmarshal(&durationString)
+	if err != nil {
+		return err
+	}
+	seconds, err := strconv.Atoi(durationString)
+	if err == nil {
+		duration, err := time.ParseDuration(fmt.Sprintf("%ds", seconds))
+		if err != nil {
+			return err
+		}
+		*d = Duration(duration)
+		return nil
+	}
+
+	var duration time.Duration
+	err = unmarshal(&duration)
+	if err != nil {
+		return err
+	}
+	*d = Duration(duration)
 	return nil
 }

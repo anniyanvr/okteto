@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,6 @@ import (
 	"context"
 	"testing"
 
-	okLabels "github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/model"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,7 +45,7 @@ annotations:
 	if err := setTranslationAsAnnotation(d.GetObjectMeta(), tr1); err != nil {
 		t.Fatal(err)
 	}
-	translationString := d.GetObjectMeta().GetAnnotations()[okLabels.TranslationAnnotation]
+	translationString := d.GetObjectMeta().GetAnnotations()[model.TranslationAnnotation]
 	if translationString == "" {
 		t.Fatal("Marshalled translation was not found in the deployment's annotations")
 	}
@@ -91,8 +90,8 @@ func Test_getPreviousDeploymentReplicas(t *testing.T) {
 			name: "sleeping-state-ok",
 			d: &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{
-						okLabels.StateBeforeSleepingAnnontation: "{\"Replicas\":3}",
+					Annotations: model.Annotations{
+						model.StateBeforeSleepingAnnontation: "{\"Replicas\":3}",
 					},
 				},
 				Spec: appsv1.DeploymentSpec{
@@ -105,8 +104,8 @@ func Test_getPreviousDeploymentReplicas(t *testing.T) {
 			name: "sleeping-state-ko",
 			d: &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{
-						okLabels.StateBeforeSleepingAnnontation: "wrong",
+					Annotations: model.Annotations{
+						model.StateBeforeSleepingAnnontation: "wrong",
 					},
 				},
 				Spec: appsv1.DeploymentSpec{

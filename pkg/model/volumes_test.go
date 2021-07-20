@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -29,7 +29,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 		{
 			name: "none",
 			dev: &Dev{
-				WorkDir: "",
+				Workdir: "",
 				Volumes: []Volume{},
 				Sync: Sync{
 					Folders: []SyncFolder{},
@@ -37,7 +37,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 			},
 			result: &Dev{
 				Volumes: []Volume{},
-				WorkDir: "/okteto",
+				Workdir: "/okteto",
 				Sync: Sync{
 					Folders: []SyncFolder{
 						{
@@ -52,7 +52,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 		{
 			name: "workdir",
 			dev: &Dev{
-				WorkDir: "/workdir",
+				Workdir: "/workdir",
 				Volumes: []Volume{},
 				Sync: Sync{
 					Folders: []SyncFolder{},
@@ -72,54 +72,9 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "mountpath",
-			dev: &Dev{
-				MountPath: "/mountpath",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "workdir-and-mountpath",
-			dev: &Dev{
-				WorkDir:   "/workdir",
-				MountPath: "/mountpath",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
 			name: "workdir-syncs",
 			dev: &Dev{
-				WorkDir: "/workdir",
+				Workdir: "/workdir",
 				Volumes: []Volume{},
 				Sync: Sync{
 					Folders: []SyncFolder{
@@ -137,279 +92,6 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 						{
 							LocalPath:  "local",
 							RemotePath: "remote",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "mountpath-syncs",
-			dev: &Dev{
-				MountPath: "/mountpath",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local",
-							RemotePath: "remote",
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local",
-							RemotePath: "remote",
-						},
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "workdir-and-mountpath-syncs",
-			dev: &Dev{
-				WorkDir:   "/workdir",
-				MountPath: "/mountpath",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local",
-							RemotePath: "remote",
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local",
-							RemotePath: "remote",
-						},
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "volumes-to-syncs",
-			dev: &Dev{
-				WorkDir:   "/workdir",
-				MountPath: "/mountpath",
-				Volumes: []Volume{
-					{
-						LocalPath:  "/local",
-						RemotePath: "/remote",
-					},
-				},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath",
-						},
-						{
-							LocalPath:  "/local",
-							RemotePath: "/remote",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-workdir",
-			dev: &Dev{
-				WorkDir: "/workdir1",
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-				Services: []*Dev{
-					{
-						WorkDir: "/workdir2",
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/workdir1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  ".",
-									RemotePath: "/workdir2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-workdir-subpath",
-			dev: &Dev{
-				WorkDir: "/workdir1",
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-				Services: []*Dev{
-					{
-						WorkDir: "/workdir2",
-						SubPath: "subpath",
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/workdir1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "subpath",
-									RemotePath: "/workdir2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-mountpath",
-			dev: &Dev{
-				MountPath: "/mountpath1",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-				Services: []*Dev{
-					{
-						MountPath: "/mountpath2",
-						Volumes:   []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  ".",
-									RemotePath: "/mountpath2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-mountpath-subpath",
-			dev: &Dev{
-				MountPath: "/mountpath1",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-				Services: []*Dev{
-					{
-						MountPath: "/mountpath2",
-						SubPath:   "subpath",
-						Volumes:   []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "subpath",
-									RemotePath: "/mountpath2",
-								},
-							},
 						},
 					},
 				},
@@ -419,7 +101,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 		{
 			name: "services-workdir-error",
 			dev: &Dev{
-				WorkDir: "/workdir1",
+				Workdir: "/workdir1",
 				Sync: Sync{
 					Folders: []SyncFolder{
 						{
@@ -430,28 +112,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 				},
 				Services: []*Dev{
 					{
-						WorkDir: "/workdir1",
-					},
-				},
-			},
-			result:  nil,
-			wantErr: true,
-		},
-		{
-			name: "services-mountpath-error",
-			dev: &Dev{
-				WorkDir: "/mountpath1",
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local",
-							RemotePath: "remote",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						MountPath: "/mountpath2",
+						Workdir: "/workdir1",
 					},
 				},
 			},
@@ -461,7 +122,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 		{
 			name: "services-workdir-syncs",
 			dev: &Dev{
-				WorkDir: "/workdir1",
+				Workdir: "/workdir1",
 				Volumes: []Volume{},
 				Sync: Sync{
 					Folders: []SyncFolder{
@@ -473,7 +134,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 				},
 				Services: []*Dev{
 					{
-						WorkDir: "/workdir2",
+						Workdir: "/workdir2",
 						Volumes: []Volume{},
 						Sync: Sync{
 							Folders: []SyncFolder{
@@ -504,194 +165,6 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 								{
 									LocalPath:  "local2",
 									RemotePath: "remote2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-mountpath-syncs",
-			dev: &Dev{
-				MountPath: "/mountpath1",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local1",
-							RemotePath: "remote1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						MountPath: "/mountpath2",
-						Volumes:   []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "local2",
-									RemotePath: "remote2",
-								},
-							},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local1",
-							RemotePath: "remote1",
-						},
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "local2",
-									RemotePath: "remote2",
-								},
-								{
-									LocalPath:  ".",
-									RemotePath: "/mountpath2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-workdir-and-mountpath-syncs",
-			dev: &Dev{
-				WorkDir:   "/workdir1",
-				MountPath: "/mountpath1",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local1",
-							RemotePath: "remote1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						WorkDir:   "/workdir2",
-						MountPath: "/mountpath2",
-						Volumes:   []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "local2",
-									RemotePath: "remote2",
-								},
-							},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local1",
-							RemotePath: "remote1",
-						},
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "local2",
-									RemotePath: "remote2",
-								},
-								{
-									LocalPath:  ".",
-									RemotePath: "/mountpath2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-volumes-to-syncs",
-			dev: &Dev{
-				WorkDir: "/workdir1",
-				Volumes: []Volume{
-					{
-						LocalPath:  "/local1",
-						RemotePath: "/remote1",
-					},
-				},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-				Services: []*Dev{
-					{
-						WorkDir: "/workdir2",
-						Volumes: []Volume{
-							{
-								LocalPath:  "/local2",
-								RemotePath: "/remote2",
-							},
-						},
-						Sync: Sync{
-							Folders: []SyncFolder{},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/workdir1",
-						},
-						{
-							LocalPath:  "/local1",
-							RemotePath: "/remote1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  ".",
-									RemotePath: "/workdir2",
-								},
-								{
-									LocalPath:  "/local2",
-									RemotePath: "/remote2",
 								},
 							},
 						},

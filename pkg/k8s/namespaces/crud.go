@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,7 +19,8 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	okLabels "github.com/okteto/okteto/pkg/k8s/labels"
+	k8Client "github.com/okteto/okteto/pkg/k8s/client"
+	"github.com/okteto/okteto/pkg/model"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -28,12 +29,12 @@ const (
 	OktetoNotAllowedLabel = "dev.okteto.com/not-allowed"
 )
 
-//IsOktetoNamespace checks if this is a namespace created by okteto
+// IsOktetoNamespace checks if this is a namespace created by okteto
 func IsOktetoNamespace(ns *apiv1.Namespace) bool {
-	return ns.Labels[okLabels.DevLabel] == "true"
+	return ns.Labels[model.DevLabel] == "true"
 }
 
-//IsOktetoAllowed checks if Okteto operationos are allowed in this namespace
+// IsOktetoAllowed checks if Okteto operationos are allowed in this namespace
 func IsOktetoAllowed(ns *apiv1.Namespace) bool {
 	if _, ok := ns.Labels[OktetoNotAllowedLabel]; ok {
 		return false
@@ -50,4 +51,16 @@ func Get(ctx context.Context, ns string, c *kubernetes.Clientset) (*apiv1.Namesp
 	}
 
 	return n, nil
+}
+
+func IsOktetoNamespaceFromName(ctx context.Context, namespace string) bool {
+	c, _, err := k8Client.GetLocal()
+	if err != nil {
+		return false
+	}
+	n, err := Get(ctx, namespace, c)
+	if err == nil {
+		return IsOktetoNamespace(n)
+	}
+	return false
 }

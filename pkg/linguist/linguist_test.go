@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -33,17 +33,17 @@ func TestProcessDirectory(t *testing.T) {
 		},
 		{
 			name:  "gradle",
-			want:  gradle,
+			want:  Gradle,
 			files: []string{"build.gradle", "main.java"},
 		},
 		{
 			name:  "maven",
-			want:  maven,
+			want:  Maven,
 			files: []string{"pom.xml", "main.java"},
 		},
 		{
 			name:  "java-default",
-			want:  maven,
+			want:  Maven,
 			files: []string{"main.java"},
 		},
 		{
@@ -53,17 +53,17 @@ func TestProcessDirectory(t *testing.T) {
 		},
 		{
 			name:  "python",
-			want:  python,
+			want:  Python,
 			files: []string{"api.py"},
 		},
 		{
 			name:  "javascript",
-			want:  javascript,
+			want:  Javascript,
 			files: []string{"Package.json", "index.js"},
 		},
 		{
 			name:  "ruby",
-			want:  ruby,
+			want:  Ruby,
 			files: []string{"Gemfile", "Rakefile", "application_controller.rb"},
 		},
 	}

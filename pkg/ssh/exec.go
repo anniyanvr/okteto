@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,7 +15,6 @@ package ssh
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -29,7 +28,7 @@ import (
 	"github.com/okteto/okteto/pkg/log"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 // Exec executes the command over SSH
@@ -90,14 +89,14 @@ func Exec(ctx context.Context, iface string, remotePort int, tty bool, inR io.Re
 		var termFD int
 		var ok bool
 		if termFD, ok = isTerminal(inR); ok {
-			width, height, err = terminal.GetSize(int(os.Stdout.Fd()))
+			width, height, err = term.GetSize(int(os.Stdout.Fd()))
 			log.Infof("terminal width %d height %d", width, height)
 			if err != nil {
 				log.Infof("request for terminal size failed: %s", err)
 			}
 		}
 
-		state, err := terminal.MakeRaw(termFD)
+		state, err := term.MakeRaw(termFD)
 		if err != nil {
 			log.Infof("request for raw terminal failed: %s", err)
 		}
@@ -107,7 +106,7 @@ func Exec(ctx context.Context, iface string, remotePort int, tty bool, inR io.Re
 				return
 			}
 
-			if err := terminal.Restore(termFD, state); err != nil {
+			if err := term.Restore(termFD, state); err != nil {
 				log.Infof("failed to restore terminal: %s", err)
 			}
 
@@ -135,13 +134,7 @@ func Exec(ctx context.Context, iface string, remotePort int, tty bool, inR io.Re
 	if err != nil {
 		return fmt.Errorf("unable to setup stdin for session: %v", err)
 	}
-	go func() {
-		if _, err = io.Copy(stdin, inR); err != nil {
-			if !errors.Is(err, io.EOF) {
-				log.Infof("error while reading from stdIn: %s", err)
-			}
-		}
-	}()
+	Copy(inR, stdin)
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
@@ -176,7 +169,7 @@ func Exec(ctx context.Context, iface string, remotePort int, tty bool, inR io.Re
 	}
 	if strings.Contains(err.Error(), "exit code 137") || strings.Contains(err.Error(), "exit status 137") {
 		log.Yellow(`Insufficient memory. Please update your resources on your okteto manifest.
-More information is available here: https://okteto.com/docs/reference/manifest#resources-object-optional`)
+More information is available here: https://okteto.com/docs/reference/manifest/#resources-object-optional`)
 	}
 
 	log.Infof("command failed: %s", err)
@@ -187,7 +180,7 @@ More information is available here: https://okteto.com/docs/reference/manifest#r
 func isTerminal(r io.Reader) (int, bool) {
 	switch v := r.(type) {
 	case *os.File:
-		return int(v.Fd()), terminal.IsTerminal(int(v.Fd()))
+		return int(v.Fd()), term.IsTerminal(int(v.Fd()))
 	default:
 		return 0, false
 	}

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,8 +17,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
+	"strings"
 
-	okLabels "github.com/okteto/okteto/pkg/k8s/labels"
+	"github.com/okteto/okteto/pkg/k8s/annotations"
+	"github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 
@@ -27,6 +30,7 @@ import (
 	resource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/pointer"
 )
 
 const (
@@ -35,6 +39,8 @@ const (
 	revisionAnnotation         = "deployment.kubernetes.io/revision"
 	//OktetoBinName name of the okteto bin init container
 	OktetoBinName = "okteto-bin"
+	//OktetoInitVolumeContainerName name of the okteto init container that initializes the persistent colume from image content
+	OktetoInitVolumeContainerName = "okteto-init-volume"
 
 	//syncthing
 	oktetoSyncSecretVolume = "okteto-sync-secret" // skipcq GSC-G101  not a secret
@@ -46,15 +52,6 @@ var (
 	devReplicas                      int32 = 1
 	devTerminationGracePeriodSeconds int64
 	falseBoolean                     = false
-
-	//OktetoUpInitContainerRequestsCPU cpu requests used by the up init container
-	OktetoUpInitContainerRequestsCPU = resource.MustParse("10m")
-	//OktetoUpInitContainerRequestsMemory memory requests used by the up init container
-	OktetoUpInitContainerRequestsMemory = resource.MustParse("10Mi")
-	//OktetoUpInitContainerLimitsCPU cpu limits used by the up init container
-	OktetoUpInitContainerLimitsCPU = resource.MustParse("30m")
-	//OktetoUpInitContainerLimitsMemory limits requests used by the up init container
-	OktetoUpInitContainerLimitsMemory = resource.MustParse("30Mi")
 )
 
 func translate(t *model.Translation, c *kubernetes.Clientset, isOktetoNamespace bool) error {
@@ -66,7 +63,7 @@ func translate(t *model.Translation, c *kubernetes.Clientset, isOktetoNamespace 
 		rule.Container = devContainer.Name
 	}
 
-	manifest := getAnnotation(t.Deployment.GetObjectMeta(), oktetoDeploymentAnnotation)
+	manifest := annotations.Get(t.Deployment.GetObjectMeta(), oktetoDeploymentAnnotation)
 	if manifest != "" {
 		dOrig := &appsv1.Deployment{}
 		if err := json.Unmarshal([]byte(manifest), dOrig); err != nil {
@@ -74,9 +71,9 @@ func translate(t *model.Translation, c *kubernetes.Clientset, isOktetoNamespace 
 		}
 		t.Deployment = dOrig
 	}
-	annotations := t.Deployment.GetObjectMeta().GetAnnotations()
-	delete(annotations, revisionAnnotation)
-	t.Deployment.GetObjectMeta().SetAnnotations(annotations)
+	dAnnotations := t.Deployment.GetObjectMeta().GetAnnotations()
+	delete(dAnnotations, revisionAnnotation)
+	t.Deployment.GetObjectMeta().SetAnnotations(dAnnotations)
 
 	if c != nil && isOktetoNamespace {
 		c := os.Getenv("OKTETO_CLIENTSIDE_TRANSLATION")
@@ -89,14 +86,15 @@ func translate(t *model.Translation, c *kubernetes.Clientset, isOktetoNamespace 
 	}
 
 	t.Deployment.Status = appsv1.DeploymentStatus{}
+	delete(t.Deployment.Annotations, oktetoDeploymentAnnotation)
 	manifestBytes, err := json.Marshal(t.Deployment)
 	if err != nil {
 		return err
 	}
-	setAnnotation(t.Deployment.GetObjectMeta(), oktetoDeploymentAnnotation, string(manifestBytes))
+	annotations.Set(t.Deployment.GetObjectMeta(), oktetoDeploymentAnnotation, string(manifestBytes))
 
 	commonTranslation(t)
-	setLabel(t.Deployment.Spec.Template.GetObjectMeta(), okLabels.DevLabel, "true")
+	labels.Set(t.Deployment.Spec.Template.GetObjectMeta(), model.DevLabel, "true")
 	TranslateDevAnnotations(t.Deployment.Spec.Template.GetObjectMeta(), t.Annotations)
 	TranslateDevTolerations(&t.Deployment.Spec.Template.Spec, t.Tolerations)
 	t.Deployment.Spec.Template.Spec.TerminationGracePeriodSeconds = &devTerminationGracePeriodSeconds
@@ -112,8 +110,11 @@ func translate(t *model.Translation, c *kubernetes.Clientset, isOktetoNamespace 
 			return fmt.Errorf("Container '%s' not found in deployment '%s'", rule.Container, t.Deployment.Name)
 		}
 
+		if rule.Image == "" {
+			rule.Image = devContainer.Image
+		}
+
 		TranslateDevContainer(devContainer, rule)
-		TranslateInitContainer(&rule.InitContainer)
 		TranslateOktetoVolumes(&t.Deployment.Spec.Template.Spec, rule)
 		TranslatePodSecurityContext(&t.Deployment.Spec.Template.Spec, rule.SecurityContext)
 		TranslatePodServiceAccount(&t.Deployment.Spec.Template.Spec, rule.ServiceAccount)
@@ -121,6 +122,8 @@ func translate(t *model.Translation, c *kubernetes.Clientset, isOktetoNamespace 
 		if rule.IsMainDevContainer() {
 			TranslateOktetoBinVolumeMounts(devContainer)
 			TranslateOktetoInitBinContainer(rule.InitContainer, &t.Deployment.Spec.Template.Spec)
+			TranslateOktetoInitFromImageContainer(&t.Deployment.Spec.Template.Spec, rule)
+			TranslateDinDContainer(&t.Deployment.Spec.Template.Spec, rule)
 			TranslateOktetoBinVolume(&t.Deployment.Spec.Template.Spec)
 		}
 	}
@@ -129,16 +132,19 @@ func translate(t *model.Translation, c *kubernetes.Clientset, isOktetoNamespace 
 
 func commonTranslation(t *model.Translation) {
 	TranslateDevAnnotations(t.Deployment.GetObjectMeta(), t.Annotations)
-	setAnnotation(t.Deployment.GetObjectMeta(), oktetoVersionAnnotation, okLabels.Version)
-	setLabel(t.Deployment.GetObjectMeta(), okLabels.DevLabel, "true")
+	annotations.Set(t.Deployment.GetObjectMeta(), oktetoVersionAnnotation, model.Version)
+	labels.Set(t.Deployment.GetObjectMeta(), model.DevLabel, "true")
 
 	if t.Interactive {
-		setLabel(t.Deployment.Spec.Template.GetObjectMeta(), okLabels.InteractiveDevLabel, t.Name)
+		labels.Set(t.Deployment.Spec.Template.GetObjectMeta(), model.InteractiveDevLabel, t.Name)
 	} else {
-		setLabel(t.Deployment.Spec.Template.GetObjectMeta(), okLabels.DetachedDevLabel, t.Name)
+		labels.Set(t.Deployment.Spec.Template.GetObjectMeta(), model.DetachedDevLabel, t.Name)
 	}
 
 	t.Deployment.Spec.Replicas = &devReplicas
+	t.Deployment.Spec.Strategy = appsv1.DeploymentStrategy{
+		Type: appsv1.RecreateDeploymentStrategyType,
+	}
 }
 
 //GetDevContainer returns the dev container of a given deployment
@@ -157,9 +163,9 @@ func GetDevContainer(spec *apiv1.PodSpec, name string) *apiv1.Container {
 }
 
 //TranslateDevAnnotations sets the user provided annotations
-func TranslateDevAnnotations(o metav1.Object, annotations map[string]string) {
-	for key, value := range annotations {
-		setAnnotation(o, key, value)
+func TranslateDevAnnotations(o metav1.Object, annotationsToAdd map[string]string) {
+	for key, value := range annotationsToAdd {
+		annotations.Set(o, key, value)
 	}
 }
 
@@ -184,7 +190,7 @@ func TranslatePodAffinity(spec *apiv1.PodSpec, name string) {
 		apiv1.PodAffinityTerm{
 			LabelSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					okLabels.InteractiveDevLabel: name,
+					model.InteractiveDevLabel: name,
 				},
 			},
 			TopologyKey: "kubernetes.io/hostname",
@@ -194,9 +200,6 @@ func TranslatePodAffinity(spec *apiv1.PodSpec, name string) {
 
 //TranslateDevContainer translates a dev container
 func TranslateDevContainer(c *apiv1.Container, rule *model.TranslationRule) {
-	if rule.Image == "" {
-		rule.Image = c.Image
-	}
 	c.Image = rule.Image
 	c.ImagePullPolicy = rule.ImagePullPolicy
 
@@ -210,6 +213,7 @@ func TranslateDevContainer(c *apiv1.Container, rule *model.TranslationRule) {
 	}
 
 	TranslateProbes(c, rule.Probes)
+	TranslateLifecycle(c, rule.Lifecycle)
 
 	TranslateResources(c, rule.Resources)
 	TranslateEnvVars(c, rule)
@@ -217,39 +221,85 @@ func TranslateDevContainer(c *apiv1.Container, rule *model.TranslationRule) {
 	TranslateContainerSecurityContext(c, rule.SecurityContext)
 }
 
-//TranslateProbes translates the healthchecks attached to a container
-func TranslateProbes(c *apiv1.Container, h *model.Probes) {
-	if h == nil {
+//TranslateDinDContainer translates the DinD container
+func TranslateDinDContainer(spec *apiv1.PodSpec, rule *model.TranslationRule) {
+	if !rule.Docker.Enabled {
 		return
 	}
-	if !h.Liveness {
+	c := apiv1.Container{
+		Name:  "dind",
+		Image: rule.Docker.Image,
+		Env: []apiv1.EnvVar{
+			{
+				Name:  "DOCKER_TLS_CERTDIR",
+				Value: model.DefaultDockerCertDir,
+			},
+		},
+		VolumeMounts: []apiv1.VolumeMount{},
+		SecurityContext: &apiv1.SecurityContext{
+			Privileged: pointer.BoolPtr(true),
+		},
+	}
+
+	for _, v := range rule.Volumes {
+		if isDockerVolumeMount(v.SubPath) {
+			c.VolumeMounts = append(
+				c.VolumeMounts,
+				apiv1.VolumeMount{
+					Name:      v.Name,
+					MountPath: v.MountPath,
+					SubPath:   v.SubPath,
+				},
+			)
+		}
+	}
+
+	translateInitResources(&c, rule.Docker.Resources)
+
+	spec.Containers = append(spec.Containers, c)
+}
+
+func isDockerVolumeMount(subPath string) bool {
+	if strings.HasPrefix(subPath, model.SourceCodeSubPath) {
+		return true
+	}
+
+	if subPath == model.DefaultDockerCertDirSubPath {
+		return true
+	}
+
+	return subPath == model.DefaultDockerCacheDirSubPath
+}
+
+//TranslateProbes translates the probes attached to a container
+func TranslateProbes(c *apiv1.Container, p *model.Probes) {
+	if p == nil {
+		return
+	}
+	if !p.Liveness {
 		c.LivenessProbe = nil
 	}
-	if !h.Readiness {
+	if !p.Readiness {
 		c.ReadinessProbe = nil
 	}
-	if !h.Startup {
+	if !p.Startup {
 		c.StartupProbe = nil
 	}
 }
 
-func TranslateInitContainer(initContainer *model.InitContainer) {
-	if initContainer.Resources.Limits == nil {
-		initContainer.Resources.Limits = make(map[apiv1.ResourceName]resource.Quantity)
+//TranslateLifecycle translates the lifecycle events attached to a container
+func TranslateLifecycle(c *apiv1.Container, l *model.Lifecycle) {
+	if l == nil {
+		return
 	}
-	if initContainer.Resources.Requests == nil {
-		initContainer.Resources.Requests = make(map[apiv1.ResourceName]resource.Quantity)
+	if c.Lifecycle == nil {
+		return
 	}
-	setDefaultResourceValueIfNotPresent(initContainer.Resources.Limits, apiv1.ResourceMemory, OktetoUpInitContainerLimitsMemory)
-	setDefaultResourceValueIfNotPresent(initContainer.Resources.Limits, apiv1.ResourceCPU, OktetoUpInitContainerLimitsCPU)
-
-	setDefaultResourceValueIfNotPresent(initContainer.Resources.Requests, apiv1.ResourceMemory, OktetoUpInitContainerRequestsMemory)
-	setDefaultResourceValueIfNotPresent(initContainer.Resources.Requests, apiv1.ResourceCPU, OktetoUpInitContainerRequestsCPU)
-}
-
-func setDefaultResourceValueIfNotPresent(resourceList model.ResourceList, resourceName apiv1.ResourceName, value resource.Quantity) {
-	if _, ok := resourceList[resourceName]; !ok {
-		resourceList[resourceName] = value
+	if !l.PostStart {
+		c.Lifecycle.PostStart = nil
+	}
+	if !l.PostStart {
+		c.Lifecycle.PostStart = nil
 	}
 }
 
@@ -322,6 +372,9 @@ func TranslateVolumeMounts(c *apiv1.Container, rule *model.TranslationRule) {
 	}
 
 	for _, v := range rule.Volumes {
+		if v.SubPath == model.DefaultDockerCacheDirSubPath {
+			continue
+		}
 		c.VolumeMounts = append(
 			c.VolumeMounts,
 			apiv1.VolumeMount{
@@ -441,7 +494,7 @@ func TranslatePodSecurityContext(spec *apiv1.PodSpec, s *model.SecurityContext) 
 	}
 }
 
-//TranslatePodServiceAccount translates the security accout the pod uses
+//TranslatePodServiceAccount translates the security account the pod uses
 func TranslatePodServiceAccount(spec *apiv1.PodSpec, sa string) {
 	if sa != "" {
 		spec.ServiceAccountName = sa
@@ -484,9 +537,23 @@ func TranslateContainerSecurityContext(c *apiv1.Container, s *model.SecurityCont
 	c.SecurityContext.Capabilities.Drop = append(c.SecurityContext.Capabilities.Drop, s.Capabilities.Drop...)
 }
 
+func translateInitResources(c *apiv1.Container, resources model.ResourceRequirements) {
+	if len(resources.Requests) > 0 {
+		c.Resources.Requests = map[apiv1.ResourceName]resource.Quantity{}
+	}
+	for k, v := range resources.Requests {
+		c.Resources.Requests[k] = v
+	}
+	if len(resources.Limits) > 0 {
+		c.Resources.Limits = map[apiv1.ResourceName]resource.Quantity{}
+	}
+	for k, v := range resources.Limits {
+		c.Resources.Limits[k] = v
+	}
+}
+
 //TranslateOktetoInitBinContainer translates the bin init container of a pod
 func TranslateOktetoInitBinContainer(initContainer model.InitContainer, spec *apiv1.PodSpec) {
-
 	c := apiv1.Container{
 		Name:            OktetoBinName,
 		Image:           initContainer.Image,
@@ -498,22 +565,55 @@ func TranslateOktetoInitBinContainer(initContainer model.InitContainer, spec *ap
 				MountPath: "/okteto/bin",
 			},
 		},
-		Resources: apiv1.ResourceRequirements{
-			Requests: map[apiv1.ResourceName]resource.Quantity{
-				apiv1.ResourceCPU:    initContainer.Resources.Requests[apiv1.ResourceCPU],
-				apiv1.ResourceMemory: initContainer.Resources.Requests[apiv1.ResourceMemory],
-			},
-			Limits: map[apiv1.ResourceName]resource.Quantity{
-				apiv1.ResourceCPU:    initContainer.Resources.Limits[apiv1.ResourceCPU],
-				apiv1.ResourceMemory: initContainer.Resources.Limits[apiv1.ResourceMemory],
-			},
-		},
 	}
+
+	translateInitResources(&c, initContainer.Resources)
 
 	if spec.InitContainers == nil {
 		spec.InitContainers = []apiv1.Container{}
 	}
 	spec.InitContainers = append(spec.InitContainers, c)
+}
+
+//TranslateOktetoInitFromImageContainer translates the init from image container of a pod
+func TranslateOktetoInitFromImageContainer(spec *apiv1.PodSpec, rule *model.TranslationRule) {
+	if !rule.PersistentVolume {
+		return
+	}
+
+	if spec.InitContainers == nil {
+		spec.InitContainers = []apiv1.Container{}
+	}
+
+	c := &apiv1.Container{
+		Name:            OktetoInitVolumeContainerName,
+		Image:           rule.Image,
+		ImagePullPolicy: apiv1.PullIfNotPresent,
+		VolumeMounts:    []apiv1.VolumeMount{},
+	}
+	command := "echo initializing"
+	iVolume := 1
+	for _, v := range rule.Volumes {
+		if !strings.HasPrefix(v.SubPath, model.SourceCodeSubPath) && !strings.HasPrefix(v.SubPath, model.DataSubPath) {
+			continue
+		}
+		c.VolumeMounts = append(
+			c.VolumeMounts,
+			apiv1.VolumeMount{
+				Name:      v.Name,
+				MountPath: fmt.Sprintf("/init-volume/%d", iVolume),
+				SubPath:   v.SubPath,
+			},
+		)
+		mounPath := path.Join(v.MountPath, ".")
+		command = fmt.Sprintf("%s && ( [ \"$(ls -A /init-volume/%d)\" ] || cp -R %s/. /init-volume/%d || true)", command, iVolume, mounPath, iVolume)
+		iVolume++
+	}
+
+	c.Command = []string{"sh", "-cx", command}
+	translateInitResources(c, rule.InitContainer.Resources)
+	TranslateContainerSecurityContext(c, rule.SecurityContext)
+	spec.InitContainers = append(spec.InitContainers, *c)
 }
 
 //TranslateOktetoSyncSecret translates the syncthing secret container of a pod

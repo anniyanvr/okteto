@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joho/godotenv"
 	apiv1 "k8s.io/api/core/v1"
 )
 
@@ -33,6 +34,8 @@ command: ["uwsgi"]
 annotations:
   key1: value1
   key2: value2
+labels:
+  key3: value3
 resources:
   requests:
     memory: "64Mi"
@@ -124,7 +127,7 @@ services:
 	}
 
 	expected := (63 * time.Second)
-	if expected != main.Timeout {
+	if expected != main.Timeout.Default {
 		t.Errorf("the default timeout wasn't applied, got %s, expected %s", main.Timeout, expected)
 	}
 }
@@ -152,7 +155,7 @@ func Test_LoadDevDefaults(t *testing.T) {
 	var tests = []struct {
 		name                string
 		manifest            []byte
-		expectedEnvironment []EnvVar
+		expectedEnvironment Environment
 		expectedForward     []Forward
 	}{
 		{
@@ -160,7 +163,7 @@ func Test_LoadDevDefaults(t *testing.T) {
 			[]byte(`name: service
 container: core
 workdir: /app`),
-			[]EnvVar{},
+			Environment{},
 			[]Forward{},
 		},
 		{
@@ -168,7 +171,7 @@ workdir: /app`),
 			[]byte(`name: service
 container: core
 workdir: /app`),
-			[]EnvVar{},
+			Environment{},
 			[]Forward{},
 		},
 		{
@@ -179,7 +182,7 @@ workdir: /app
 environment:
   - ENV=production
   - name=test-node`),
-			[]EnvVar{
+			Environment{
 				{Name: "ENV", Value: "production"},
 				{Name: "name", Value: "test-node"},
 			},
@@ -193,7 +196,7 @@ workdir: /app
 forward:
   - 9000:8000
   - 9001:8001`),
-			[]EnvVar{},
+			Environment{},
 			[]Forward{
 				{Local: 9000, Remote: 8000, Service: false, ServiceName: ""},
 				{Local: 9001, Remote: 8001, Service: false, ServiceName: ""},
@@ -212,8 +215,17 @@ forward:
 				t.Errorf("command was parsed: %+v", d)
 			}
 
-			if !reflect.DeepEqual(d.Environment, tt.expectedEnvironment) {
-				t.Errorf("environment was not parsed correctly:\n%+v\n%+v", d.Environment, tt.expectedEnvironment)
+			for _, env := range d.Environment {
+				found := false
+				for _, expectedEnv := range tt.expectedEnvironment {
+					if env.Name == expectedEnv.Name && env.Value == expectedEnv.Value {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("environment was not parsed correctly:\n%+v\n%+v", d.Environment, tt.expectedEnvironment)
+				}
 			}
 
 			if !reflect.DeepEqual(d.Forward, tt.expectedForward) {
@@ -237,7 +249,7 @@ forward:
 			}
 
 			defaultTimeout, _ := GetTimeout()
-			if defaultTimeout != d.Timeout {
+			if defaultTimeout != d.Timeout.Default {
 				t.Errorf("the default timeout wasn't applied, got %s, expected %s", d.Timeout, defaultTimeout)
 			}
 		})
@@ -326,27 +338,27 @@ services:
 func Test_loadLabels(t *testing.T) {
 	tests := []struct {
 		name   string
-		labels map[string]string
+		labels Labels
 		value  string
-		want   map[string]string
+		want   Labels
 	}{
 		{
 			name:   "no-var",
-			labels: map[string]string{"a": "1", "b": "2"},
+			labels: Labels{"a": "1", "b": "2"},
 			value:  "3",
-			want:   map[string]string{"a": "1", "b": "2"},
+			want:   Labels{"a": "1", "b": "2"},
 		},
 		{
 			name:   "var",
-			labels: map[string]string{"a": "1", "b": "${value}"},
+			labels: Labels{"a": "1", "b": "${value}"},
 			value:  "3",
-			want:   map[string]string{"a": "1", "b": "3"},
+			want:   Labels{"a": "1", "b": "3"},
 		},
 		{
 			name:   "missing",
-			labels: map[string]string{"a": "1", "b": "${valueX}"},
+			labels: Labels{"a": "1", "b": "${valueX}"},
 			value:  "1",
-			want:   map[string]string{"a": "1", "b": ""},
+			want:   Labels{"a": "1", "b": ""},
 		},
 	}
 
@@ -355,9 +367,10 @@ func Test_loadLabels(t *testing.T) {
 			dev := &Dev{Labels: tt.labels}
 			os.Setenv("value", tt.value)
 			dev.loadLabels()
-
-			if !reflect.DeepEqual(tt.want, dev.Labels) {
-				t.Errorf("got: '%v', expected: '%v'", dev.Labels, tt.want)
+			for key, value := range dev.Labels {
+				if tt.want[key] != value {
+					t.Errorf("got: '%v', expected: '%v'", dev.Labels, tt.want)
+				}
 			}
 		})
 	}
@@ -496,6 +509,52 @@ func TestDev_validateName(t *testing.T) {
 			}
 			if err := dev.validate(); (err != nil) != tt.wantErr {
 				t.Errorf("Dev.validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDev_readImageContext(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest []byte
+		expected *BuildInfo
+	}{
+		{
+			name: "context pointing to url",
+			manifest: []byte(`name: deployment
+image:
+  context: https://github.com/okteto/okteto.git
+`),
+			expected: &BuildInfo{
+				Context: "https://github.com/okteto/okteto.git",
+			},
+		},
+		{
+			name: "context pointing to path",
+			manifest: []byte(`name: deployment
+image:
+  context: .
+`),
+			expected: &BuildInfo{
+				Context:    ".",
+				Dockerfile: "Dockerfile",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dev, err := Read(tt.manifest)
+			if err != nil {
+				t.Fatalf("Wrong unmarshalling: %s", err.Error())
+			}
+			// Since dev isn't being unmarshalled through Read, apply defaults
+			// before validating.
+			if err := dev.setDefaults(); err != nil {
+				t.Fatalf("error applying defaults: %v", err)
+			}
+			if !reflect.DeepEqual(dev.Image, tt.expected) {
+				t.Fatalf("Expected %v but got %v", tt.expected, dev.Image)
 			}
 		})
 	}
@@ -802,15 +861,6 @@ func Test_validate(t *testing.T) {
 			expectErr: false,
 		},
 		{
-			name: "subpath-on-main-dev",
-			manifest: []byte(`
-          name: deployment
-          sync:
-            - .:/app
-          subpath: /app/docs`),
-			expectErr: true,
-		},
-		{
 			name: "valid-ssh-server-port",
 			manifest: []byte(`
       name: deployment
@@ -826,6 +876,28 @@ func Test_validate(t *testing.T) {
       sync:
         - .:/app
       sshServerPort: -1`),
+			expectErr: true,
+		},
+		{
+			name: "docker-with-persistent-volume",
+			manifest: []byte(`
+      name: deployment
+      sync:
+        - .:/app
+      docker:
+        enabled: true`),
+			expectErr: false,
+		},
+		{
+			name: "docker-without-persistent-volume",
+			manifest: []byte(`
+      name: deployment
+      sync:
+        - .:/app
+      persistentVolume:
+        enabled: false
+      docker:
+        enabled: true`),
 			expectErr: true,
 		},
 	}
@@ -943,7 +1015,7 @@ func TestGetTimeout(t *testing.T) {
 		want    time.Duration
 		wantErr bool
 	}{
-		{name: "default value", want: 30 * time.Second},
+		{name: "default value", want: 60 * time.Second},
 		{name: "env var", want: 134 * time.Second, env: "134s"},
 		{name: "bad env var", wantErr: true, env: "bad value"},
 	}
@@ -967,4 +1039,153 @@ func TestGetTimeout(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_loadEnvFile(t *testing.T) {
+	tests := []struct {
+		name      string
+		expectErr bool
+		content   map[string]string
+		existing  map[string]string
+		expected  map[string]string
+	}{
+		{
+			name:      "missing",
+			expectErr: true,
+		},
+		{
+			name:      "basic",
+			expectErr: false,
+			content:   map[string]string{"foo": "bar"},
+			expected:  map[string]string{"foo": "bar"},
+		},
+		{
+			name:      "doesnt-override",
+			expectErr: false,
+			content:   map[string]string{"foo": "bar"},
+			existing:  map[string]string{"foo": "var"},
+			expected:  map[string]string{"foo": "var"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			if tt.content != nil {
+				file, err := createEnvFile(tt.content)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				defer os.Remove(file)
+			}
+
+			for k, v := range tt.existing {
+				os.Setenv(k, v)
+			}
+
+			if err := godotenv.Load(); err != nil {
+				if tt.expectErr {
+					return
+				}
+
+				t.Fatal(err)
+			}
+
+			if tt.expectErr {
+				t.Fatal("call didn't fail as expected")
+			}
+
+			for k, v := range tt.expected {
+				got := os.Getenv(k)
+				if got != v {
+					t.Errorf("got %s=%s, expected %s=%s", k, got, k, v)
+				}
+			}
+		})
+	}
+}
+
+func Test_LoadDevWithEnvFile(t *testing.T) {
+	content := map[string]string{
+		"DEPLOYMENT":    "main",
+		"IMAGE_TAG":     "1.2",
+		"MY_VAR":        "from-env-file",
+		"SERVICE":       "secondary",
+		"SERVICE_IMAGE": "code/service:2.1",
+	}
+
+	f, err := createEnvFile(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer os.Remove(f)
+
+	manifest := []byte(`
+name: deployment-$DEPLOYMENT
+container: core
+image: code/core:$IMAGE_TAG
+command: ["uwsgi"]
+environment:
+- MY_VAR=$MY_VAR
+services:
+  - name: deployment-$SERVICE
+    container: core
+    image: $SERVICE_IMAGE
+    command: ["uwsgi"]
+    workdir: /app
+    environment:
+    - MY_VAR=$MY_VAR`)
+
+	if err := godotenv.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	main, err := Read(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(main.Services) != 1 {
+		t.Errorf("'services' was not parsed: %+v", main)
+	}
+
+	if main.Name != "deployment-main" {
+		t.Errorf("'name' was not parsed: got %s, expected %s", main.Name, "deployment-main")
+	}
+
+	if main.Image.Name != "code/core:1.2" {
+		t.Errorf("'tag' was not parsed: got %s, expected %s", main.Image.Name, "code/core:1.2")
+	}
+
+	if main.Environment[0].Value != "from-env-file" {
+		t.Errorf("'environment' was not parsed: got %s, expected %s", main.Environment[0].Value, "from-env-file")
+	}
+
+	if main.Services[0].Name != "deployment-secondary" {
+		t.Errorf("'name' was not parsed: got %s, expected %s", main.Services[0].Name, "deployment-main")
+	}
+
+	if main.Services[0].Image.Name != "code/service:2.1" {
+		t.Errorf("'tag' was not parsed: got %s, expected %s", main.Services[0].Image.Name, "code/service:2.1")
+	}
+
+	if main.Services[0].Environment[0].Value != "from-env-file" {
+		t.Errorf("'environment' was not parsed: got %s, expected %s", main.Services[0].Environment[0].Value, "from-env-file")
+	}
+}
+
+func createEnvFile(content map[string]string) (string, error) {
+	file, err := os.OpenFile(".env", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return "", err
+	}
+
+	for k, v := range content {
+		file.WriteString(fmt.Sprintf("%s=%s\n", k, v))
+	}
+
+	file.Sync()
+	return file.Name(), nil
 }

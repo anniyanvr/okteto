@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,7 +22,7 @@ import (
 	"github.com/okteto/okteto/pkg/okteto"
 )
 
-//RunWithRetry runs a function and it refreshes the kubernetes credentials if needed
+// RunWithRetry runs a function and it refreshes the kubernetes credentials if needed
 func RunWithRetry(f func() error) error {
 	err := f()
 

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,11 +27,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-//Namespace fetch credentials for a cluster namespace
+// Namespace fetch credentials for a cluster namespace
 func Namespace(ctx context.Context) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "namespace [name]",
 		Short: "Downloads k8s credentials for a namespace",
+		Args:  utils.ExactArgsAccepted(1, "https://okteto.com/docs/reference/cli/#namespace"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 
 			namespace := ""
@@ -51,7 +52,7 @@ func Namespace(ctx context.Context) *cobra.Command {
 	return cmd
 }
 
-//RunNamespace starts the kubeconfig sequence
+// RunNamespace starts the kubeconfig sequence
 func RunNamespace(ctx context.Context, namespace string) error {
 	if !okteto.IsAuthenticated() {
 		if !askIfLogin() {
@@ -111,7 +112,7 @@ func askIfLogin() bool {
 	return result
 }
 
-//askOktetoURL prompts for okteto URL
+// askOktetoURL prompts for okteto URL
 func askOktetoURL() (string, error) {
 	var oktetoURL string
 

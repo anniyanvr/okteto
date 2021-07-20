@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -35,7 +35,7 @@ func (akt *addAPIKeyTransport) RoundTrip(req *http.Request) (*http.Response, err
 	return akt.T.RoundTrip(req)
 }
 
-//NewAPIClient returns a new syncthing api client configured to call the syncthing api
+// NewAPIClient returns a new syncthing api client configured to call the syncthing api
 func NewAPIClient() *http.Client {
 	return &http.Client{
 		Timeout:   60 * time.Second,

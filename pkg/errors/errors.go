@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -61,7 +61,7 @@ var (
 	ErrSSHConnectError = fmt.Errorf("ssh start error")
 
 	// ErrNotInDevContainer is returned when an unsupported command is invoked from a dev container (e.g. okteto up)
-	ErrNotInDevContainer = fmt.Errorf("this command is not supported from inside an development container")
+	ErrNotInDevContainer = fmt.Errorf("'OKTETO_NAME' environment variable is defined. This command is not supported from inside a development container")
 
 	// ErrUnknownSyncError is returned when syncthing reports an unknown sync error
 	ErrUnknownSyncError = fmt.Errorf("unknown syncthing error")
@@ -83,6 +83,9 @@ var (
 
 	// ErrDevPodDeleted raised if dev pod is deleted in the middle of the "okteto up" sequence
 	ErrDevPodDeleted = fmt.Errorf("development container has been removed")
+
+	//ErrDivertNotSupported raised if the divert feature is not supported in the current cluster
+	ErrDivertNotSupported = fmt.Errorf("the 'divert' field is only supported in namespaces managed by Okteto")
 )
 
 // IsNotFound returns true if err is of the type not found
@@ -115,11 +118,14 @@ func IsTransient(err error) bool {
 	case strings.Contains(err.Error(), "operation time out"),
 		strings.Contains(err.Error(), "operation timed out"),
 		strings.Contains(err.Error(), "i/o timeout"),
+		strings.Contains(err.Error(), "unknown (get events)"),
 		strings.Contains(err.Error(), "Client.Timeout exceeded while awaiting headers"),
 		strings.Contains(err.Error(), "can't assign requested address"),
 		strings.Contains(err.Error(), "command exited without exit status or exit signal"),
 		strings.Contains(err.Error(), "connection refused"),
 		strings.Contains(err.Error(), "connection reset by peer"),
+		strings.Contains(err.Error(), "client connection lost"),
+		strings.Contains(err.Error(), "nodename nor servname provided, or not known"),
 		strings.Contains(err.Error(), "unexpected EOF"),
 		strings.Contains(err.Error(), "TLS handshake timeout"),
 		strings.Contains(err.Error(), "in the time allotted"),
@@ -134,7 +140,7 @@ func IsTransient(err error) bool {
 	}
 }
 
-//IsCredentialError need to refresh credentials
+// IsCredentialError need to refresh credentials
 func IsCredentialError(err error) bool {
 	if err == nil {
 		return false

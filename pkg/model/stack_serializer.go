@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,28 +15,36 @@ package model
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/kballard/go-shellquote"
 	apiv1 "k8s.io/api/core/v1"
+	resource "k8s.io/apimachinery/pkg/api/resource"
+)
+
+const (
+	DefaultReplicasNumber = 1
 )
 
 //Stack represents an okteto stack
 type StackRaw struct {
-	Version   string                 `yaml:"version,omitempty"`
-	Name      string                 `yaml:"name"`
-	Namespace string                 `yaml:"namespace,omitempty"`
-	Services  map[string]*ServiceRaw `yaml:"services,omitempty"`
-	Endpoints map[string]Endpoint    `yaml:"endpoints,omitempty"`
+	Version   string                     `yaml:"version,omitempty"`
+	Name      string                     `yaml:"name"`
+	Namespace string                     `yaml:"namespace,omitempty"`
+	Services  map[string]*ServiceRaw     `yaml:"services,omitempty"`
+	Endpoints EndpointSpec               `yaml:"endpoints,omitempty"`
+	Volumes   map[string]*VolumeTopLevel `yaml:"volumes,omitempty"`
 
 	// Docker-compose not implemented
 	Networks *WarningType `yaml:"networks,omitempty"`
-	Volumes  *WarningType `yaml:"volumes,omitempty"`
-	Configs  *WarningType `yaml:"configs,omitempty"`
-	Secrets  *WarningType `yaml:"secrets,omitempty"`
 
-	Warnings []string
+	Configs *WarningType `yaml:"configs,omitempty"`
+	Secrets *WarningType `yaml:"secrets,omitempty"`
+
+	Warnings StackWarnings
 }
 
 //Service represents an okteto stack service
@@ -47,43 +55,47 @@ type ServiceRaw struct {
 	CapAdd                   []apiv1.Capability `yaml:"capAdd,omitempty"`
 	CapDropSneakCase         []apiv1.Capability `yaml:"cap_drop,omitempty"`
 	CapDrop                  []apiv1.Capability `yaml:"capDrop,omitempty"`
-	Command                  Args               `yaml:"command,omitempty"`
-	Entrypoint               Command            `yaml:"entrypoint,omitempty"`
-	Args                     Args               `yaml:"args,omitempty"`
-	EnvFilesSneakCase        []string           `yaml:"env_file,omitempty"`
-	EnvFiles                 []string           `yaml:"envFile,omitempty"`
-	Environment              *RawMessage        `yaml:"environment,omitempty"`
-	Expose                   *RawMessage        `yaml:"expose,omitempty"`
+	Command                  CommandStack       `yaml:"command,omitempty"`
+	CpuCount                 Quantity           `yaml:"cpu_count,omitempty"`
+	Cpus                     Quantity           `yaml:"cpus,omitempty"`
+	Entrypoint               CommandStack       `yaml:"entrypoint,omitempty"`
+	Args                     ArgsStack          `yaml:"args,omitempty"`
+	EnvFilesSneakCase        EnvFiles           `yaml:"env_file,omitempty"`
+	EnvFiles                 EnvFiles           `yaml:"envFile,omitempty"`
+	Environment              Environment        `yaml:"environment,omitempty"`
+	Expose                   []PortRaw          `yaml:"expose,omitempty"`
+	Healthcheck              *HealthCheck       `yaml:"healthcheck,omitempty"`
 	Image                    string             `yaml:"image,omitempty"`
-	Labels                   *RawMessage        `json:"labels,omitempty" yaml:"labels,omitempty"`
-	Annotations              map[string]string  `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	Labels                   Labels             `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Annotations              Annotations        `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	MemLimit                 Quantity           `yaml:"mem_limit,omitempty"`
+	MemReservation           Quantity           `yaml:"mem_reservation,omitempty"`
 	Ports                    []PortRaw          `yaml:"ports,omitempty"`
-	Scale                    int32              `yaml:"scale"`
+	Restart                  string             `yaml:"restart,omitempty"`
+	Scale                    *int32             `yaml:"scale"`
 	StopGracePeriodSneakCase *RawMessage        `yaml:"stop_grace_period,omitempty"`
 	StopGracePeriod          *RawMessage        `yaml:"stopGracePeriod,omitempty"`
 	Volumes                  []StackVolume      `yaml:"volumes,omitempty"`
 	WorkingDirSneakCase      string             `yaml:"working_dir,omitempty"`
-	WorkingDir               string             `yaml:"workingDir,omitempty"`
+	Workdir                  string             `yaml:"workdir,omitempty"`
+	DependsOn                DependsOn          `yaml:"depends_on,omitempty"`
 
 	Public    bool            `yaml:"public,omitempty"`
-	Replicas  int32           `yaml:"replicas"`
+	Replicas  *int32          `yaml:"replicas"`
 	Resources *StackResources `yaml:"resources,omitempty"`
 
 	BlkioConfig       *WarningType `yaml:"blkio_config,omitempty"`
-	CpuCount          *WarningType `yaml:"cpu_count,omitempty"`
 	CpuPercent        *WarningType `yaml:"cpu_percent,omitempty"`
 	CpuShares         *WarningType `yaml:"cpu_shares,omitempty"`
 	CpuPeriod         *WarningType `yaml:"cpu_period,omitempty"`
 	CpuQuota          *WarningType `yaml:"cpu_quota,omitempty"`
 	CpuRtRuntime      *WarningType `yaml:"cpu_rt_runtime,omitempty"`
 	CpuRtPeriod       *WarningType `yaml:"cpu_rt_period,omitempty"`
-	Cpus              *WarningType `yaml:"cpus,omitempty"`
 	Cpuset            *WarningType `yaml:"cpuset,omitempty"`
 	CgroupParent      *WarningType `yaml:"cgroup_parent,omitempty"`
 	Configs           *WarningType `yaml:"configs,omitempty"`
 	ContainerName     *WarningType `yaml:"container_name,omitempty"`
 	CredentialSpec    *WarningType `yaml:"credential_spec,omitempty"`
-	DependsOn         *WarningType `yaml:"depends_on,omitempty"`
 	DeviceCgroupRules *WarningType `yaml:"device_cgroup_rules,omitempty"`
 	Devices           *WarningType `yaml:"devices,omitempty"`
 	Dns               *WarningType `yaml:"dns,omitempty"`
@@ -94,7 +106,6 @@ type ServiceRaw struct {
 	ExternalLinks     *WarningType `yaml:"external_links,omitempty"`
 	ExtraHosts        *WarningType `yaml:"extra_hosts,omitempty"`
 	GroupAdd          *WarningType `yaml:"group_add,omitempty"`
-	Healthcheck       *WarningType `yaml:"healthcheck,omitempty"`
 	Hostname          *WarningType `yaml:"hostname,omitempty"`
 	Init              *WarningType `yaml:"init,omitempty"`
 	Ipc               *WarningType `yaml:"ipc,omitempty"`
@@ -104,8 +115,6 @@ type ServiceRaw struct {
 	Network_mode      *WarningType `yaml:"network_mode,omitempty"`
 	Networks          *WarningType `yaml:"networks,omitempty"`
 	MacAddress        *WarningType `yaml:"mac_address,omitempty"`
-	MemLimit          *WarningType `yaml:"mem_limit,omitempty"`
-	MemReservation    *WarningType `yaml:"mem_reservation,omitempty"`
 	MemSwappiness     *WarningType `yaml:"mem_swappiness,omitempty"`
 	MemswapLimit      *WarningType `yaml:"memswap_limit,omitempty"`
 	OomKillDisable    *WarningType `yaml:"oom_kill_disable,omitempty"`
@@ -117,7 +126,6 @@ type ServiceRaw struct {
 	Profiles          *WarningType `yaml:"profiles,omitempty"`
 	PullPolicy        *WarningType `yaml:"pull_policy,omitempty"`
 	ReadOnly          *WarningType `yaml:"read_only,omitempty"`
-	Restart           *string      `yaml:"restart,omitempty"`
 	Runtime           *WarningType `yaml:"runtime,omitempty"`
 	Secrets           *WarningType `yaml:"secrets,omitempty"`
 	SecurityOpt       *WarningType `yaml:"security_opt,omitempty"`
@@ -135,23 +143,35 @@ type ServiceRaw struct {
 }
 
 type DeployInfoRaw struct {
-	Replicas  int32        `yaml:"replicas,omitempty"`
-	Resources ResourcesRaw `yaml:"resources,omitempty"`
+	Replicas      *int32            `yaml:"replicas,omitempty"`
+	Resources     ResourcesRaw      `yaml:"resources,omitempty"`
+	Labels        Labels            `yaml:"labels,omitempty"`
+	RestartPolicy *RestartPolicyRaw `yaml:"restart_policy,omitempty"`
 
 	EndpointMode   *WarningType `yaml:"endpoint_mode,omitempty"`
-	Labels         *WarningType `yaml:"labels,omitempty"`
 	Mode           *WarningType `yaml:"mode,omitempty"`
 	Placement      *WarningType `yaml:"placement,omitempty"`
 	Constraints    *WarningType `yaml:"constraints,omitempty"`
 	Preferences    *WarningType `yaml:"preferences,omitempty"`
-	RestartPolicy  *WarningType `yaml:"restart_policy,omitempty"`
 	RollbackConfig *WarningType `yaml:"rollback_config,omitempty"`
 	UpdateConfig   *WarningType `yaml:"update_config,omitempty"`
+}
+
+type RestartPolicyRaw struct {
+	Condition   string `yaml:"condition,omitempty"`
+	MaxAttempts int32  `yaml:"max_attempts,omitempty"`
+
+	Delay  *WarningType `yaml:"delay,omitempty"`
+	Window *WarningType `yaml:"window,omitempty"`
 }
 
 type PortRaw struct {
 	ContainerPort int32
 	HostPort      int32
+	ContainerFrom int32
+	ContainerTo   int32
+	HostFrom      int32
+	HostTo        int32
 	Protocol      apiv1.Protocol
 }
 
@@ -168,6 +188,18 @@ type DeployComposeResources struct {
 	Cpus    Quantity     `json:"cpus,omitempty" yaml:"cpus,omitempty"`
 	Memory  Quantity     `json:"memory,omitempty" yaml:"memory,omitempty"`
 	Devices *WarningType `json:"devices,omitempty" yaml:"devices,omitempty"`
+}
+
+type VolumeTopLevel struct {
+	Labels      Labels            `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Annotations Annotations       `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	Name        string            `json:"name,omitempty" yaml:"name,omitempty"`
+	Size        Quantity          `json:"size,omitempty" yaml:"size,omitempty"`
+	Class       string            `json:"class,omitempty" yaml:"class,omitempty"`
+	DriverOpts  map[string]string `json:"driver_opts,omitempty" yaml:"driver_opts,omitempty"`
+
+	Driver   *WarningType `json:"driver,omitempty" yaml:"driver,omitempty"`
+	External *WarningType `json:"external,omitempty" yaml:"external,omitempty"`
 }
 type RawMessage struct {
 	unmarshal func(interface{}) error
@@ -186,116 +218,406 @@ func (s *Stack) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 	s.Endpoints = stackRaw.Endpoints
 
+	if len(s.Endpoints) == 0 {
+		s.Endpoints = getEndpointsFromPorts(stackRaw.Services)
+	}
+	s.Volumes = make(map[string]*VolumeSpec)
+	for volumeName, volume := range stackRaw.Volumes {
+		volumeSpec, err := unmarshalVolume(volume)
+		if err != nil {
+			return err
+		}
+		s.Volumes[sanitizeName(volumeName)] = volumeSpec
+	}
+
+	sanitizedServicesNames := make(map[string]string)
 	s.Services = make(map[string]*Service)
 	for svcName, svcRaw := range stackRaw.Services {
-		s.Services[svcName], err = svcRaw.ToService(svcName, s.IsCompose)
+		if shouldBeSanitized(svcName) {
+			newName := sanitizeName(svcName)
+			sanitizedServicesNames[svcName] = newName
+			svcName = newName
+		}
+		s.Services[svcName], err = svcRaw.ToService(svcName, s)
 		if err != nil {
 			return err
 		}
 	}
-	stackRaw.Warnings = make([]string, 0)
+	if err := validateDependsOn(s); err != nil {
+		return err
+	}
 
-	setWarnings(&stackRaw)
-	s.Warnings = stackRaw.Warnings
+	s.Warnings.NotSupportedFields = getNotSupportedFields(&stackRaw)
+	s.Warnings.SanitizedServices = sanitizedServicesNames
+	s.Warnings.VolumeMountWarnings = make([]string, 0)
 	return nil
 }
 
-func (serviceRaw *ServiceRaw) ToService(svcName string, isCompose bool) (*Service, error) {
-	s := &Service{}
+func unmarshalVolume(volume *VolumeTopLevel) (*VolumeSpec, error) {
+
+	result := &VolumeSpec{}
+	if volume == nil {
+		result.Labels = make(Labels)
+		result.Annotations = make(Annotations)
+	} else {
+		result.Labels = make(Labels)
+		if volume.Annotations == nil {
+			result.Annotations = make(Annotations)
+		} else {
+			result.Annotations = volume.Annotations
+		}
+
+		for key, value := range volume.Labels {
+			result.Annotations[key] = value
+		}
+
+		if volume.Size.Value.Cmp(resource.MustParse("0")) > 0 {
+			result.Size = volume.Size
+		}
+		if volume.DriverOpts != nil {
+			for key, value := range volume.DriverOpts {
+				if key == "size" {
+					qK8s, err := resource.ParseQuantity(value)
+					if err != nil {
+						return nil, err
+					}
+					result.Size.Value = qK8s
+				}
+				if key == "class" {
+					result.Class = value
+				}
+			}
+		}
+		if result.Class == "" {
+			result.Class = volume.Class
+		}
+	}
+
+	return result, nil
+
+}
+
+func getEndpointsFromPorts(services map[string]*ServiceRaw) EndpointSpec {
+	endpoints := make(EndpointSpec)
+	for svcName, svc := range services {
+		accessiblePorts := getAccessiblePorts(svc.Ports)
+		if len(accessiblePorts) >= 2 {
+			for _, p := range accessiblePorts {
+				endpointName := fmt.Sprintf("%s-%d", svcName, p.HostPort)
+				endpoints[endpointName] = Endpoint{
+					Rules: []EndpointRule{
+						{
+							Path:    "/",
+							Service: svcName,
+							Port:    p.ContainerPort,
+						},
+					},
+				}
+			}
+		}
+	}
+	return endpoints
+}
+
+func getAccessiblePorts(ports []PortRaw) []PortRaw {
+	accessiblePorts := make([]PortRaw, 0)
+	for _, p := range ports {
+		if p.HostPort != 0 && !IsSkippablePort(p.ContainerPort) {
+			accessiblePorts = append(accessiblePorts, p)
+		}
+	}
+	return accessiblePorts
+}
+
+func (serviceRaw *ServiceRaw) ToService(svcName string, stack *Stack) (*Service, error) {
+	svc := &Service{}
 	var err error
-	s.Resources, err = unmarshalDeployResources(serviceRaw.Deploy, serviceRaw.Resources)
-	if err != nil {
-		return nil, err
-	}
-	s.Replicas, err = unmarshalDeployReplicas(serviceRaw.Deploy, serviceRaw.Scale, serviceRaw.Replicas)
-	if err != nil {
-		return nil, err
-	}
-	s.Image = serviceRaw.Image
-	s.Build = serviceRaw.Build
 
-	s.CapAdd = serviceRaw.CapAdd
+	svc.Resources, err = unmarshalDeployResources(serviceRaw.Deploy, serviceRaw.Resources, serviceRaw.CpuCount, serviceRaw.Cpus, serviceRaw.MemLimit, serviceRaw.MemReservation)
+	if err != nil {
+		return nil, err
+	}
+	svc.Replicas, err = unmarshalDeployReplicas(serviceRaw.Deploy, serviceRaw.Scale, serviceRaw.Replicas)
+	if err != nil {
+		return nil, err
+	}
+	svc.Image, err = ExpandEnv(serviceRaw.Image)
+	if err != nil {
+		return nil, err
+	}
+	svc.Build = serviceRaw.Build
+
+	svc.CapAdd = serviceRaw.CapAdd
 	if len(serviceRaw.CapAddSneakCase) > 0 {
-		s.CapAdd = serviceRaw.CapAddSneakCase
+		svc.CapAdd = serviceRaw.CapAddSneakCase
 	}
-	s.CapDrop = serviceRaw.CapDrop
+	svc.CapDrop = serviceRaw.CapDrop
 	if len(serviceRaw.CapDropSneakCase) > 0 {
-		s.CapDrop = serviceRaw.CapDropSneakCase
+		svc.CapDrop = serviceRaw.CapDropSneakCase
 	}
 
-	if isCompose {
+	if err := validateHealthcheck(serviceRaw.Healthcheck); err != nil {
+		return nil, err
+	}
+	if serviceRaw.Healthcheck != nil && !serviceRaw.Healthcheck.Disable {
+		svc.Healtcheck = serviceRaw.Healthcheck
+		translateHealtcheckCurlToHTTP(svc.Healtcheck)
+	}
+
+	svc.Annotations = serviceRaw.Annotations
+	if svc.Annotations == nil {
+		svc.Annotations = make(Annotations)
+	}
+	for key, value := range unmarshalLabels(serviceRaw.Labels, serviceRaw.Deploy) {
+		svc.Annotations[key] = value
+	}
+
+	if stack.IsCompose {
 		if len(serviceRaw.Args.Values) > 0 {
 			return nil, fmt.Errorf("Unsupported field for services.%s: 'args'", svcName)
 		}
-		s.Entrypoint.Values = serviceRaw.Entrypoint.Values
-		s.Command.Values = serviceRaw.Command.Values
-	} else {
+		svc.Entrypoint.Values = serviceRaw.Entrypoint.Values
+		svc.Command.Values = serviceRaw.Command.Values
+
+	} else { // isOktetoStack
 		if len(serviceRaw.Entrypoint.Values) > 0 {
 			return nil, fmt.Errorf("Unsupported field for services.%s: 'entrypoint'", svcName)
 		}
-		s.Entrypoint.Values = serviceRaw.Command.Values
+		svc.Entrypoint.Values = serviceRaw.Command.Values
 		if len(serviceRaw.Command.Values) == 1 {
 			if strings.Contains(serviceRaw.Command.Values[0], " ") {
-				s.Entrypoint.Values = []string{"sh", "-c", serviceRaw.Command.Values[0]}
+				svc.Entrypoint.Values = []string{"sh", "-c", serviceRaw.Command.Values[0]}
 			}
 		}
-		s.Command.Values = serviceRaw.Args.Values
+		svc.Command.Values = serviceRaw.Args.Values
 	}
 
-	s.EnvFiles = serviceRaw.EnvFiles
+	svc.EnvFiles = serviceRaw.EnvFiles
 	if len(serviceRaw.EnvFilesSneakCase) > 0 {
-		s.EnvFiles = serviceRaw.EnvFilesSneakCase
+		svc.EnvFiles = serviceRaw.EnvFilesSneakCase
 	}
 
-	s.Environment, err = unmarshalEnvs(serviceRaw.Environment)
+	svc.Environment = serviceRaw.Environment
+
+	svc.DependsOn = serviceRaw.DependsOn
+
+	svc.Public, svc.Ports, err = getSvcPorts(serviceRaw.Public, serviceRaw.Ports, serviceRaw.Expose)
 	if err != nil {
 		return nil, err
 	}
 
-	s.Public = serviceRaw.Public
-
-	for _, p := range serviceRaw.Ports {
-		if p.HostPort != 0 {
-			s.Public = true
-		}
-		s.Ports = append(s.Ports, Port{Port: p.ContainerPort, Protocol: p.Protocol})
-	}
-
-	s.Expose, err = unmarshalExpose(serviceRaw.Expose)
+	svc.StopGracePeriod, err = unmarshalDuration(serviceRaw.StopGracePeriod)
 	if err != nil {
 		return nil, err
 	}
 
-	s.Labels, err = unmarshalLabels(serviceRaw.Labels)
-	if err != nil {
-		return nil, err
-	}
-
-	s.Annotations = serviceRaw.Annotations
-	for key, annotation := range serviceRaw.Annotations {
-		if _, ok := s.Annotations[key]; !ok {
-			s.Annotations[key] = annotation
-		}
-	}
-
-	s.StopGracePeriod, err = unmarshalDuration(serviceRaw.StopGracePeriod)
-	if err != nil {
-		return nil, err
-	}
 	if serviceRaw.StopGracePeriodSneakCase != nil {
-		s.StopGracePeriod, err = unmarshalDuration(serviceRaw.StopGracePeriodSneakCase)
+		svc.StopGracePeriod, err = unmarshalDuration(serviceRaw.StopGracePeriodSneakCase)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	s.Volumes = serviceRaw.Volumes
-	s.WorkingDir = serviceRaw.WorkingDir
-	if serviceRaw.WorkingDirSneakCase != "" {
-		s.WorkingDir = serviceRaw.WorkingDirSneakCase
+	svc.Volumes, svc.VolumeMounts = splitVolumesByType(serviceRaw.Volumes, stack)
+	for _, volume := range svc.VolumeMounts {
+		if !isNamedVolumeDeclared(volume) {
+			return nil, fmt.Errorf("Named volume '%s' is used in service '%s' but no declaration was found in the volumes section.", volume.ToString(), svcName)
+		}
 	}
 
-	return s, nil
+	svc.Workdir = serviceRaw.Workdir
+	if serviceRaw.WorkingDirSneakCase != "" {
+		svc.Workdir = serviceRaw.WorkingDirSneakCase
+	}
+	svc.Workdir, err = ExpandEnv(svc.Workdir)
+	if err != nil {
+		return nil, err
+	}
+
+	svc.RestartPolicy, err = getRestartPolicy(svcName, serviceRaw.Deploy, serviceRaw.Restart)
+	if err != nil {
+		return nil, err
+	}
+	if serviceRaw.Deploy != nil && serviceRaw.Deploy.RestartPolicy != nil {
+		svc.BackOffLimit = serviceRaw.Deploy.RestartPolicy.MaxAttempts
+	}
+	return svc, nil
+}
+
+func validateHealthcheck(healthcheck *HealthCheck) error {
+	if healthcheck != nil && len(healthcheck.Test) != 0 && healthcheck.Test[0] == "NONE" {
+		healthcheck.Test = make(HealtcheckTest, 0)
+		healthcheck.Disable = true
+	}
+	if healthcheck != nil && healthcheck.HTTP == nil && len(healthcheck.Test) == 0 && !healthcheck.Disable {
+		return fmt.Errorf("Healthcheck.test must be set")
+	}
+	if healthcheck != nil && healthcheck.HTTP != nil && len(healthcheck.Test) != 0 && !healthcheck.Disable {
+		return fmt.Errorf("healthcheck.test can not be set along with healthcheck.http")
+	}
+	return nil
+}
+
+func translateHealtcheckCurlToHTTP(healthcheck *HealthCheck) {
+	localPortTestRegex := `^curl ((-f|--fail) )?'?((http|https)://)?(localhost|0.0.0.0):\d+(\/\w*)?'?$`
+	regexp, err := regexp.Compile(localPortTestRegex)
+	if err != nil {
+		return
+	}
+	testString := strings.Join(healthcheck.Test, " ")
+	if regexp.MatchString(testString) {
+		var firstSlashIndex, portStart int
+		if strings.Contains(testString, "://") {
+			testStringCopy := testString
+			for i := 0; i < 3; i++ {
+				firstSlashIndex += strings.Index(testStringCopy[firstSlashIndex:], "/") + 1
+			}
+			testStringCopy = testString
+			for i := 0; i < 2; i++ {
+				portStart += strings.Index(testStringCopy[portStart:], ":") + 1
+			}
+			portStart--
+			firstSlashIndex--
+		} else {
+			firstSlashIndex = strings.Index(testString, "/")
+			portStart = strings.Index(testString, ":")
+		}
+
+		var port, path string
+		if firstSlashIndex != -1 {
+			port = testString[portStart+1 : firstSlashIndex]
+			path = testString[firstSlashIndex:]
+		} else {
+			port = testString[portStart+1:]
+			path = "/"
+		}
+		p, err := strconv.Atoi(port)
+		if err != nil {
+			return
+		}
+		healthcheck.HTTP = &HTTPHealtcheck{Path: path, Port: int32(p)}
+		healthcheck.Test = make(HealtcheckTest, 0)
+	}
+}
+
+func getSvcPorts(public bool, rawPorts, rawExpose []PortRaw) (bool, []Port, error) {
+	rawPorts = expandRangePorts(rawPorts)
+
+	if !public && len(getAccessiblePorts(rawPorts)) == 1 {
+		public = true
+	}
+	if len(rawExpose) > 0 && len(rawPorts) == 0 {
+		public = false
+	}
+
+	ports := make([]Port, 0)
+	for _, p := range rawPorts {
+		if err := validatePort(p, ports); err == nil {
+			ports = append(ports, Port{HostPort: p.HostPort, ContainerPort: p.ContainerPort, Protocol: p.Protocol})
+		} else {
+			return false, ports, err
+		}
+	}
+	rawExpose = expandRangePorts(rawExpose)
+	for _, p := range rawExpose {
+		newPort := Port{HostPort: p.HostPort, ContainerPort: p.ContainerPort, Protocol: p.Protocol}
+		if p.ContainerPort == 0 {
+			if !IsAlreadyAdded(newPort, ports) {
+				ports = append(ports, newPort)
+			}
+		} else {
+			if !IsAlreadyAddedExpose(newPort, ports) {
+				ports = append(ports, newPort)
+			}
+		}
+	}
+	return public, ports, nil
+}
+
+func expandRangePorts(ports []PortRaw) []PortRaw {
+	newPortList := make([]PortRaw, 0)
+	for _, p := range ports {
+		if p.ContainerPort != 0 {
+			newPortList = append(newPortList, p)
+		} else {
+			portStart := p.ContainerFrom
+			portFinish := p.ContainerTo
+			aux := 0
+			for portStart+int32(aux) != portFinish+1 {
+				if p.HostFrom != 0 {
+					newPortList = append(newPortList, PortRaw{ContainerPort: p.ContainerFrom + int32(aux)})
+				} else {
+					newPortList = append(newPortList, PortRaw{ContainerPort: p.ContainerFrom + int32(aux), HostPort: 0})
+				}
+				if portStart > portFinish {
+					aux--
+				} else {
+					aux++
+				}
+
+			}
+		}
+	}
+	return newPortList
+}
+
+func validatePort(newPort PortRaw, ports []Port) error {
+	for _, p := range ports {
+		if newPort.ContainerPort == p.HostPort {
+			return fmt.Errorf("Container port '%d' is already declared as host port in port '%d:%d'", newPort.ContainerPort, p.HostPort, p.ContainerPort)
+		}
+		if newPort.HostPort == p.ContainerPort {
+			if p.HostPort == 0 {
+				return fmt.Errorf("Host port '%d' is already declared as container port in port '%d'", newPort.HostPort, p.ContainerPort)
+			} else {
+				return fmt.Errorf("Host port '%d' is already declared as container port in port '%d:%d'", newPort.HostPort, p.HostPort, p.ContainerPort)
+			}
+		}
+	}
+	return nil
+}
+
+func isNamedVolumeDeclared(volume StackVolume) bool {
+	if volume.LocalPath != "" {
+		if strings.HasPrefix(volume.LocalPath, "/") {
+			return true
+		}
+		if strings.HasPrefix(volume.LocalPath, "./") {
+			return true
+		}
+		if FileExists(volume.LocalPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func splitVolumesByType(volumes []StackVolume, s *Stack) ([]StackVolume, []StackVolume) {
+	topLevelVolumes := make([]StackVolume, 0)
+	mountedVolumes := make([]StackVolume, 0)
+	for _, volume := range volumes {
+		if volume.LocalPath == "" || isInVolumesTopLevelSection(volume.LocalPath, s) {
+			topLevelVolumes = append(topLevelVolumes, volume)
+		} else {
+			mountedVolumes = append(mountedVolumes, volume)
+		}
+	}
+	return topLevelVolumes, mountedVolumes
+}
+
+func unmarshalLabels(labels Labels, deployInfo *DeployInfoRaw) Labels {
+	result := Labels{}
+	if deployInfo != nil {
+		if deployInfo.Labels != nil {
+			for key, value := range deployInfo.Labels {
+				result[key] = value
+			}
+		}
+	}
+	for key, value := range labels {
+		result[key] = value
+	}
+	return result
 }
 
 func (msg *RawMessage) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -317,68 +639,214 @@ func (warning *WarningType) UnmarshalYAML(unmarshal func(interface{}) error) err
 }
 
 // UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
+func (dependsOn *DependsOn) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	result := make(DependsOn)
+
+	type dependsOnSyntax DependsOn // prevent recursion
+	var d dependsOnSyntax
+	err := unmarshal(&d)
+	if err == nil {
+		for key, value := range d {
+			if value.Condition != DependsOnServiceRunning && value.Condition != DependsOnServiceHealthy && value.Condition != DependsOnServiceCompleted {
+				return fmt.Errorf("'%s' is unsupported. Condition must be one of '%s', '%s' or '%s'", value.Condition, DependsOnServiceRunning, DependsOnServiceHealthy, DependsOnServiceCompleted)
+			}
+			result[key] = value
+		}
+		*dependsOn = result
+		return nil
+	}
+	var dList []string
+	err = unmarshal(&dList)
+	if err == nil {
+		for _, svc := range dList {
+			result[svc] = DependsOnConditionSpec{Condition: DependsOnServiceRunning}
+		}
+		*dependsOn = result
+		return nil
+	}
+	return err
+}
+
+// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
 func (p *PortRaw) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var rawPort string
-	err := unmarshal(&rawPort)
+	var rawPortString string
+	err := unmarshal(&rawPortString)
 	if err != nil {
 		return fmt.Errorf("Port field is only supported in short syntax")
 	}
 
-	parts := strings.Split(rawPort, ":")
-	var portString string
-	var hostPortString string
-	if len(parts) == 1 {
-		if strings.Contains(portString, "-") {
-			return fmt.Errorf("Can not convert %s. Range ports are not supported.", rawPort)
-		}
-
-		portString = parts[0]
-	} else if len(parts) <= 3 {
-		if strings.Contains(portString, "-") {
-			return fmt.Errorf("Can not convert %s. Range ports are not supported.", rawPort)
-		}
-
-		portString = parts[len(parts)-1]
-
-		hostPortString = strings.Join(parts[:len(parts)-1], ":")
-		parts := strings.Split(hostPortString, ":")
-		hostString := parts[len(parts)-1]
-		port, err := strconv.Atoi(hostString)
-		if err != nil {
-			return fmt.Errorf("Can not convert %s to a port.", hostString)
-		}
-		p.HostPort = int32(port)
-
+	if !strings.Contains(rawPortString, ":") {
+		err = getPortWithoutMapping(p, rawPortString)
 	} else {
-		return fmt.Errorf(malformedPortForward, rawPort)
+		err = getPortWithMapping(p, rawPortString)
 	}
 
-	p.Protocol = apiv1.ProtocolTCP
-	if strings.Contains(portString, "/") {
-		portAndProtocol := strings.Split(portString, "/")
-		portString = portAndProtocol[0]
-		if protocol, err := getProtocol(portAndProtocol[1]); err == nil {
-			p.Protocol = protocol
-		} else {
-			return fmt.Errorf("Can not convert %s. Only TCP ports are allowed.", portString)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func getPortWithoutMapping(p *PortRaw, portString string) error {
+	var err error
+	p.ContainerFrom, p.ContainerTo, p.Protocol, err = getRangePorts(portString)
+	if err != nil {
+		return err
+	}
+	if p.ContainerFrom == 0 {
+		portDigit, protocol, err := getPortAndProtocol(portString, portString)
+		if err != nil {
+			return err
 		}
+		port, err := getPortFromString(portDigit, portString)
+		if err != nil {
+			return err
+		}
+		p.ContainerPort = port
+		p.Protocol = protocol
 	}
+	return nil
+}
 
+func getRangePorts(portString string) (int32, int32, apiv1.Protocol, error) {
+	if strings.Contains(portString, "-") {
+		rangeSplitted := strings.Split(portString, "-")
+		if len(rangeSplitted) != 2 {
+			return 0, 0, "", fmt.Errorf("Can not convert '%s' to a port.", portString)
+		}
+		fromString, toString := rangeSplitted[0], rangeSplitted[1]
+		toString, protocol, err := getPortAndProtocol(toString, portString)
+		if err != nil {
+			return 0, 0, "", err
+		}
+		fromPort, err := getPortFromString(fromString, portString)
+		if err != nil {
+			return 0, 0, "", err
+		}
+		toPort, err := getPortFromString(toString, portString)
+		if err != nil {
+			return 0, 0, "", err
+		}
+		return fromPort, toPort, protocol, nil
+	}
+	return 0, 0, "", nil
+}
+
+func getPortFromString(portString, originalPortString string) (int32, error) {
 	port, err := strconv.Atoi(portString)
 	if err != nil {
-		return fmt.Errorf("Can not convert %s to a port.", portString)
+		return 0, fmt.Errorf("Can not convert '%s' to a port: %s is not a number", originalPortString, portString)
 	}
-	p.ContainerPort = int32(port)
+	return int32(port), nil
+}
 
+func getPortAndProtocol(portString, originalPortString string) (string, apiv1.Protocol, error) {
+	var err error
+	protocol := apiv1.ProtocolTCP
+	if strings.Contains(portString, "/") {
+		portProtocolSplitted := strings.Split(portString, "/")
+		if len(portProtocolSplitted) != 2 {
+			return "", protocol, fmt.Errorf("Can not convert '%s' to a port.", originalPortString)
+		}
+		portString = portProtocolSplitted[0]
+		protocol, err = getProtocol(portProtocolSplitted[1])
+		if err != nil {
+			return "", protocol, fmt.Errorf("Can not convert '%s' to a port: %s", originalPortString, err.Error())
+		}
+	}
+	return portString, protocol, nil
+}
+
+func getPortWithMapping(p *PortRaw, portString string) error {
+	localToContainer := strings.Split(portString, ":")
+	if len(localToContainer) > 3 {
+		return fmt.Errorf(malformedPortForward, portString)
+	}
+
+	containerPortString := localToContainer[len(localToContainer)-1]
+	var err error
+	p.ContainerFrom, p.ContainerTo, p.Protocol, err = getRangePorts(containerPortString)
+	if err != nil {
+		return err
+	}
+	hostPortString := strings.Join(localToContainer[:len(localToContainer)-1], ":")
+	p.HostFrom, p.HostTo, _, err = getRangePorts(hostPortString)
+	if err != nil {
+		return err
+	}
+	if (p.ContainerFrom - p.ContainerTo) != (p.HostFrom - p.HostTo) {
+		return fmt.Errorf("Can not convert '%s' to a port: Ranges must be of the same length", portString)
+	}
+
+	if p.ContainerFrom == 0 {
+		if strings.Contains(hostPortString, ":") {
+			return fmt.Errorf("Can not convert '%s' to a port: Host IP is not allowed", portString)
+		}
+		hostPortString, err = ExpandEnv(hostPortString)
+		if err != nil {
+			return err
+		}
+		p.HostPort, err = getPortFromString(hostPortString, portString)
+		if err != nil {
+			return err
+		}
+		if IsSkippablePort(p.HostPort) {
+			p.HostPort = 0
+		}
+
+		portDigit, protocol, err := getPortAndProtocol(containerPortString, portString)
+		if err != nil {
+			return err
+		}
+		port, err := getPortFromString(portDigit, portString)
+		if err != nil {
+			return err
+		}
+		p.ContainerPort = port
+		p.Protocol = protocol
+	}
 	return nil
+}
+
+func IsSkippablePort(port int32) bool {
+	skippablePorts := map[int32]string{3306: "MySQL", 1521: "OracleDB", 1830: "OracleDB", 5432: "PostgreSQL",
+		1433: "SQL Server", 1434: "SQL Server", 7210: "MaxDB", 7473: "Neo4j", 7474: "Neo4j", 8529: "ArangoDB",
+		7000: "Cassandra", 7001: "Cassandra", 9042: "Cassandra", 8086: "InfluxDB", 9200: "Elasticsearch", 9300: "Elasticsearch",
+		5984: "CouchDB", 27017: "MongoDB", 27018: "MongoDB", 27019: "MongoDB", 28017: "MongoDB", 6379: "Redis",
+		8087: "Riak", 8098: "Riak", 828015: "Rethink", 29015: "Rethink", 7574: "Solr", 8983: "Solr",
+		2345: "Golang debugger", 5858: "Node debugger", 9229: "Node debugger", 5005: "Java debugger", 1234: "Ruby debugger",
+		4444: "Python pdb", 5678: "Python debugpy"}
+	if _, ok := skippablePorts[port]; ok {
+		return true
+	}
+	return false
 }
 
 // MarshalYAML Implements the marshaler interface of the yaml pkg.
 func (p *Port) MarshalYAML() (interface{}, error) {
-	return Port{Port: p.Port, Protocol: p.Protocol}, nil
+	return Port{ContainerPort: p.ContainerPort, Protocol: p.Protocol}, nil
 }
 
-func unmarshalDeployResources(deployInfo *DeployInfoRaw, resources *StackResources) (*StackResources, error) {
+func getRestartPolicy(svcName string, deployInfo *DeployInfoRaw, restartPolicy string) (apiv1.RestartPolicy, error) {
+	var restart string
+	if deployInfo != nil && deployInfo.RestartPolicy != nil {
+		restart = deployInfo.RestartPolicy.Condition
+	}
+	if restart == "" {
+		restart = restartPolicy
+	}
+	switch restart {
+	case "none", "never", "no":
+		return apiv1.RestartPolicyNever, nil
+	case "always", "", "unless-stopped", "any":
+		return apiv1.RestartPolicyAlways, nil
+	case "on-failure":
+		return apiv1.RestartPolicyOnFailure, nil
+	default:
+		return apiv1.RestartPolicyAlways, fmt.Errorf("Cannot create container for service %s: invalid restart policy '%s'", svcName, restart)
+	}
+}
+func unmarshalDeployResources(deployInfo *DeployInfoRaw, resources *StackResources, cpuCount, cpus, memLimit, memReservation Quantity) (*StackResources, error) {
 	if resources == nil {
 		resources = &StackResources{}
 	}
@@ -387,25 +855,36 @@ func unmarshalDeployResources(deployInfo *DeployInfoRaw, resources *StackResourc
 		resources.Requests = deployInfo.Resources.Reservations.toServiceResources()
 	}
 
+	if resources.Limits.CPU.Value.IsZero() && !cpuCount.Value.IsZero() {
+		resources.Limits.CPU = cpuCount
+	}
+
+	if resources.Requests.CPU.Value.IsZero() && !cpus.Value.IsZero() {
+		resources.Requests.CPU = cpus
+	}
+
+	if resources.Limits.Memory.Value.IsZero() && !memLimit.Value.IsZero() {
+		resources.Limits.Memory = memLimit
+	}
+
+	if resources.Requests.Memory.Value.IsZero() && !memReservation.Value.IsZero() {
+		resources.Requests.Memory = memReservation
+	}
+
 	return resources, nil
 }
 
-func unmarshalDeployReplicas(deployInfo *DeployInfoRaw, scale, replicas int32) (int32, error) {
-	var finalReplicas int32
-	finalReplicas = 1
-	if deployInfo != nil {
-		if deployInfo.Replicas > replicas {
-			finalReplicas = deployInfo.Replicas
-		}
+func unmarshalDeployReplicas(deployInfo *DeployInfoRaw, scale, replicas *int32) (int32, error) {
+	if replicas != nil {
+		return *replicas, nil
 	}
-	if scale > finalReplicas {
-		finalReplicas = scale
+	if deployInfo != nil && deployInfo.Replicas != nil {
+		return *deployInfo.Replicas, nil
 	}
-	if replicas > finalReplicas {
-		finalReplicas = replicas
+	if scale != nil {
+		return *scale, nil
 	}
-
-	return finalReplicas, nil
+	return DefaultReplicasNumber, nil
 }
 
 func (r DeployComposeResources) toServiceResources() ServiceResources {
@@ -417,6 +896,28 @@ func (r DeployComposeResources) toServiceResources() ServiceResources {
 		resources.Memory = r.Memory
 	}
 	return resources
+}
+
+func (endpoint *EndpointSpec) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	result := make(EndpointSpec)
+	if endpoint == nil {
+		*endpoint = result
+	}
+	var directRule Endpoint
+	err := unmarshal(&directRule)
+	if err == nil {
+		result[""] = directRule
+		*endpoint = result
+		return nil
+	}
+	var expandedAnnotation map[string]Endpoint
+	err = unmarshal(&expandedAnnotation)
+	if err != nil {
+		return err
+	}
+
+	*endpoint = expandedAnnotation
+	return nil
 }
 
 // UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
@@ -439,82 +940,6 @@ func (s *StackResources) UnmarshalYAML(unmarshal func(interface{}) error) error 
 	s.Limits.Memory = resources.Memory
 	s.Requests.Storage = resources.Storage
 	return nil
-}
-
-func unmarshalExpose(raw *RawMessage) ([]int32, error) {
-	exposeInInt := make([]int32, 0)
-	if raw == nil {
-		return exposeInInt, nil
-	}
-	err := raw.unmarshal(&exposeInInt)
-	if err == nil {
-		return exposeInInt, nil
-	}
-	var exposeInString []string
-	err = raw.unmarshal(&exposeInString)
-	if err != nil {
-		return exposeInInt, err
-	}
-
-	for _, expose := range exposeInString {
-		portInInt, err := strconv.Atoi(expose)
-		if err != nil {
-			return exposeInInt, err
-		}
-		exposeInInt = append(exposeInInt, int32(portInInt))
-	}
-	return exposeInInt, nil
-}
-
-func unmarshalEnvs(raw *RawMessage) ([]EnvVar, error) {
-	var envList []EnvVar
-	if raw == nil {
-		return envList, nil
-	}
-	err := raw.unmarshal(&envList)
-	if err == nil {
-		return envList, nil
-	}
-	var envMap map[string]string
-	err = raw.unmarshal(&envMap)
-	if err == nil {
-		for key, value := range envMap {
-			envList = append(envList, EnvVar{Name: key, Value: value})
-		}
-		return envList, nil
-	}
-
-	return envList, err
-}
-
-func unmarshalLabels(raw *RawMessage) (map[string]string, error) {
-	envMap := make(map[string]string)
-	if raw == nil {
-		return envMap, nil
-	}
-	err := raw.unmarshal(&envMap)
-	if err == nil {
-		return envMap, nil
-	}
-	var envList []string
-	err = raw.unmarshal(&envList)
-	if err == nil {
-		for _, env := range envList {
-			if strings.Contains(env, "=") {
-				splittedEnv := strings.Split(env, "=")
-				if len(splittedEnv) == 2 {
-					envMap[splittedEnv[0]] = splittedEnv[1]
-				} else {
-					return envMap, fmt.Errorf("Environment variable malformed: %s.", env)
-				}
-			} else {
-				envMap[env] = ""
-			}
-		}
-		return envMap, nil
-	}
-
-	return envMap, err
 }
 
 func unmarshalDuration(raw *RawMessage) (int64, error) {
@@ -540,6 +965,60 @@ func unmarshalDuration(raw *RawMessage) (int64, error) {
 	return int64(seconds), nil
 
 }
+func (httpHealtcheck *HTTPHealtcheck) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type httpHealtCheck HTTPHealtcheck // prevent recursion
+	var healthcheck httpHealtCheck
+	err := unmarshal(&healthcheck)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(healthcheck.Path, "/") {
+		return fmt.Errorf("HTTP path must start with '/'")
+	}
+
+	httpHealtcheck.Path = healthcheck.Path
+	httpHealtcheck.Port = healthcheck.Port
+	return nil
+}
+func (healthcheckTest *HealtcheckTest) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var rawList []string
+	err := unmarshal(&rawList)
+
+	if err == nil {
+		if len(rawList) == 0 {
+			return fmt.Errorf("healtcheck.test can not be an empty list")
+		}
+		switch rawList[0] {
+		case "NONE":
+			*healthcheckTest = rawList[:1]
+			return nil
+		case "CMD":
+			*healthcheckTest = rawList[1:]
+		case "CMD-SHELL":
+			if len(rawList) != 2 {
+				return fmt.Errorf("'CMD-SHELL' healtcheck.test must have exactly 2 elements")
+			}
+			*healthcheckTest, err = shellquote.Split(rawList[1])
+			if err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("when 'healtcheck.test' is a list the first item must be either 'NONE', 'CMD' or 'CMD-SHELL'")
+		}
+		return nil
+	}
+
+	var rawString string
+	err = unmarshal(&rawString)
+	if err != nil {
+		return err
+	}
+	*healthcheckTest, err = shellquote.Split(rawString)
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
 // UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
 func (v *StackVolume) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -548,13 +1027,13 @@ func (v *StackVolume) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if err != nil {
 		return err
 	}
-
+	raw, err = ExpandEnv(raw)
+	if err != nil {
+		return err
+	}
 	parts := strings.SplitN(raw, ":", 2)
 	if len(parts) == 2 {
-		v.LocalPath, err = ExpandEnv(parts[0])
-		if err != nil {
-			return err
-		}
+		v.LocalPath = sanitizeName(parts[0])
 		v.RemotePath = parts[1]
 	} else {
 		v.RemotePath = parts[0]
@@ -565,6 +1044,14 @@ func (v *StackVolume) UnmarshalYAML(unmarshal func(interface{}) error) error {
 // MarshalYAML Implements the marshaler interface of the yaml pkg.
 func (v StackVolume) MarshalYAML() (interface{}, error) {
 	return v.RemotePath, nil
+}
+
+// MarshalYAML Implements the marshaler interface of the yaml pkg.
+func (v StackVolume) ToString() string {
+	if v.LocalPath != "" {
+		return fmt.Sprintf("%s:%s", v.LocalPath, v.RemotePath)
+	}
+	return v.RemotePath
 }
 
 func getProtocol(protocolName string) (apiv1.Protocol, error) {
@@ -581,20 +1068,57 @@ func getProtocol(protocolName string) (apiv1.Protocol, error) {
 	}
 }
 
-func setWarnings(s *StackRaw) {
-	s.Warnings = append(s.Warnings, getTopLevelNotSupportedFields(s)...)
-	for name, svcInfo := range s.Services {
-		s.Warnings = append(s.Warnings, getServiceNotSupportedFields(name, svcInfo)...)
+func shouldBeSanitized(name string) bool {
+	return strings.Contains(name, " ") || strings.Contains(name, "_")
+}
+
+func sanitizeName(name string) string {
+	name = strings.ReplaceAll(name, " ", "-")
+	name = strings.ReplaceAll(name, "_", "-")
+	return name
+}
+
+func validateDependsOn(s *Stack) error {
+	for svcName, svc := range s.Services {
+		for dependentSvc, condition := range svc.DependsOn {
+			if svcName == dependentSvc {
+				return fmt.Errorf(" Service '%s' depends can not depend of itself.", svcName)
+			}
+			if _, ok := s.Services[dependentSvc]; !ok {
+				return fmt.Errorf(" Service '%s' depends on service '%s' which is undefined.", svcName, dependentSvc)
+			}
+			if condition.Condition == DependsOnServiceCompleted && !s.Services[dependentSvc].IsJob() {
+				return fmt.Errorf(" Service '%s' is not a job. Please change the reset policy so that it is not always in service '%s' ", dependentSvc, dependentSvc)
+			}
+		}
 	}
+
+	dependencyCycle := getDependentCyclic(s)
+	if len(dependencyCycle) > 0 {
+		svcsDependents := fmt.Sprintf("%s and %s", strings.Join(dependencyCycle[:len(dependencyCycle)-1], ", "), dependencyCycle[len(dependencyCycle)-1])
+		return fmt.Errorf(" There was a cyclic dependendecy between %s.", svcsDependents)
+	}
+	return nil
+}
+
+func getNotSupportedFields(s *StackRaw) []string {
+	notSupportedFields := make([]string, 0)
+	notSupportedFields = append(notSupportedFields, getTopLevelNotSupportedFields(s)...)
+	for name, svcInfo := range s.Services {
+		notSupportedFields = append(notSupportedFields, getServiceNotSupportedFields(name, svcInfo)...)
+	}
+	for name, volumeInfo := range s.Volumes {
+		if volumeInfo != nil {
+			notSupportedFields = append(notSupportedFields, getVolumesNotSupportedFields(name, volumeInfo)...)
+		}
+	}
+	return notSupportedFields
 }
 
 func getTopLevelNotSupportedFields(s *StackRaw) []string {
 	notSupported := make([]string, 0)
 	if s.Networks != nil {
 		notSupported = append(notSupported, "networks")
-	}
-	if s.Volumes != nil {
-		notSupported = append(notSupported, "volumes")
 	}
 	if s.Configs != nil {
 		notSupported = append(notSupported, "configs")
@@ -614,9 +1138,6 @@ func getServiceNotSupportedFields(svcName string, svcInfo *ServiceRaw) []string 
 	if svcInfo.BlkioConfig != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].blkio_config", svcName))
 	}
-	if svcInfo.CpuCount != nil {
-		notSupported = append(notSupported, fmt.Sprintf("services[%s].cpu_count", svcName))
-	}
 	if svcInfo.CpuPercent != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].cpu_percent", svcName))
 	}
@@ -635,9 +1156,6 @@ func getServiceNotSupportedFields(svcName string, svcInfo *ServiceRaw) []string 
 	if svcInfo.CpuRtPeriod != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].cpu_rt_period", svcName))
 	}
-	if svcInfo.Cpus != nil {
-		notSupported = append(notSupported, fmt.Sprintf("services[%s].cpus", svcName))
-	}
 	if svcInfo.Cpuset != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].cpuset", svcName))
 	}
@@ -647,14 +1165,8 @@ func getServiceNotSupportedFields(svcName string, svcInfo *ServiceRaw) []string 
 	if svcInfo.Configs != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].configs", svcName))
 	}
-	if svcInfo.ContainerName != nil {
-		notSupported = append(notSupported, fmt.Sprintf("services[%s].container_name", svcName))
-	}
 	if svcInfo.CredentialSpec != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].credential_spec", svcName))
-	}
-	if svcInfo.DependsOn != nil {
-		notSupported = append(notSupported, fmt.Sprintf("services[%s].depends_on", svcName))
 	}
 	if svcInfo.DeviceCgroupRules != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].device_cgroup_rules", svcName))
@@ -686,9 +1198,6 @@ func getServiceNotSupportedFields(svcName string, svcInfo *ServiceRaw) []string 
 	if svcInfo.GroupAdd != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].group_add", svcName))
 	}
-	if svcInfo.Healthcheck != nil {
-		notSupported = append(notSupported, fmt.Sprintf("services[%s].healthcheck", svcName))
-	}
 	if svcInfo.Hostname != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].hostname", svcName))
 	}
@@ -715,12 +1224,6 @@ func getServiceNotSupportedFields(svcName string, svcInfo *ServiceRaw) []string 
 	}
 	if svcInfo.MacAddress != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].mac_address", svcName))
-	}
-	if svcInfo.MemLimit != nil {
-		notSupported = append(notSupported, fmt.Sprintf("services[%s].mem_limit", svcName))
-	}
-	if svcInfo.MemReservation != nil {
-		notSupported = append(notSupported, fmt.Sprintf("services[%s].mem_reservation", svcName))
 	}
 	if svcInfo.MemSwappiness != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].mem_swappiness", svcName))
@@ -754,11 +1257,6 @@ func getServiceNotSupportedFields(svcName string, svcInfo *ServiceRaw) []string 
 	}
 	if svcInfo.ReadOnly != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].read_only", svcName))
-	}
-	if svcInfo.Restart != nil {
-		if *svcInfo.Restart != "always" {
-			notSupported = append(notSupported, fmt.Sprintf("services[%s].restart", svcName))
-		}
 	}
 	if svcInfo.Runtime != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].runtime", svcName))
@@ -814,11 +1312,17 @@ func getDeployNotSupportedFields(svcName string, deploy *DeployInfoRaw) []string
 	if deploy.Resources.Reservations.Devices != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].deploy.resources.reservations.devices", svcName))
 	}
+
+	if deploy.RestartPolicy != nil {
+		if deploy.RestartPolicy.Delay != nil {
+			notSupported = append(notSupported, fmt.Sprintf("services[%s].deploy.delay", svcName))
+		}
+		if deploy.RestartPolicy.Window != nil {
+			notSupported = append(notSupported, fmt.Sprintf("services[%s].deploy.window", svcName))
+		}
+	}
 	if deploy.EndpointMode != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].deploy.endpoint_mode", svcName))
-	}
-	if deploy.Labels != nil {
-		notSupported = append(notSupported, fmt.Sprintf("services[%s].deploy.labels", svcName))
 	}
 	if deploy.Mode != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].deploy.mode", svcName))
@@ -832,9 +1336,6 @@ func getDeployNotSupportedFields(svcName string, deploy *DeployInfoRaw) []string
 	if deploy.Preferences != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].deploy.preferences", svcName))
 	}
-	if deploy.RestartPolicy != nil {
-		notSupported = append(notSupported, fmt.Sprintf("services[%s].deploy.restart_policy", svcName))
-	}
 	if deploy.RollbackConfig != nil {
 		notSupported = append(notSupported, fmt.Sprintf("services[%s].deploy.rollback_config", svcName))
 	}
@@ -843,4 +1344,69 @@ func getDeployNotSupportedFields(svcName string, deploy *DeployInfoRaw) []string
 	}
 
 	return notSupported
+}
+
+func getVolumesNotSupportedFields(volumeName string, volumeInfo *VolumeTopLevel) []string {
+	notSupported := make([]string, 0)
+
+	if volumeInfo.Driver != nil {
+		notSupported = append(notSupported, fmt.Sprintf("volumes[%s].driver", volumeName))
+	}
+	if volumeInfo.DriverOpts != nil {
+		for key := range volumeInfo.DriverOpts {
+			if key != "size" && key != "class" {
+				notSupported = append(notSupported, fmt.Sprintf("volumes[%s].driver_opts.%s", volumeName, key))
+			}
+		}
+	}
+
+	if volumeInfo.External != nil {
+		notSupported = append(notSupported, fmt.Sprintf("volumes[%s].external", volumeName))
+	}
+	return notSupported
+
+}
+
+// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
+func (c *CommandStack) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var multi []string
+	err := unmarshal(&multi)
+	if err != nil {
+		var single string
+		err := unmarshal(&single)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(single, " && ") {
+			c.Values = []string{"sh", "-c", single}
+		} else {
+			c.Values, err = shellquote.Split(single)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		c.Values = multi
+	}
+	return nil
+}
+
+// UnmarshalYAML Implements the Unmarshaler interface of the yaml pkg.
+func (a *ArgsStack) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var multi []string
+	err := unmarshal(&multi)
+	if err != nil {
+		var single string
+		err := unmarshal(&single)
+		if err != nil {
+			return err
+		}
+		a.Values, err = shellquote.Split(single)
+		if err != nil {
+			return err
+		}
+	} else {
+		a.Values = multi
+	}
+	return nil
 }

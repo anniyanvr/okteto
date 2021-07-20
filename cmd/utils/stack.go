@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -28,7 +28,7 @@ var (
 	deprecatedManifests     = []string{"stack.yml", "stack.yaml"}
 )
 
-//LoadStack loads an okteto stack manifest checking "yml" and "yaml"
+// LoadStack loads an okteto stack manifest checking "yml" and "yaml"
 func LoadStack(name, stackPath string) (*model.Stack, error) {
 	var isCompose bool
 	if model.FileExists(stackPath) {
@@ -41,10 +41,10 @@ func LoadStack(name, stackPath string) (*model.Stack, error) {
 	if stackPath == DefaultStackManifest {
 		for _, secondaryStackManifest := range secondaryStackManifests {
 			if model.FileExists(secondaryStackManifest) {
-				if isDeprecatedExtension(stackPath) {
+				if isDeprecatedExtension(secondaryStackManifest) {
 					log.Warning("The file %s will be deprecated as a default stack file name in a future version. Please consider renaming your stack file to 'okteto-stack.yml'", stackPath)
 				}
-				if strings.HasPrefix(stackPath, "docker-compose") {
+				if strings.HasPrefix(secondaryStackManifest, "docker-compose") {
 					isCompose = true
 				}
 				return model.GetStack(name, secondaryStackManifest, isCompose)

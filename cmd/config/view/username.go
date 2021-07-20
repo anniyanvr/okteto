@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/okteto/okteto/cmd/utils"
 	"github.com/okteto/okteto/pkg/cmd/login"
 	"github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/log"
@@ -24,10 +25,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-//Username returns the username of the authenticated user
+// Username returns the username of the authenticated user
 func Username(ctx context.Context) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "username",
+		Args:  utils.NoArgsAccepted(""),
 		Short: "Returns the username of the authenticated user",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			t, err := okteto.GetToken()

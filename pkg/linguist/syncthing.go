@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,7 +23,7 @@ func init() {
 	// based on the list available at https://github.com/github/gitignore
 	stignore = make(map[string][]byte)
 
-	stignore[javascript] = []byte(`.git
+	stignore[Javascript] = []byte(`.git
 # Runtime data
 pids
 *.pid
@@ -101,7 +101,7 @@ vendor
 __debug_bin
 `)
 
-	stignore[python] = []byte(`.git
+	stignore[Python] = []byte(`.git
 # Byte-compiled / optimized / DLL files
 __pycache__
 *.py[cod]
@@ -204,7 +204,7 @@ dmypy.json
 .pyre
 `)
 
-	stignore[gradle] = []byte(`.git
+	stignore[Gradle] = []byte(`.git
 .gradle
 build
 
@@ -218,11 +218,11 @@ gradle-app.setting
 .gradletasknamecache
 `)
 
-	stignore[maven] = []byte(`.git
+	stignore[Maven] = []byte(`.git
 ?
 `)
 
-	stignore[ruby] = []byte(`.git
+	stignore[Ruby] = []byte(`.git
 *.gem
 *.rbc
 coverage
@@ -271,7 +271,7 @@ lib/bundler/man
 .rvmrc
 `)
 
-	stignore[csharp] = []byte(`.git
+	stignore[Csharp] = []byte(`.git
 out
 bin
 obj/Debug
@@ -279,11 +279,14 @@ obj/Release
 core.*.*.*
 `)
 
+	stignore[Rust] = []byte(`.git
+`)
+
 }
 
 // GetSTIgnore returns a .stignore file for the specified language
 func GetSTIgnore(language string) []byte {
-	l := normalizeLanguage(language)
+	l := NormalizeLanguage(language)
 	if s, ok := stignore[l]; ok {
 		return s
 	}

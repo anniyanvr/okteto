@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -26,7 +26,6 @@ import (
 	"github.com/okteto/okteto/pkg/k8s/client"
 	k8Client "github.com/okteto/okteto/pkg/k8s/client"
 	"github.com/okteto/okteto/pkg/k8s/deployments"
-	okLabels "github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/k8s/namespaces"
 	"github.com/okteto/okteto/pkg/linguist"
 	"github.com/okteto/okteto/pkg/log"
@@ -45,7 +44,7 @@ const (
 	defaultInitValues = "Use default values"
 )
 
-//Init automatically generates the manifest
+// Init automatically generates the manifest
 func Init() *cobra.Command {
 	var namespace string
 	var k8sContext string
@@ -53,6 +52,7 @@ func Init() *cobra.Command {
 	var overwrite bool
 	cmd := &cobra.Command{
 		Use:   "init",
+		Args:  utils.NoArgsAccepted("https://okteto.com/docs/reference/cli/#init"),
 		Short: "Automatically generates your okteto manifest file",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l := os.Getenv("OKTETO_LANGUAGE")
@@ -91,7 +91,7 @@ func Run(namespace, k8sContext, devPath, language, workDir string, overwrite boo
 
 	fmt.Println("This command walks you through creating an okteto manifest.")
 	fmt.Println("It only covers the most common items, and tries to guess sensible defaults.")
-	fmt.Println("See https://okteto.com/docs/reference/manifest for the official documentation about the okteto manifest.")
+	fmt.Println("See https://okteto.com/docs/reference/manifest/ for the official documentation about the okteto manifest.")
 	ctx := context.Background()
 	devPath, err := validateDevPath(devPath, overwrite)
 	if err != nil {
@@ -108,7 +108,7 @@ func Run(namespace, k8sContext, devPath, language, workDir string, overwrite boo
 		return err
 	}
 
-	dev, err := linguist.GetDevDefaults(language, workDir, checkForDeployment)
+	dev, err := linguist.GetDevDefaults(language, workDir)
 	if err != nil {
 		return err
 	}
@@ -132,7 +132,7 @@ func Run(namespace, k8sContext, devPath, language, workDir string, overwrite boo
 			suffix := fmt.Sprintf("Analyzing deployment '%s'...", d.Name)
 			spinner := utils.NewSpinner(suffix)
 			spinner.Start()
-			err = initCMD.SetDevDefaultsFromDeployment(ctx, dev, d, container)
+			err = initCMD.SetDevDefaultsFromDeployment(ctx, dev, d, container, language)
 			spinner.Stop()
 			if err == nil {
 				log.Success(fmt.Sprintf("Deployment '%s' successfully analyzed", d.Name))
@@ -237,7 +237,7 @@ func supportsPersistentVolumes(ctx context.Context, namespace, k8sContext string
 	}
 
 	for i := range stClassList.Items {
-		if stClassList.Items[i].Annotations[okLabels.DefaultStorageClassAnnotation] == "true" {
+		if stClassList.Items[i].Annotations[model.DefaultStorageClassAnnotation] == "true" {
 			log.Infof("found default storage class '%s'", stClassList.Items[i].Name)
 			return true
 		}
@@ -257,7 +257,7 @@ func validateDevPath(devPath string, overwrite bool) (string, error) {
 	return devPath, nil
 }
 
-//GetLanguage returns the language of a given folder
+// GetLanguage returns the language of a given folder
 func GetLanguage(language, workDir string) (string, error) {
 	if language != "" {
 		return language, nil

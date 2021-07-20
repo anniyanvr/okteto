@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2021 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/okteto/okteto/pkg/errors"
 	"github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
@@ -30,7 +31,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-//List returns the list of volumes
+// List returns the list of volumes
 func List(ctx context.Context, namespace, labels string, c kubernetes.Interface) ([]apiv1.PersistentVolumeClaim, error) {
 	vList, err := c.CoreV1().PersistentVolumeClaims(namespace).List(
 		ctx,
@@ -44,21 +45,49 @@ func List(ctx context.Context, namespace, labels string, c kubernetes.Interface)
 	return vList.Items, nil
 }
 
-//Create deploys the volume claim for a given development container
-func Create(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset) error {
+// CreateForDev deploys the volume claim for a given development container
+func CreateForDev(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset) error {
 	vClient := c.CoreV1().PersistentVolumeClaims(dev.Namespace)
 	pvc := translate(dev)
 	k8Volume, err := vClient.Get(ctx, pvc.Name, metav1.GetOptions{})
 	if err != nil && !strings.Contains(err.Error(), "not found") {
 		return fmt.Errorf("error getting kubernetes volume claim: %s", err)
 	}
-	if k8Volume.Name != "" {
-		return checkPVCValues(k8Volume, dev)
+	if k8Volume.Name == "" {
+		log.Infof("creating volume claim '%s'", pvc.Name)
+		_, err = vClient.Create(ctx, pvc, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("error creating kubernetes volume claim: %s", err)
+		}
+	} else {
+		if err := checkPVCValues(pvc, dev); err != nil {
+			return err
+		}
+		log.Infof("updating volume claim '%s'", pvc.Name)
+		if pvc.Spec.StorageClassName == nil {
+			pvc.Spec.StorageClassName = k8Volume.Spec.StorageClassName
+		}
+		pvc.Spec.VolumeName = k8Volume.Spec.VolumeName
+		_, err = vClient.Update(ctx, pvc, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("error updating kubernetes volume claim: %s", err)
+		}
 	}
-	log.Infof("creating volume claim '%s'", pvc.Name)
-	_, err = vClient.Create(ctx, pvc, metav1.CreateOptions{})
+	return nil
+}
+
+func Create(ctx context.Context, pvc *apiv1.PersistentVolumeClaim, c kubernetes.Interface) error {
+	_, err := c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("error creating kubernetes volume claim: %s", err)
+		return err
+	}
+	return nil
+}
+
+func Update(ctx context.Context, pvc *apiv1.PersistentVolumeClaim, c kubernetes.Interface) error {
+	_, err := c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Update(ctx, pvc, metav1.UpdateOptions{})
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -68,24 +97,38 @@ func checkPVCValues(pvc *apiv1.PersistentVolumeClaim, dev *model.Dev) error {
 	if !ok {
 		return fmt.Errorf("current okteto volume size is wrong. Run 'okteto down -v' and try again")
 	}
-	if currentSize.Cmp(resource.MustParse(dev.PersistentVolumeSize())) != 0 {
+	if currentSize.Cmp(resource.MustParse(dev.PersistentVolumeSize())) > 0 {
 		if currentSize.Cmp(resource.MustParse("10Gi")) != 0 || dev.PersistentVolumeSize() != model.OktetoDefaultPVSize {
 			return fmt.Errorf(
-				"current okteto volume size is '%s' instead of '%s'. Run 'okteto down -v' and try again",
-				currentSize.String(),
+				"okteto volume size '%s' cannot be less than previous value '%s'. Run 'okteto down -v' and try again",
 				dev.PersistentVolumeSize(),
+				currentSize.String(),
 			)
 		}
 	}
+	if currentSize.Cmp(resource.MustParse(dev.PersistentVolumeSize())) < 0 {
+		restartUUID := uuid.New().String()
+		if dev.Annotations == nil {
+			dev.Annotations = map[string]string{}
+		}
+		dev.Annotations[model.OktetoRestartAnnotation] = restartUUID
+		for _, s := range dev.Services {
+			if s.Annotations == nil {
+				s.Annotations = map[string]string{}
+			}
+			s.Annotations[model.OktetoRestartAnnotation] = restartUUID
+		}
+	}
+
 	if dev.PersistentVolumeStorageClass() != "" {
 		if pvc.Spec.StorageClassName == nil {
 			return fmt.Errorf(
-				"current okteto volume storageclass is '' instead of '%s'. Run 'okteto down -v' and try again",
+				"okteto volume storageclass is '' instead of '%s'. Run 'okteto down -v' and try again",
 				dev.PersistentVolumeStorageClass(),
 			)
 		} else if dev.PersistentVolumeStorageClass() != *pvc.Spec.StorageClassName {
 			return fmt.Errorf(
-				"current okteto volume storageclass is '%s' instead of '%s'. Run 'okteto down -v' and try again",
+				"okteto volume storageclass cannot be updated from '%s' to '%s'. Run 'okteto down -v' and try again",
 				*pvc.Spec.StorageClassName,
 				dev.PersistentVolumeStorageClass(),
 			)
@@ -95,12 +138,12 @@ func checkPVCValues(pvc *apiv1.PersistentVolumeClaim, dev *model.Dev) error {
 
 }
 
-//DestroyDev destroys the persistent volume claim for a given development container
+// DestroyDev destroys the persistent volume claim for a given development container
 func DestroyDev(ctx context.Context, dev *model.Dev, c *kubernetes.Clientset) error {
-	return Destroy(ctx, dev.GetVolumeName(), dev.Namespace, c, dev.Timeout)
+	return Destroy(ctx, dev.GetVolumeName(), dev.Namespace, c, dev.Timeout.Default)
 }
 
-//Destroy destroys a persistent volume claim
+// Destroy destroys a persistent volume claim
 func Destroy(ctx context.Context, name, namespace string, c *kubernetes.Clientset, timeout time.Duration) error {
 	vClient := c.CoreV1().PersistentVolumeClaims(namespace)
 	log.Infof("destroying volume '%s'", name)
