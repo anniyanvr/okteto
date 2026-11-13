@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,61 +14,155 @@
 package model
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/okteto/okteto/pkg/build"
+	"github.com/okteto/okteto/pkg/env"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	yaml "gopkg.in/yaml.v2"
-	v1 "k8s.io/api/core/v1"
+	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/utils/ptr"
 )
+
+func TestTranslateHealthcheckCurlToHttp(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		test         []string
+		expectedTest HealtcheckTest
+		expectedHTTP HTTPHealtcheck
+	}{
+		{
+			name:         "RegularCurlWithZeros",
+			test:         []string{"curl http://0.0.0.0:4572"},
+			expectedTest: HealtcheckTest{},
+			expectedHTTP: HTTPHealtcheck{Path: "/", Port: int32(4572)},
+		},
+		{
+			name:         "RegularCurlWithLocalhost",
+			test:         []string{"curl http://localhost:4572"},
+			expectedTest: HealtcheckTest{},
+			expectedHTTP: HTTPHealtcheck{Path: "/", Port: int32(4572)},
+		},
+		{
+			name:         "RegularCurlTrailingSlash",
+			test:         []string{"curl http://0.0.0.0:4572/"},
+			expectedTest: HealtcheckTest{},
+			expectedHTTP: HTTPHealtcheck{Path: "/", Port: int32(4572)},
+		},
+		{
+			name:         "MissingScheme",
+			test:         []string{"curl 0.0.0.0:4572/readiness"},
+			expectedTest: HealtcheckTest{},
+			expectedHTTP: HTTPHealtcheck{Path: "/readiness", Port: int32(4572)},
+		},
+		{
+			name:         "MissingSchemeWithF",
+			test:         []string{"curl -f localhost:8080/"},
+			expectedTest: HealtcheckTest{},
+			expectedHTTP: HTTPHealtcheck{Path: "/", Port: int32(8080)},
+		},
+		{
+			name:         "NoTest",
+			test:         []string{"curl --fail 0.0.0.0:8080"},
+			expectedTest: HealtcheckTest{},
+			expectedHTTP: HTTPHealtcheck{Path: "/", Port: int32(8080)},
+		},
+		{
+			name:         "Readiness",
+			test:         []string{"curl https://0.0.0.0:8080/readiness"},
+			expectedTest: HealtcheckTest{},
+			expectedHTTP: HTTPHealtcheck{Path: "/readiness", Port: int32(8080)},
+		},
+		{
+			name:         "RegularCurlWithPath",
+			test:         []string{"curl http://0.0.0.0:4572/a/path/exists"},
+			expectedTest: HealtcheckTest{},
+			expectedHTTP: HTTPHealtcheck{Path: "/a/path/exists", Port: int32(4572)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			check := HealthCheck{
+				Test: tc.test,
+			}
+			translateHealtcheckCurlToHTTP(&check)
+			if !reflect.DeepEqual(check.Test, tc.expectedTest) {
+				t.Fatalf("expected %v but got %v", tc.expectedTest, check.Test)
+			}
+			if !reflect.DeepEqual(check.Test, tc.expectedTest) {
+				t.Fatalf("expected %v but got %v", tc.expectedHTTP, check.HTTP)
+			}
+		})
+	}
+}
 
 func Test_DeployReplicasUnmarshalling(t *testing.T) {
 	tests := []struct {
-		name      string
 		deployRaw *DeployInfoRaw
-		scale     int32
-		replicas  int32
+		scale     *int32
+		replicas  *int32
+		name      string
 		expected  int32
 	}{
 		{
-			name:      "empty",
+			name:      "empty with other deploy values",
 			deployRaw: &DeployInfoRaw{},
-			scale:     0,
-			replicas:  0,
+			scale:     nil,
+			replicas:  nil,
+			expected:  1,
+		},
+		{
+			name:      "empty",
+			deployRaw: nil,
+			scale:     nil,
+			replicas:  nil,
 			expected:  1,
 		},
 		{
 			name:      "deploy-replicas-set",
-			deployRaw: &DeployInfoRaw{Replicas: 4},
-			scale:     0,
-			replicas:  0,
+			deployRaw: &DeployInfoRaw{Replicas: ptr.To(int32(4))},
+			scale:     nil,
+			replicas:  nil,
 			expected:  4,
 		},
 		{
 			name:      "scale",
 			deployRaw: &DeployInfoRaw{},
-			scale:     3,
-			replicas:  0,
+			scale:     ptr.To(int32(3)),
+			replicas:  nil,
 			expected:  3,
 		},
 		{
 			name:      "replicas",
 			deployRaw: &DeployInfoRaw{},
-			scale:     0,
-			replicas:  2,
+			scale:     nil,
+			replicas:  ptr.To(int32(2)),
 			expected:  2,
 		},
 		{
-			name:      "replicas-and-deploy-replicas",
-			deployRaw: &DeployInfoRaw{Replicas: 3},
-			scale:     0,
-			replicas:  2,
+			name:      "replicas priority",
+			deployRaw: &DeployInfoRaw{Replicas: ptr.To(int32(1))},
+			scale:     ptr.To(int32(2)),
+			replicas:  ptr.To(int32(3)),
 			expected:  3,
+		},
+		{
+			name:      "deploy priority",
+			deployRaw: &DeployInfoRaw{Replicas: ptr.To(int32(1))},
+			scale:     ptr.To(int32(2)),
+			replicas:  nil,
+			expected:  1,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			replicas, _ := unmarshalDeployReplicas(tt.deployRaw, tt.scale, tt.replicas)
+			replicas := unmarshalDeployReplicas(tt.deployRaw, tt.scale, tt.replicas)
 			if replicas != tt.expected {
 				t.Fatalf("expected %d replicas but got %d", tt.expected, replicas)
 			}
@@ -79,10 +173,14 @@ func Test_DeployReplicasUnmarshalling(t *testing.T) {
 
 func Test_DeployResourcesUnmarshalling(t *testing.T) {
 	tests := []struct {
-		name      string
-		deployRaw *DeployInfoRaw
-		resources *StackResources
-		expected  *StackResources
+		name           string
+		deployRaw      *DeployInfoRaw
+		resources      *StackResources
+		expected       *StackResources
+		cpu_count      Quantity
+		cpus           Quantity
+		memLimit       Quantity
+		memReservation Quantity
 	}{
 		{
 			name:      "both-nil",
@@ -95,7 +193,7 @@ func Test_DeployResourcesUnmarshalling(t *testing.T) {
 			deployRaw: &DeployInfoRaw{Resources: ResourcesRaw{
 				Limits: DeployComposeResources{
 					Cpus:   Quantity{resource.MustParse("1")},
-					Memory: Quantity{resource.MustParse("1Gi")},
+					Memory: ComposeMemory{Quantity{resource.MustParse("1Gi")}},
 				},
 			},
 			},
@@ -126,11 +224,11 @@ func Test_DeployResourcesUnmarshalling(t *testing.T) {
 			deployRaw: &DeployInfoRaw{Resources: ResourcesRaw{
 				Limits: DeployComposeResources{
 					Cpus:   Quantity{resource.MustParse("1")},
-					Memory: Quantity{resource.MustParse("1Gi")},
+					Memory: ComposeMemory{Quantity{resource.MustParse("1Gi")}},
 				},
 				Reservations: DeployComposeResources{
 					Cpus:   Quantity{resource.MustParse("1")},
-					Memory: Quantity{resource.MustParse("2Gi")},
+					Memory: ComposeMemory{Quantity{resource.MustParse("2Gi")}},
 				},
 			},
 			},
@@ -146,14 +244,504 @@ func Test_DeployResourcesUnmarshalling(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "deprecated-resources-not-set-if-already-set",
+			deployRaw: &DeployInfoRaw{Resources: ResourcesRaw{
+				Limits: DeployComposeResources{
+					Cpus:   Quantity{resource.MustParse("1")},
+					Memory: ComposeMemory{Quantity{resource.MustParse("1Gi")}},
+				},
+				Reservations: DeployComposeResources{
+					Cpus:   Quantity{resource.MustParse("1")},
+					Memory: ComposeMemory{Quantity{resource.MustParse("2Gi")}},
+				},
+			},
+			},
+			resources:      &StackResources{},
+			cpu_count:      Quantity{resource.MustParse("3")},
+			cpus:           Quantity{resource.MustParse("2")},
+			memLimit:       Quantity{resource.MustParse("2Gi")},
+			memReservation: Quantity{resource.MustParse("2Gi")},
+			expected: &StackResources{
+				Limits: ServiceResources{
+					CPU:    Quantity{resource.MustParse("1")},
+					Memory: Quantity{resource.MustParse("1Gi")},
+				},
+				Requests: ServiceResources{
+					CPU:    Quantity{resource.MustParse("1")},
+					Memory: Quantity{resource.MustParse("2Gi")},
+				},
+			},
+		},
+		{
+			name:           "set-deprecated-resources-if-not-already-set",
+			deployRaw:      nil,
+			resources:      nil,
+			cpu_count:      Quantity{resource.MustParse("3")},
+			cpus:           Quantity{resource.MustParse("2")},
+			memLimit:       Quantity{resource.MustParse("2Gi")},
+			memReservation: Quantity{resource.MustParse("1Gi")},
+			expected: &StackResources{
+				Limits: ServiceResources{
+					CPU:    Quantity{resource.MustParse("3")},
+					Memory: Quantity{resource.MustParse("2Gi")},
+				},
+				Requests: ServiceResources{
+					CPU:    Quantity{resource.MustParse("2")},
+					Memory: Quantity{resource.MustParse("1Gi")},
+				},
+			},
+		},
+		{
+			name:      "deploy-without-resources-keeps-service-resources",
+			deployRaw: &DeployInfoRaw{},
+			resources: &StackResources{
+				Limits: ServiceResources{
+					CPU:    Quantity{resource.MustParse("2")},
+					Memory: Quantity{resource.MustParse("1Gi")},
+				},
+				Requests: ServiceResources{
+					Storage: StorageResource{
+						Size:  Quantity{resource.MustParse("5Gi")},
+						Class: "fast",
+					},
+				},
+			},
+			expected: &StackResources{
+				Limits: ServiceResources{
+					CPU:    Quantity{resource.MustParse("2")},
+					Memory: Quantity{resource.MustParse("1Gi")},
+				},
+				Requests: ServiceResources{
+					Storage: StorageResource{
+						Size:  Quantity{resource.MustParse("5Gi")},
+						Class: "fast",
+					},
+				},
+			},
+		},
+		{
+			name: "deploy-resources-override-only-the-values-they-set",
+			deployRaw: &DeployInfoRaw{Resources: ResourcesRaw{
+				Limits: DeployComposeResources{
+					Cpus: Quantity{resource.MustParse("1")},
+				},
+			}},
+			resources: &StackResources{
+				Limits: ServiceResources{
+					CPU:    Quantity{resource.MustParse("2")},
+					Memory: Quantity{resource.MustParse("1Gi")},
+				},
+				Requests: ServiceResources{
+					Storage: StorageResource{
+						Size: Quantity{resource.MustParse("5Gi")},
+					},
+				},
+			},
+			expected: &StackResources{
+				Limits: ServiceResources{
+					CPU:    Quantity{resource.MustParse("1")},
+					Memory: Quantity{resource.MustParse("1Gi")},
+				},
+				Requests: ServiceResources{
+					Storage: StorageResource{
+						Size: Quantity{resource.MustParse("5Gi")},
+					},
+				},
+			},
+		},
+		{
+			name: "deploy-reservations-override-only-the-requests-they-set",
+			deployRaw: &DeployInfoRaw{Resources: ResourcesRaw{
+				Reservations: DeployComposeResources{
+					Cpus: Quantity{resource.MustParse("250m")},
+				},
+			}},
+			resources: &StackResources{
+				Requests: ServiceResources{
+					CPU:    Quantity{resource.MustParse("500m")},
+					Memory: Quantity{resource.MustParse("1Gi")},
+					Storage: StorageResource{
+						Size:  Quantity{resource.MustParse("5Gi")},
+						Class: "fast",
+					},
+				},
+			},
+			expected: &StackResources{
+				Requests: ServiceResources{
+					CPU:    Quantity{resource.MustParse("250m")},
+					Memory: Quantity{resource.MustParse("1Gi")},
+					Storage: StorageResource{
+						Size:  Quantity{resource.MustParse("5Gi")},
+						Class: "fast",
+					},
+				},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resources, _ := unmarshalDeployResources(tt.deployRaw, tt.resources)
+			resources := unmarshalDeployResources(tt.deployRaw, tt.resources, tt.cpu_count, tt.cpus, tt.memLimit, tt.memReservation)
 			if !reflect.DeepEqual(tt.expected, resources) {
 				t.Fatalf("expected %v but got %v", tt.expected, resources)
 			}
 
+		})
+	}
+}
+
+func Test_HealthcheckUnmarshalling(t *testing.T) {
+	tests := []struct {
+		expected      *HealthCheck
+		name          string
+		manifest      []byte
+		expectedError bool
+	}{
+		{
+			name:          "healthcheck http through test with https",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: curl https://0.0.0.0:8080/readiness\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{HTTP: &HTTPHealtcheck{Path: "/readiness", Port: 8080}, Interval: 10 * time.Second, Timeout: 10 * time.Minute, Retries: 5, StartPeriod: 30 * time.Second, Test: []string{}, Readiness: true},
+			expectedError: false,
+		},
+		{
+			name:          "healthcheck disable",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      disable: true\n      test: cat file.txt\n    image: okteto/vote:1"),
+			expected:      nil,
+			expectedError: false,
+		},
+		{
+			name:          "healthcheck none",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: [\"NONE\"]\n    image: okteto/vote:1"),
+			expected:      nil,
+			expectedError: false,
+		},
+		{
+			name:          "just healthcheck command",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      test: cat file.txt\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{Test: []string{"cat", "file.txt"}, Readiness: true},
+			expectedError: false,
+		},
+		{
+			name:          "normal healthcheck",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: cat file.txt\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{Test: []string{"cat", "file.txt"}, Interval: 10 * time.Second, Timeout: 10 * time.Minute, Retries: 5, StartPeriod: 30 * time.Second, Readiness: true},
+			expectedError: false,
+		},
+		{
+			name:          "healthcheck without test",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n    image: okteto/vote:1"),
+			expected:      nil,
+			expectedError: true,
+		},
+		{
+			name:          "healthcheck with test and http",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: cat file.txt\n      http:\n        path: /\n        port: 8080\n    image: okteto/vote:1"),
+			expected:      nil,
+			expectedError: true,
+		},
+		{
+			name:          "healthcheck http path not starting with /",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      http:\n        path: db\n        port: 8080\n    image: okteto/vote:1"),
+			expected:      nil,
+			expectedError: true,
+		},
+		{
+			name:          "healthcheck http",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      http:\n        path: /\n        port: 8080\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{HTTP: &HTTPHealtcheck{Path: "/", Port: 8080}, Interval: 10 * time.Second, Timeout: 10 * time.Minute, Retries: 5, StartPeriod: 30 * time.Second, Readiness: true},
+			expectedError: false,
+		},
+		{
+			name:          "healthcheck http through test without failing flag",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: curl 0.0.0.0:8080/readiness\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{HTTP: &HTTPHealtcheck{Path: "/readiness", Port: 8080}, Interval: 10 * time.Second, Timeout: 10 * time.Minute, Retries: 5, StartPeriod: 30 * time.Second, Test: []string{}, Readiness: true},
+			expectedError: false,
+		},
+		{
+			name:          "healthcheck http through test with -f",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: curl -f localhost:8080/\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{HTTP: &HTTPHealtcheck{Path: "/", Port: 8080}, Interval: 10 * time.Second, Timeout: 10 * time.Minute, Retries: 5, StartPeriod: 30 * time.Second, Test: []string{}, Readiness: true},
+			expectedError: false,
+		},
+		{
+			name:          "healthcheck http through test with --fail",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: curl --fail 0.0.0.0:8080/\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{HTTP: &HTTPHealtcheck{Path: "/", Port: 8080}, Interval: 10 * time.Second, Timeout: 10 * time.Minute, Retries: 5, StartPeriod: 30 * time.Second, Test: []string{}, Readiness: true},
+			expectedError: false,
+		},
+		{
+			name:          "healthcheck http through test without /",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: curl --fail 0.0.0.0:8080\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{HTTP: &HTTPHealtcheck{Path: "/", Port: 8080}, Interval: 10 * time.Second, Timeout: 10 * time.Minute, Retries: 5, StartPeriod: 30 * time.Second, Test: []string{}, Readiness: true},
+			expectedError: false,
+		},
+		{
+			name:          "healthcheck readiness=false liveness=true",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      x-okteto-readiness: false\n      x-okteto-liveness: true\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: curl --fail 0.0.0.0:8080\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{HTTP: &HTTPHealtcheck{Path: "/", Port: 8080}, Interval: 10 * time.Second, Timeout: 10 * time.Minute, Retries: 5, StartPeriod: 30 * time.Second, Test: []string{}, Readiness: false, Liveness: true},
+			expectedError: false,
+		},
+		{
+			name:          "healthcheck readiness=false liveness unset",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      x-okteto-readiness: false\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: curl --fail 0.0.0.0:8080\n    image: okteto/vote:1"),
+			expected:      nil,
+			expectedError: true,
+		},
+		{
+			name:          "healthcheck readiness=false liveness=false",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      x-okteto-readiness: false\n      x-okteto-liveness: false\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: curl --fail 0.0.0.0:8080\n    image: okteto/vote:1"),
+			expected:      nil,
+			expectedError: true,
+		},
+		{
+			name:          "healthcheck readiness=true liveness=false",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      x-okteto-readiness: true\n      x-okteto-liveness: false\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: curl --fail 0.0.0.0:8080\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{HTTP: &HTTPHealtcheck{Path: "/", Port: 8080}, Interval: 10 * time.Second, Timeout: 10 * time.Minute, Retries: 5, StartPeriod: 30 * time.Second, Test: []string{}, Readiness: true, Liveness: false},
+			expectedError: false,
+		},
+		{
+			name:          "healthcheck readiness=true liveness=true",
+			manifest:      []byte("services:\n  app:\n    healthcheck:\n      interval: 10s\n      x-okteto-readiness: true\n      x-okteto-liveness: true\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: curl --fail 0.0.0.0:8080\n    image: okteto/vote:1"),
+			expected:      &HealthCheck{HTTP: &HTTPHealtcheck{Path: "/", Port: 8080}, Interval: 10 * time.Second, Timeout: 10 * time.Minute, Retries: 5, StartPeriod: 30 * time.Second, Test: []string{}, Readiness: true, Liveness: true},
+			expectedError: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack(tt.manifest, true)
+			if err != nil && !tt.expectedError {
+				t.Fatal(err)
+			} else if err == nil && tt.expectedError {
+				t.Fatal("error not thrown")
+			}
+
+			if !tt.expectedError {
+				assert.Equal(t, tt.expected, s.Services["app"].Healtcheck)
+			}
+
+		})
+	}
+}
+
+func Test_NodeSelectorUnmarshalling(t *testing.T) {
+	tests := []struct {
+		expected      Selector
+		name          string
+		manifest      []byte
+		expectedError bool
+	}{
+		{
+			name:          "empty node selector",
+			manifest:      []byte("services:\n  app:\n\n    image: okteto/vote:1"),
+			expected:      nil,
+			expectedError: false,
+		},
+		{
+			name:          "node selector",
+			manifest:      []byte("services:\n  app:\n    image: okteto/vote:1\n    x-node-selector:\n      label: value"),
+			expected:      Selector{"label": "value"},
+			expectedError: false,
+		},
+		{
+			name:          "wrong selector",
+			manifest:      []byte("services:\n  app:\n    image: okteto/vote:1\n    x-node-selector: value"),
+			expected:      nil,
+			expectedError: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack(tt.manifest, true)
+			if err != nil && !tt.expectedError {
+				t.Fatal(err)
+			} else if err == nil && tt.expectedError {
+				t.Fatal("error not thrown")
+			}
+
+			if !tt.expectedError {
+				assert.Equal(t, tt.expected, s.Services["app"].NodeSelector)
+			}
+
+		})
+	}
+}
+
+func Test_EnableServiceLinksUnmarshalling(t *testing.T) {
+	tests := []struct {
+		expected      *bool
+		name          string
+		manifest      []byte
+		expectedError bool
+	}{
+		{
+			name:     "not set defaults to nil",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1"),
+			expected: nil,
+		},
+		{
+			name:     "explicitly disabled",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    x-enable-service-links: false"),
+			expected: ptr.To(false),
+		},
+		{
+			name:     "explicitly enabled",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    x-enable-service-links: true"),
+			expected: ptr.To(true),
+		},
+		{
+			name:          "invalid value",
+			manifest:      []byte("services:\n  app:\n    image: okteto/vote:1\n    x-enable-service-links: notabool"),
+			expectedError: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack(tt.manifest, true)
+			if err != nil && !tt.expectedError {
+				t.Fatal(err)
+			} else if err == nil && tt.expectedError {
+				t.Fatal("error not thrown")
+			}
+
+			if !tt.expectedError {
+				assert.Equal(t, tt.expected, s.Services["app"].EnableServiceLinks)
+			}
+		})
+	}
+}
+
+func TestComposeBuildSectionUnmarshalling(t *testing.T) {
+	tests := []struct {
+		expected *composeBuildInfo
+		name     string
+		bytes    []byte
+	}{
+		{
+			name:     "with depends on fail",
+			bytes:    []byte(`depends_on: a`),
+			expected: nil,
+		},
+		{
+			name:  "context",
+			bytes: []byte(`context: .`),
+			expected: &composeBuildInfo{
+				Context: ".",
+			},
+		},
+		{
+			name:  "context direct",
+			bytes: []byte(`nginx`),
+			expected: &composeBuildInfo{
+				Context: "nginx",
+			},
+		},
+		{
+			name: "complete",
+			bytes: []byte(`context: .
+dockerfile: Dockerfile
+image: nginx`),
+			expected: &composeBuildInfo{
+				Image:      "nginx",
+				Context:    ".",
+				Dockerfile: "Dockerfile",
+			},
+		},
+		{
+			name:  "secrets short form list",
+			bytes: []byte("context: .\nsecrets:\n  - mysecret\n"),
+			expected: &composeBuildInfo{
+				Context: ".",
+				Secrets: []string{"mysecret"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var result composeBuildInfo
+			err := yaml.UnmarshalStrict(tt.bytes, &result)
+			if err != nil && tt.expected == nil {
+				return
+			}
+
+			assert.Equal(t, tt.expected, &result)
+		})
+	}
+}
+
+func Test_HealthcheckTestUnmarshalling(t *testing.T) {
+	tests := []struct {
+		name            string
+		healthcheckTest string
+		expected        HealtcheckTest
+		expectedError   bool
+	}{
+		{
+			name:            "empty list",
+			healthcheckTest: `[]`,
+			expected:        []string{},
+			expectedError:   true,
+		},
+		{
+			name:            "NONE simple",
+			healthcheckTest: `["NONE"]`,
+			expected:        []string{"NONE"},
+			expectedError:   false,
+		},
+		{
+			name:            "NONE with args",
+			healthcheckTest: `["NONE", "curl -f localhost:5000"]`,
+			expected:        []string{"NONE"},
+			expectedError:   false,
+		},
+		{
+			name:            "other than the three expected",
+			healthcheckTest: `["TEST", "curl -f localhost:5000"]`,
+			expected:        []string{},
+			expectedError:   true,
+		},
+		{
+			name:            "CMDSHELL",
+			healthcheckTest: `["CMD-SHELL", "curl -f localhost:5000"]`,
+			expected:        []string{"curl", "-f", "localhost:5000"},
+			expectedError:   false,
+		},
+		{
+			name:            "CMD",
+			healthcheckTest: `["CMD", "curl", "-f", "localhost:5000"]`,
+			expected:        []string{"curl", "-f", "localhost:5000"},
+			expectedError:   false,
+		},
+		{
+			name:            "direct",
+			healthcheckTest: `curl -f localhost:5000`,
+			expected:        []string{"curl", "-f", "localhost:5000"},
+			expectedError:   false,
+		},
+		{
+			name: "list",
+			healthcheckTest: `- CMD
+- curl
+- -f
+- localhost:5000`,
+			expected:      []string{"curl", "-f", "localhost:5000"},
+			expectedError: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var result HealtcheckTest
+			if err := yaml.Unmarshal([]byte(tt.healthcheckTest), &result); err != nil {
+				if !tt.expectedError {
+					t.Fatalf("unexpected error unmarshaling %s: %s", tt.name, err.Error())
+				}
+				return
+			}
+			if tt.expectedError {
+				t.Fatalf("expected error unmarshaling %s not thrown", tt.name)
+			}
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("didn't unmarshal correctly healthcheck test. Actual %v, Expected %v", result, tt.expected)
+			}
 		})
 	}
 }
@@ -168,49 +756,67 @@ func Test_PortUnmarshalling(t *testing.T) {
 		{
 			name:          "singlePort",
 			portRaw:       "3000",
-			expected:      PortRaw{ContainerPort: 3000, Protocol: v1.ProtocolTCP},
+			expected:      PortRaw{ContainerPort: 3000, Protocol: apiv1.ProtocolTCP},
 			expectedError: false,
 		},
 		{
 			name:          "singleRange",
 			portRaw:       "3000-3005",
-			expected:      PortRaw{ContainerPort: 0, Protocol: v1.ProtocolTCP},
-			expectedError: true,
+			expected:      PortRaw{ContainerFrom: 3000, ContainerTo: 3005, Protocol: apiv1.ProtocolTCP},
+			expectedError: false,
 		},
 		{
 			name:          "singlePortForwarding",
 			portRaw:       "8000:8000",
-			expected:      PortRaw{HostPort: 8000, ContainerPort: 8000, Protocol: v1.ProtocolTCP},
+			expected:      PortRaw{HostPort: 8000, ContainerPort: 8000, Protocol: apiv1.ProtocolTCP},
 			expectedError: false,
 		},
 		{
 			name:          "RangeForwarding",
 			portRaw:       "9090-9091:8080-8081",
-			expected:      PortRaw{ContainerPort: 0, Protocol: v1.ProtocolTCP},
+			expected:      PortRaw{ContainerFrom: 8080, ContainerTo: 8081, HostFrom: 9090, HostTo: 9091, Protocol: apiv1.ProtocolTCP},
+			expectedError: false,
+		},
+		{
+			name:          "RangeForwardingNotSameLength",
+			portRaw:       "9090-9092:8080-8081",
+			expected:      PortRaw{ContainerFrom: 8080, ContainerTo: 8081, HostFrom: 9090, HostTo: 9091, Protocol: apiv1.ProtocolTCP},
 			expectedError: true,
 		},
 		{
 			name:          "DifferentPort",
 			portRaw:       "49100:22",
-			expected:      PortRaw{HostPort: 49100, ContainerPort: 22, Protocol: v1.ProtocolTCP},
+			expected:      PortRaw{HostPort: 49100, ContainerPort: 22, Protocol: apiv1.ProtocolTCP},
 			expectedError: false,
 		},
 		{
 			name:          "LocalhostForwarding",
 			portRaw:       "127.0.0.1:8000:8001",
-			expected:      PortRaw{HostPort: 8000, ContainerPort: 8001, Protocol: v1.ProtocolTCP},
-			expectedError: false,
+			expected:      PortRaw{HostPort: 8000, ContainerPort: 8001, Protocol: apiv1.ProtocolTCP},
+			expectedError: true,
 		},
 		{
 			name:          "Localhost Range",
 			portRaw:       "127.0.0.1:5000-5010:5000-5010",
-			expected:      PortRaw{ContainerPort: 0, Protocol: v1.ProtocolTCP},
+			expected:      PortRaw{ContainerPort: 0, Protocol: apiv1.ProtocolTCP},
 			expectedError: true,
 		},
 		{
 			name:          "Protocol",
 			portRaw:       "6060:6060/udp",
-			expected:      PortRaw{HostPort: 6060, ContainerPort: 6060, Protocol: v1.ProtocolUDP},
+			expected:      PortRaw{HostPort: 6060, ContainerPort: 6060, Protocol: apiv1.ProtocolUDP},
+			expectedError: false,
+		},
+		{
+			name:          "ProtocolWithoutMapping",
+			portRaw:       "6060/udp",
+			expected:      PortRaw{ContainerPort: 6060, Protocol: apiv1.ProtocolUDP},
+			expectedError: false,
+		},
+		{
+			name:          "RangeProtocol",
+			portRaw:       "6060-6061:6060-6061/udp",
+			expected:      PortRaw{ContainerFrom: 6060, ContainerTo: 6061, HostFrom: 6060, HostTo: 6061, Protocol: apiv1.ProtocolUDP},
 			expectedError: false,
 		},
 	}
@@ -258,7 +864,7 @@ func Test_DurationUnmarshalling(t *testing.T) {
 			expected: 12,
 		},
 		{
-			name:     "string-no-units",
+			name:     "string-with-units",
 			duration: []byte("12s"),
 			expected: 12,
 		},
@@ -296,9 +902,19 @@ func Test_GroupNotSupportedFields(t *testing.T) {
 			expected: []string{"volumes", "networks", "service[app].cpus"},
 		},
 		{
-			name:     "string-no-units",
+			name:     "group-two-services",
 			input:    []string{"volumes", "networks", "service[app].cpus", "service[db].cpus"},
 			expected: []string{"volumes", "networks", "service[app, db].cpus"},
+		},
+		{
+			name:     "two-into-one",
+			input:    []string{"service[app].cpus", "service[db].cpus"},
+			expected: []string{"service[app, db].cpus"},
+		},
+		{
+			name:     "only-one",
+			input:    []string{"service[app].cpus"},
+			expected: []string{"service[app].cpus"},
 		},
 	}
 	for _, tt := range tests {
@@ -313,9 +929,9 @@ func Test_GroupNotSupportedFields(t *testing.T) {
 
 func TestStackResourcesUnmarshalling(t *testing.T) {
 	tests := []struct {
+		expected StackResources
 		name     string
 		data     []byte
-		expected StackResources
 	}{
 		{
 			name: "limits-requests",
@@ -397,9 +1013,9 @@ func Test_validateCommandArgs(t *testing.T) {
 	tests := []struct {
 		name        string
 		manifest    []byte
-		isCompose   bool
 		Entrypoint  Entrypoint
 		Command     Command
+		isCompose   bool
 		expectedErr bool
 	}{
 		{
@@ -409,6 +1025,12 @@ func Test_validateCommandArgs(t *testing.T) {
 			Entrypoint:  Entrypoint{Values: []string{"/usr/bin/rpk", "redpanda"}},
 			Command:     Command{},
 			expectedErr: false,
+		},
+		{
+			name:        "COMPOSE-service-empty",
+			manifest:    []byte("services:\n  app:\n"),
+			isCompose:   true,
+			expectedErr: true,
 		},
 		{
 			name:        "STACK-only-entrypoint",
@@ -495,9 +1117,126 @@ func Test_validateCommandArgs(t *testing.T) {
 						t.Fatalf("Expected %v but got %v", tt.Command, svc.Command)
 					}
 					if !reflect.DeepEqual(svc.Entrypoint, tt.Entrypoint) {
-						t.Fatalf("Expected %v but got %v", tt.Command, svc.Command)
+						t.Fatalf("Expected %v but got %v", tt.Entrypoint, svc.Entrypoint)
 					}
 				}
+			}
+		})
+	}
+}
+
+func Test_validateVolumesUnmarshalling(t *testing.T) {
+	wd, err := os.Getwd()
+	assert.NoError(t, err)
+	relativePathExpanded := filepath.Join(wd, "test_volume_relative_path_found")
+	relativePathExpandedFile := filepath.Join(wd, "test-file")
+	err = os.Mkdir("test_volume_relative_path_found", 0750)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll("test_volume_relative_path_found")
+	file, err := os.Create("test-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(file.Name())
+	tests := []struct {
+		name                 string
+		manifest             []byte
+		expectedVolumes      []build.VolumeMounts
+		expectedVolumesMount []build.VolumeMounts
+		expectedError        bool
+	}{
+		{
+			name:     "volume-relative-path-found",
+			manifest: []byte("services:\n  app:\n    volumes: \n    - test_volume_relative_path_found:/var/lib/redpanda/data\n    image: okteto/vote:1\n"),
+			expectedVolumesMount: []build.VolumeMounts{
+				{
+					LocalPath:  relativePathExpanded,
+					RemotePath: "/var/lib/redpanda/data",
+				},
+			},
+			expectedVolumes: []build.VolumeMounts{},
+			expectedError:   false,
+		},
+		{
+			name:     "volume-absolute-path",
+			manifest: []byte(fmt.Sprintf("services:\n  app:\n    volumes: \n    - %s:/var/lib/redpanda/data\n    image: okteto/vote:1\n", relativePathExpanded)),
+			expectedVolumesMount: []build.VolumeMounts{
+				{
+					LocalPath:  relativePathExpanded,
+					RemotePath: "/var/lib/redpanda/data",
+				},
+			},
+			expectedVolumes: []build.VolumeMounts{},
+			expectedError:   false,
+		},
+		{
+			name:     "correct-volume",
+			manifest: []byte("services:\n  app:\n    volumes: \n    - redpanda:/var/lib/redpanda/data\n    image: okteto/vote:1\nvolumes:\n  redpanda:\n"),
+			expectedVolumes: []build.VolumeMounts{
+				{
+					LocalPath:  "redpanda",
+					RemotePath: "/var/lib/redpanda/data",
+				},
+			},
+			expectedVolumesMount: []build.VolumeMounts{},
+			expectedError:        false,
+		},
+		{
+			name:          "volume-not-declared-in-volumes-top-level-section",
+			manifest:      []byte("services:\n  app:\n    volumes: \n    - redpanda:/var/lib/redpanda/data\n    image: okteto/vote:1\n"),
+			expectedError: true,
+		},
+		{
+			name:     "absolute path",
+			manifest: []byte(fmt.Sprintf("services:\n  app:\n    image: okteto/vote:1\n    volumes:\n      - %s:/var/run/docker.sock", relativePathExpandedFile)),
+			expectedVolumesMount: []build.VolumeMounts{
+				{
+					LocalPath:  relativePathExpandedFile,
+					RemotePath: "/var/run/docker.sock",
+				},
+			},
+			expectedVolumes: []build.VolumeMounts{},
+			expectedError:   false,
+		},
+		{
+			name:          "volume-relative-path-not-found",
+			manifest:      []byte("services:\n  app:\n    volumes: \n    - test:/var/lib/redpanda/data\n    image: okteto/vote:1\n"),
+			expectedError: true,
+		},
+		{
+			name:                 "pv",
+			manifest:             []byte("services:\n  app:\n    volumes: \n    - /var/lib/redpanda/data\n    image: okteto/vote:1\n"),
+			expectedVolumesMount: []build.VolumeMounts{},
+			expectedVolumes: []build.VolumeMounts{
+				{
+					RemotePath: "/var/lib/redpanda/data",
+				},
+			},
+			expectedError: false,
+		},
+		{
+			name:     "volume-with-underscores",
+			manifest: []byte("services:\n  app:\n    volumes: \n    - redpanda_a:/var/lib/redpanda/data\n    image: okteto/vote:1\nvolumes:\n  redpanda_a:\n"),
+			expectedVolumes: []build.VolumeMounts{
+				{
+					LocalPath:  "redpanda-a",
+					RemotePath: "/var/lib/redpanda/data",
+				},
+			},
+			expectedVolumesMount: []build.VolumeMounts{},
+			expectedError:        false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stack, err := ReadStack(tt.manifest, true)
+			if err != nil && !tt.expectedError {
+				t.Fatal(err)
+			} else if err == nil && !tt.expectedError {
+				assert.Equal(t, stack.Services["app"].Volumes, tt.expectedVolumes)
+				assert.Equal(t, stack.Services["app"].VolumeMounts, tt.expectedVolumesMount)
 			}
 		})
 	}
@@ -507,22 +1246,97 @@ func Test_validateIngressCreationPorts(t *testing.T) {
 	tests := []struct {
 		name     string
 		manifest []byte
+		ports    []Port
 		isPublic bool
 	}{
 		{
-			name:     "Public-service",
-			manifest: []byte("services:\n  app:\n    ports:\n    - 9213\n    public: true\n    image: okteto/vote:1"),
-			isPublic: true,
+			name:     "expose-range-and-ports-range",
+			manifest: []byte("services:\n  app:\n    ports:\n    - 9213-9215\n    expose:\n    - 8213-8215\n    image: okteto/vote:1"),
+			isPublic: false,
+			ports: []Port{
+				{ContainerPort: 9213, Protocol: apiv1.ProtocolTCP},
+				{ContainerPort: 9214, Protocol: apiv1.ProtocolTCP},
+				{ContainerPort: 9215, Protocol: apiv1.ProtocolTCP},
+				{ContainerPort: 8213, Protocol: apiv1.ProtocolTCP},
+				{ContainerPort: 8214, Protocol: apiv1.ProtocolTCP},
+				{ContainerPort: 8215, Protocol: apiv1.ProtocolTCP},
+			},
 		},
 		{
-			name:     "not-public-service",
-			manifest: []byte("services:\n  app:\n    ports:\n    - 9213\n    image: okteto/vote:1"),
+			name:     "not-public-service-with-expose-and-ports",
+			manifest: []byte("services:\n  app:\n    ports:\n    - 9213\n    expose:\n    - 8213\n    image: okteto/vote:1"),
 			isPublic: false,
+			ports: []Port{
+				{ContainerPort: 9213, Protocol: apiv1.ProtocolTCP},
+				{ContainerPort: 8213, Protocol: apiv1.ProtocolTCP},
+			},
 		},
 		{
 			name:     "not-public-port-but-with-assignation",
 			manifest: []byte("services:\n  app:\n    ports:\n    - 9213:9213\n    image: okteto/vote:1"),
 			isPublic: true,
+			ports:    []Port{{ContainerPort: 9213, Protocol: apiv1.ProtocolTCP}},
+		},
+		{
+			name:     "not-public-range-but-with-assignation",
+			manifest: []byte("services:\n  app:\n    ports:\n    - 9213-9215:9213-9215\n    image: okteto/vote:1"),
+			isPublic: false,
+			ports: []Port{
+				{HostPort: 9213, ContainerPort: 9213, Protocol: apiv1.ProtocolTCP},
+				{HostPort: 9213, ContainerPort: 9214, Protocol: apiv1.ProtocolTCP},
+				{HostPort: 9213, ContainerPort: 9215, Protocol: apiv1.ProtocolTCP},
+			},
+		},
+		{
+			name:     "Public-service",
+			manifest: []byte("services:\n  app:\n    ports:\n    - 9213\n    public: true\n    image: okteto/vote:1"),
+			isPublic: true,
+			ports:    []Port{{ContainerPort: 9213, Protocol: apiv1.ProtocolTCP}},
+		},
+		{
+			name:     "Public-service-with-range",
+			manifest: []byte("services:\n  app:\n    ports:\n    - 9213-9215\n    public: true\n    image: okteto/vote:1"),
+			isPublic: true,
+			ports: []Port{
+				{ContainerPort: 9213, Protocol: apiv1.ProtocolTCP},
+				{ContainerPort: 9214, Protocol: apiv1.ProtocolTCP},
+				{ContainerPort: 9215, Protocol: apiv1.ProtocolTCP},
+			},
+		},
+		{
+			name:     "not-public-service",
+			manifest: []byte("services:\n  app:\n    ports:\n    - 9213\n    image: okteto/vote:1"),
+			isPublic: false,
+			ports:    []Port{{ContainerPort: 9213, Protocol: apiv1.ProtocolTCP}},
+		},
+		{
+			name:     "not-public-service-with-range",
+			manifest: []byte("services:\n  app:\n    ports:\n    - 9213-9215\n    image: okteto/vote:1"),
+			isPublic: false,
+			ports: []Port{
+				{ContainerPort: 9213, Protocol: apiv1.ProtocolTCP},
+				{ContainerPort: 9214, Protocol: apiv1.ProtocolTCP},
+				{ContainerPort: 9215, Protocol: apiv1.ProtocolTCP},
+			},
+		},
+
+		{
+			name:     "mysql-port-forwarding",
+			manifest: []byte("services:\n  app:\n    ports:\n    - 3306:3306\n    image: okteto/vote:1"),
+			isPublic: false,
+			ports:    []Port{{ContainerPort: 3306, Protocol: apiv1.ProtocolTCP}},
+		},
+		{
+			name:     "mysql-port-forwarding-and-public",
+			manifest: []byte("services:\n  app:\n    ports:\n    - 3306:3306\n    image: okteto/vote:1\n    public: true"),
+			isPublic: true,
+			ports:    []Port{{ContainerPort: 3306, Protocol: apiv1.ProtocolTCP}},
+		},
+		{
+			name:     "mysql-expose-forwarding-and-public",
+			manifest: []byte("services:\n  app:\n    expose:\n    - 3306:3306\n    image: okteto/vote:1\n    public: true"),
+			isPublic: false,
+			ports:    []Port{{ContainerPort: 3306, Protocol: apiv1.ProtocolTCP}},
 		},
 	}
 	for _, tt := range tests {
@@ -536,30 +1350,644 @@ func Test_validateIngressCreationPorts(t *testing.T) {
 					t.Fatalf("Expected %v but got %v", tt.isPublic, svc.Public)
 				}
 			}
+			if len(tt.ports) != len(s.Services["app"].Ports) {
+				t.Fatalf("Not unmarshalled ports correctly")
+			}
 		})
 	}
 }
 
-func Test_restartFile(t *testing.T) {
+func Test_unmarshalVolumes(t *testing.T) {
 	tests := []struct {
-		name     string
-		manifest []byte
-		isInList bool
+		expectedVolume *VolumeSpec
+		name           string
+		manifest       []byte
+		isCompose      bool
 	}{
 		{
-			name:     "no-restart-field",
-			manifest: []byte("services:\n  app:\n    ports:\n    - 9213\n    public: true\n    image: okteto/vote:1"),
-			isInList: false,
+			name: "simple volume",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("1Gi")}, Labels: Labels{}, Annotations: Annotations{}},
 		},
 		{
-			name:     "restart-field-always",
-			manifest: []byte("services:\n  app:\n    ports:\n    - 9213\n    image: okteto/vote:1\n    restart: always"),
-			isInList: false,
+			name: "volume with size",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+    size: 2Gi
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("2Gi")}, Labels: Labels{}, Annotations: Annotations{}},
 		},
 		{
-			name:     "restart-field-not-always",
-			manifest: []byte("services:\n  app:\n    ports:\n    - 9213:9213\n    image: okteto/vote:1\n    restart: never"),
-			isInList: true,
+			name: "volume with driver_opts.size",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+    driver_opts:
+      size: 2Gi
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("2Gi")}, Labels: Labels{}, Annotations: Annotations{}},
+		},
+		{
+			name: "volume with driver_opts.class",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+    driver_opts:
+      class: standard
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("1Gi")}, Class: "standard", Labels: Labels{}, Annotations: Annotations{}},
+		},
+		{
+			name: "volume with class",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+    class: standard
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("1Gi")}, Class: "standard", Labels: Labels{}, Annotations: Annotations{}},
+		},
+		{
+			name:      "compose - volume with labels",
+			isCompose: true,
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+    labels:
+      env: test
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("1Gi")}, Labels: Labels{}, Annotations: Annotations{"env": "test"}},
+		},
+		{
+			name:      "compose - volume with annotations",
+			isCompose: true,
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+    annotations:
+      env: test
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("1Gi")}, Labels: Labels{"env": "test"}, Annotations: Annotations{}},
+		},
+		{
+			name:      "compose - volume with labels and annotations",
+			isCompose: true,
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+    labels:
+      label-env: label-test
+    annotations:
+      annotation-env: annotation-test
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("1Gi")}, Labels: Labels{"annotation-env": "annotation-test"}, Annotations: Annotations{"label-env": "label-test"}},
+		},
+		{
+			name:      "stack - volume with labels",
+			isCompose: false,
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+    labels:
+      env: test
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("1Gi")}, Labels: Labels{}, Annotations: Annotations{"env": "test"}},
+		},
+		{
+			name:      "stack - volume with annotations",
+			isCompose: false,
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+    annotations:
+      env: test
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("1Gi")}, Annotations: Annotations{"env": "test"}, Labels: Labels{}},
+		},
+		{
+			name:      "stack - volume with labels and annotations",
+			isCompose: false,
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+volumes:
+  apiv1:
+    labels:
+      label-env: label-test
+    annotations:
+      annotation-env: annotation-test
+`),
+			expectedVolume: &VolumeSpec{Size: Quantity{resource.MustParse("1Gi")}, Labels: Labels{}, Annotations: Annotations{"annotation-env": "annotation-test", "label-env": "label-test"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack(tt.manifest, tt.isCompose)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectedVolume, s.Volumes["apiv1"])
+		})
+	}
+}
+
+func Test_sanitizeVolumeName(t *testing.T) {
+	tests := []struct {
+		name               string
+		volumeName         string
+		expectedVolumeName string
+	}{
+		{
+			name:               "correct-volume",
+			volumeName:         "redpanda",
+			expectedVolumeName: "redpanda",
+		},
+		{
+			name:               "volume-name-with-_",
+			volumeName:         "db_postgres",
+			expectedVolumeName: "db-postgres",
+		},
+		{
+			name:               "volume-name-with-whitespace",
+			volumeName:         "db postgres",
+			expectedVolumeName: "db-postgres",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			name := sanitizeName(tt.volumeName)
+			if name != tt.expectedVolumeName {
+				t.Fatalf("Expected '%s', but got %s", tt.expectedVolumeName, name)
+			}
+		})
+	}
+}
+
+func Test_UnmarshalRestart(t *testing.T) {
+	tests := []struct {
+		name     string
+		result   apiv1.RestartPolicy
+		manifest []byte
+		throwErr bool
+	}{
+		{
+			name:     "Not-supported-policy",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: always\n    deploy:\n      restart_policy:\n        condition: aaa"),
+			result:   apiv1.RestartPolicyAlways,
+			throwErr: true,
+		},
+		{
+			name:     "restart-always",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: always"),
+			result:   apiv1.RestartPolicyAlways,
+			throwErr: false,
+		},
+		{
+			name:     "restart-always-default",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1"),
+			result:   apiv1.RestartPolicyAlways,
+			throwErr: false,
+		},
+		{
+			name:     "restart-always-by-deploy",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    deploy:\n      restart_policy:\n        condition: any"),
+			result:   apiv1.RestartPolicyAlways,
+			throwErr: false,
+		},
+		{
+			name:     "restart-on-failure",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: on-failure"),
+			result:   apiv1.RestartPolicyOnFailure,
+			throwErr: false,
+		},
+		{
+			name:     "restart-on-failure-by-deploy",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    deploy:\n      restart_policy:\n        condition: on-failure"),
+			result:   apiv1.RestartPolicyOnFailure,
+			throwErr: false,
+		},
+		{
+			name:     "restart-never",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: never"),
+			result:   apiv1.RestartPolicyNever,
+			throwErr: false,
+		},
+		{
+			name:     "restart-never-by-deploy",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    deploy:\n      restart_policy:\n        condition: no"),
+			result:   apiv1.RestartPolicyNever,
+			throwErr: false,
+		},
+		{
+			name:     "deploy over direct restart",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: always\n    deploy:\n      restart_policy:\n        condition: on-failure"),
+			result:   apiv1.RestartPolicyOnFailure,
+			throwErr: false,
+		},
+		{
+			name:     "Not-supported-policy",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: always\n    deploy:\n      restart_policy:\n        condition: aaa"),
+			result:   apiv1.RestartPolicyAlways,
+			throwErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack(tt.manifest, false)
+			if tt.throwErr && err == nil {
+				t.Fatal("Error not thrown")
+			} else if err != nil && !tt.throwErr {
+				t.Fatalf("Threw error when no error needed: %s", err.Error())
+			}
+			if err == nil && s.Services["app"].RestartPolicy != tt.result {
+				t.Fatal("Wrong unmarshal")
+			}
+
+		})
+	}
+}
+
+func Test_UnmarshalSvcName(t *testing.T) {
+	tests := []struct {
+		name            string
+		svcName         string
+		manifest        []byte
+		isSvcNameChange bool
+	}{
+		{
+			name:            "with underscore",
+			manifest:        []byte("services:\n  app_1:\n    ports:\n    - 9213\n    public: true\n    image: okteto/vote:1"),
+			svcName:         "app-1",
+			isSvcNameChange: true,
+		},
+		{
+			name:            "with whitespace",
+			manifest:        []byte("services:\n  app 1:\n    ports:\n    - 9213\n    public: true\n    image: okteto/vote:1"),
+			svcName:         "app-1",
+			isSvcNameChange: true,
+		},
+		{
+			name:            "with whitespace and underscore",
+			manifest:        []byte("services:\n  app_ 1:\n    ports:\n    - 9213\n    public: true\n    image: okteto/vote:1"),
+			svcName:         "app--1",
+			isSvcNameChange: true,
+		},
+		{
+			name:            "without whitespace or underscore",
+			manifest:        []byte("services:\n  app:\n    ports:\n    - 9213\n    public: true\n    image: okteto/vote:1"),
+			svcName:         "app",
+			isSvcNameChange: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			s, err := ReadStack(tt.manifest, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := s.Services[tt.svcName]; !ok {
+				t.Fatal("Service name not sanitized")
+			}
+			if tt.isSvcNameChange && len(s.Warnings.SanitizedServices) == 0 {
+				t.Fatal("Warnings have not been recovered")
+			}
+		})
+	}
+}
+
+func Test_DeployLabelsAndAnnotations(t *testing.T) {
+	tests := []struct {
+		annotations Annotations
+		labels      Labels
+		name        string
+		manifest    []byte
+		isCompose   bool
+	}{
+		{
+			name: "compose - no labels or annotations",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+`),
+			annotations: Annotations{},
+			labels:      Labels{},
+			isCompose:   true,
+		},
+		{
+			name: "compose - deploy labels",
+			manifest: []byte(`
+services:
+  app:
+    deploy:
+      labels:
+        env: production
+    image: okteto/vote:1
+`),
+			annotations: Annotations{"env": "production"},
+			labels:      Labels{},
+			isCompose:   true,
+		},
+		{
+			name: "compose - labels on service",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+    labels:
+      env: production
+`),
+			annotations: Annotations{"env": "production"},
+			labels:      Labels{},
+			isCompose:   true,
+		},
+		{
+			name: "compose - annotations on service",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+    annotations:
+      env: production
+`),
+			annotations: Annotations{},
+			labels:      Labels{"env": "production"},
+			isCompose:   true,
+		},
+		{
+			name: "compose - labels on deploy and service and annotations",
+			manifest: []byte(`
+services:
+  app:
+    deploy:
+      labels:
+        env: production
+    image: okteto/vote:1
+    labels:
+      app: main
+    annotations:
+      annotation: test
+`),
+			annotations: Annotations{"env": "production", "app": "main"},
+			labels:      Labels{"annotation": "test"},
+			isCompose:   true,
+		},
+		{
+			name: "stack - no labels or annotations",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+`),
+			annotations: Annotations{},
+			labels:      Labels{},
+			isCompose:   false,
+		},
+		{
+			name: "stack - deploy labels",
+			manifest: []byte(`
+services:
+  app:
+    deploy:
+      labels:
+        env: production
+    image: okteto/vote:1
+`),
+			annotations: Annotations{},
+			labels:      Labels{"env": "production"},
+			isCompose:   false,
+		},
+		{
+			name: "stack - labels on deploy and service",
+			manifest: []byte(`
+services:
+  app:
+    deploy:
+      labels:
+        env: production
+    image: okteto/vote:1
+    labels:
+      app: main
+`),
+			annotations: Annotations{},
+			labels:      Labels{"app": "main", "env": "production"},
+			isCompose:   false,
+		},
+		{
+			name: "stack - labels on service",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+    labels:
+      env: production
+`),
+			annotations: Annotations{},
+			labels:      Labels{"env": "production"},
+			isCompose:   false,
+		},
+		{
+			name: "stack - annotations on service",
+			manifest: []byte(`
+services:
+  app:
+    image: okteto/vote:1
+    annotations:
+      env: production
+`),
+			annotations: Annotations{"env": "production"},
+			labels:      Labels{},
+			isCompose:   false,
+		},
+		{
+			name: "stack - labels on deploy and service and annotations",
+			manifest: []byte(`
+services:
+  app:
+    deploy:
+      labels:
+        env: production
+    image: okteto/vote:1
+    labels:
+      app: main
+    annotations:
+      annotation: test
+`),
+			annotations: Annotations{"annotation": "test"},
+			labels:      Labels{"env": "production", "app": "main"},
+			isCompose:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			s, err := ReadStack(tt.manifest, tt.isCompose)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Services["app"].Annotations) != len(tt.annotations) {
+				t.Fatalf("Bad deployment annotations")
+			}
+			if len(s.Services["app"].Labels) != len(tt.labels) {
+				t.Fatalf("Bad deployment labels")
+			}
+		})
+	}
+}
+
+func Test_endpoints(t *testing.T) {
+	tests := []struct {
+		expected EndpointSpec
+		name     string
+		manifest []byte
+	}{
+		{
+			name: "rule with name",
+			manifest: []byte(`name: test
+services:
+  app:
+    ports:
+      - 9213
+    image: okteto/vote:1
+endpoints:
+  app:
+    - path: /
+      service: app
+      port: 9213`),
+			expected: EndpointSpec{
+				"app": Endpoint{
+					Annotations: make(Annotations),
+					Labels:      make(Labels),
+					Rules: []EndpointRule{
+						{
+							Service: "app",
+							Path:    "/",
+							Port:    9213,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "rule with name and annotations/labels",
+			manifest: []byte(`name: test
+services:
+  app:
+    ports:
+    - 9213
+    image: okteto/vote:1
+endpoints:
+  app:
+    annotations:
+      key: value
+    labels:
+      key: value
+    rules:
+    - path: /
+      service: app
+      port: 9213`),
+			expected: EndpointSpec{
+				"app": Endpoint{
+					Annotations: Annotations{"key": "value"},
+					Labels:      Labels{},
+					Rules: []EndpointRule{
+						{
+							Service: "app",
+							Path:    "/",
+							Port:    9213,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "direct rules with labels/annotations",
+			manifest: []byte(`name: test
+services:
+  app:
+    ports:
+    - 9213
+    image: okteto/vote:1
+endpoints:
+  labels:
+    key: value
+  rules:
+  - path: /
+    service: app
+    port: 9213`),
+			expected: EndpointSpec{
+				"": Endpoint{
+					Annotations: Annotations{"key": "value"},
+					Labels:      Labels{},
+					Rules: []EndpointRule{
+						{
+							Service: "app",
+							Path:    "/",
+							Port:    9213,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "direct rules",
+			manifest: []byte(`name: test
+services:
+  app:
+    ports:
+    - 9213
+    image: okteto/vote:1
+endpoints:
+  - path: /
+    service: app
+    port: 9213`),
+			expected: EndpointSpec{
+				"": Endpoint{
+					Annotations: make(Annotations),
+					Labels:      make(Labels),
+					Rules: []EndpointRule{
+						{
+							Service: "app",
+							Path:    "/",
+							Port:    9213,
+						},
+					},
+				},
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -568,9 +1996,1427 @@ func Test_restartFile(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(s.Warnings) == 0 && tt.isInList {
-				t.Fatalf("Expected to see a warning but there is no warning")
+			if !reflect.DeepEqual(tt.expected, s.Endpoints) {
+				t.Fatalf("Expected %v, but got %v", tt.expected, s.Endpoints)
 			}
 		})
+	}
+}
+
+func Test_validateEnvFiles(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest []byte
+		EnvFiles env.Files
+	}{
+		{
+			name:     "snake case single file",
+			manifest: []byte("services:\n  app:\n    env_file: .testEnv\n    public: true\n    image: okteto/vote:1"),
+			EnvFiles: env.Files{".testEnv"},
+		},
+		{
+			name:     "snake case list",
+			manifest: []byte("services:\n  app:\n    env_file:\n    - .testEnv\n    - .env2\n    image: okteto/vote:1"),
+			EnvFiles: env.Files{".testEnv", ".env2"},
+		},
+		{
+			name:     "camel case single file",
+			manifest: []byte("services:\n  app:\n    envFile: .testEnv\n    image: okteto/vote:1"),
+			EnvFiles: env.Files{".testEnv"},
+		},
+		{
+			name:     "camel case list",
+			manifest: []byte("services:\n  app:\n    envFile:\n    - .testEnv\n    - .env2\n    image: okteto/vote:1"),
+			EnvFiles: env.Files{".testEnv", ".env2"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack(tt.manifest, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if svc, ok := s.Services["app"]; ok {
+				if !reflect.DeepEqual(tt.EnvFiles, svc.EnvFiles) {
+					t.Fatalf("expected %v but got %v", tt.EnvFiles, svc.EnvFiles)
+				}
+			}
+		})
+	}
+}
+
+func Test_Environment(t *testing.T) {
+	tests := []struct {
+		name        string
+		manifest    []byte
+		environment env.Environment
+	}{
+		{
+			name:        "envs",
+			manifest:    []byte("services:\n  app:\n    environment:\n        env: production\n    image: okteto/vote:1"),
+			environment: env.Environment{env.Var{Name: "env", Value: "production"}},
+		},
+		{
+			name:        "empty envs",
+			manifest:    []byte("services:\n  app:\n    environment:\n      - testEnv\n    image: okteto/vote:1"),
+			environment: env.Environment{},
+		},
+		{
+			name:        "empty envs - exists envar",
+			manifest:    []byte("services:\n  app:\n    environment:\n        OKTETO_ENVTEST:\n    image: okteto/vote:1"),
+			environment: env.Environment{env.Var{Name: "OKTETO_ENVTEST", Value: "myvalue"}},
+		},
+		{
+			name:        "empty list envs - exists envar",
+			manifest:    []byte("services:\n  app:\n    environment:\n      - OKTETO_ENVTEST\n    image: okteto/vote:1"),
+			environment: env.Environment{env.Var{Name: "OKTETO_ENVTEST", Value: "myvalue"}},
+		},
+		{
+			name:        "noenvs",
+			manifest:    []byte("services:\n  app:\n    image: okteto/vote:1"),
+			environment: env.Environment{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			t.Setenv("OKTETO_ENVTEST", "myvalue")
+
+			s, err := ReadStack(tt.manifest, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assert.Equal(t, tt.environment, s.Services["app"].Environment)
+			if len(s.Services["app"].Environment) != len(tt.environment) {
+				t.Fatalf("Bad unmarshal of envs")
+			}
+		})
+	}
+}
+
+func Test_MultipleEndpoints(t *testing.T) {
+	tests := []struct {
+		expectedStack *Stack
+		name          string
+		manifest      []byte
+		svcPublic     bool
+	}{
+		{
+			name:     "no-ports",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1"),
+			expectedStack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto/vote:1"},
+				},
+				Endpoints: nil,
+			},
+			svcPublic: false,
+		},
+		{
+			name:     "one-port-that-should-not-be-skipped",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    ports:\n    - 8080:8080"),
+			expectedStack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto/vote:1"},
+				},
+				Endpoints: nil,
+			},
+			svcPublic: true,
+		},
+		{
+			name:     "two-ports-that-should-not-be-skipped",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    ports:\n    - 8080:8080\n    - 80:8081"),
+			expectedStack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto/vote:1"},
+				},
+				Endpoints: nil,
+			},
+			svcPublic: false,
+		},
+		{
+			name:     "one-port-that-should-be-skipped",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    ports:\n    - 3306:3306"),
+			expectedStack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto/vote:1"},
+				},
+				Endpoints: nil,
+			},
+			svcPublic: false,
+		},
+		{
+			name:     "two-ports-one-skippable-and-one-not",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    ports:\n    - 8080:8080\n    - 3306:3306"),
+			expectedStack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto/vote:1"},
+				},
+				Endpoints: nil,
+			},
+			svcPublic: true,
+		},
+		{
+			name:     "three-ports-one-skippable-and-two-not",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    ports:\n    - 8080:8080\n    - 80:8081\n    - 3306:3306"),
+			expectedStack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto/vote:1"},
+				},
+				Endpoints: nil,
+			},
+			svcPublic: false,
+		},
+		{
+			name:     "two-ports-not-skippable",
+			manifest: []byte("services:\n  app:\n    image: okteto/vote:1\n    ports:\n    - 8080:8080\n    - 8081:8081"),
+			expectedStack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto/vote:1"},
+				},
+				Endpoints: nil,
+			},
+			svcPublic: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			s, err := ReadStack(tt.manifest, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Endpoints) != len(tt.expectedStack.Endpoints) {
+				t.Fatal("The number of created endpoints is incorrect")
+			}
+			if !reflect.DeepEqual(s.Endpoints, tt.expectedStack.Endpoints) {
+				t.Fatal("The endpoints have not been created properly")
+			}
+			if s.Services["app"].Public != tt.svcPublic {
+				t.Fatal("Public property was not set properly")
+			}
+		})
+	}
+}
+
+func Test_CreateJobPVCs(t *testing.T) {
+	manifest := []byte(`name: test
+services:
+  app:
+    ports:
+      - 9213
+    image: okteto/vote:1
+    volumes:
+      - /usr/var/lib
+    restart: never
+`)
+	s, err := ReadStack(manifest, true)
+	if err != nil {
+		t.Fatal("Could not read stack")
+	}
+	if len(s.Volumes) == 0 {
+		t.Fatal("PVCs not created")
+	}
+
+}
+
+func Test_TestJobCreation(t *testing.T) {
+	manifest := []byte(`name: test
+services:
+  app:
+    image: okteto/vote:1
+    deploy:
+      restart_policy:
+        max_attempts: 3
+        condition: on-failure
+`)
+	s, err := ReadStack(manifest, true)
+	if err != nil {
+		t.Fatalf("Could not read stack: %s", err.Error())
+	}
+	if s.Services["app"].BackOffLimit != 3 {
+		t.Fatal("Could not read the job properly")
+	}
+	if s.Services["app"].RestartPolicy != apiv1.RestartPolicyOnFailure {
+		t.Fatal("Could not read the job properly")
+	}
+}
+
+func Test_ExtensionUnmarshalling(t *testing.T) {
+	tests := []struct {
+		expected      *Service
+		name          string
+		manifest      []byte
+		expectedError bool
+	}{
+		{
+			name:     "test anchors expansion",
+			manifest: []byte("x-env: &testEnv\n  environment:\n  - SOME_ENV_VAR=123\nservices:\n  app:\n    <<: *testEnv"),
+			expected: &Service{
+				Environment: env.Environment{
+					env.Var{
+						Name:  "SOME_ENV_VAR",
+						Value: "123",
+					},
+				},
+			},
+			expectedError: false,
+		},
+		{
+			name:     "extension not anchor results in no error",
+			manifest: []byte("x-endpoints:\n  path: /\n  port: 8080\n  service: app\nservices:\n  app:\n    command: bash"),
+			expected: &Service{
+				Command: Command{
+					Values: []string{"bash"},
+				},
+				Environment: env.Environment{},
+			},
+			expectedError: false,
+		},
+		{
+			name:          "not valid first class field",
+			manifest:      []byte("test:\n  hello-world: echo\nservices:\n  app:\n    healthcheck:\n      interval: 10s\n      timeout: 10m\n      retries: 5\n      start_period: 30s\n      test: [\"NONE\"]\n    image: okteto/vote:1"),
+			expected:      nil,
+			expectedError: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack(tt.manifest, true)
+			if err != nil && !tt.expectedError {
+				t.Fatal(err)
+			} else if err == nil && tt.expectedError {
+				t.Fatal("error not thrown")
+			}
+			if !tt.expectedError {
+				assert.Equal(t, tt.expected.Environment, s.Services["app"].Environment)
+			}
+
+		})
+	}
+}
+
+func Test_UnmarshalStackUser(t *testing.T) {
+	tests := []struct {
+		expected      *StackSecurityContext
+		name          string
+		manifest      []byte
+		errorExpected bool
+	}{
+		{
+			name:     "expanded form",
+			manifest: []byte("runAsUser: 1000\nrunAsGroup: 2000"),
+			expected: &StackSecurityContext{RunAsUser: ptr.To(int64(1000)), RunAsGroup: ptr.To(int64(2000))},
+		},
+		{
+			name:     "runAsUserOnly",
+			manifest: []byte("1000"),
+			expected: &StackSecurityContext{RunAsUser: ptr.To(int64(1000))},
+		},
+		{
+			name:     "runAsUser and runAsGroup",
+			manifest: []byte("1000:2000"),
+			expected: &StackSecurityContext{RunAsUser: ptr.To(int64(1000)), RunAsGroup: ptr.To(int64(2000))},
+		},
+		{
+			name:          "not a number",
+			manifest:      []byte("test"),
+			errorExpected: true,
+			expected:      nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var result *StackSecurityContext
+			if err := yaml.Unmarshal(tt.manifest, &result); err != nil {
+				if !tt.errorExpected {
+					t.Fatalf("unexpected error unmarshaling %s: %s", tt.name, err.Error())
+				}
+				return
+			}
+			if tt.errorExpected {
+				t.Fatalf("expected error unmarshaling %s not thrown", tt.name)
+			}
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("didn't unmarshal correctly stack user. Actual %v, Expected %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func Test_TranslateOktetoStackPortsToComposePorts(t *testing.T) {
+	tests := []struct {
+		name     string
+		ports    []PortRaw
+		expected []PortRaw
+	}{
+		{
+			name: "containerPort only",
+			ports: []PortRaw{
+				{
+					ContainerPort: 8080,
+				},
+				{
+					ContainerPort: 3000,
+				},
+			},
+			expected: []PortRaw{
+				{
+					ContainerPort: 8080,
+					HostPort:      8080,
+				},
+				{
+					ContainerPort: 3000,
+					HostPort:      3000,
+				},
+			},
+		},
+		{
+			name: "hostPort:containerPort only",
+			ports: []PortRaw{
+				{
+					ContainerPort: 8080,
+					HostPort:      8081,
+				},
+				{
+					ContainerPort: 3000,
+					HostPort:      2345,
+				},
+			},
+			expected: []PortRaw{
+				{
+					ContainerPort: 8080,
+					HostPort:      8081,
+				},
+				{
+					ContainerPort: 3000,
+					HostPort:      2345,
+				},
+			},
+		},
+		{
+			name: "hostPort:containerPort and containerPort",
+			ports: []PortRaw{
+				{
+					ContainerPort: 8080,
+				},
+				{
+					ContainerPort: 3000,
+					HostPort:      2345,
+				},
+			},
+			expected: []PortRaw{
+				{
+					ContainerPort: 8080,
+					HostPort:      8080,
+				},
+				{
+					ContainerPort: 3000,
+					HostPort:      2345,
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := translateOktetoStacksPortsIntoComposeSyntax(tt.ports)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func Test_EndpointModeUnmarshalling(t *testing.T) {
+	tests := []struct {
+		name         string
+		yaml         string
+		expectedMode EndpointMode
+		expectError  bool
+	}{
+		{
+			name: "VIP endpoint mode",
+			yaml: `
+services:
+  web:
+    image: nginx
+    deploy:
+      endpoint_mode: vip
+`,
+			expectedMode: EndpointModeVIP,
+			expectError:  false,
+		},
+		{
+			name: "DNSRR endpoint mode",
+			yaml: `
+services:
+  web:
+    image: nginx
+    deploy:
+      endpoint_mode: dnsrr
+`,
+			expectedMode: EndpointModeDNSRR,
+			expectError:  false,
+		},
+		{
+			name: "Default endpoint mode (VIP when not specified)",
+			yaml: `
+services:
+  web:
+    image: nginx
+`,
+			expectedMode: EndpointModeVIP,
+			expectError:  false,
+		},
+		{
+			name: "Invalid endpoint mode",
+			yaml: `
+services:
+  web:
+    image: nginx
+    deploy:
+      endpoint_mode: invalid
+`,
+			expectedMode: EndpointModeVIP,
+			expectError:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stack Stack
+			stack.IsCompose = true
+			err := yaml.Unmarshal([]byte(tt.yaml), &stack)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Contains(t, stack.Services, "web")
+			assert.Equal(t, tt.expectedMode, stack.Services["web"].EndpointMode)
+		})
+	}
+}
+
+func TestComposeBuildSecretsResolution(t *testing.T) {
+	tests := []struct {
+		name            string
+		yaml            string
+		expectedSecrets build.Secrets
+	}{
+		{
+			name: "file secret resolved via top-level",
+			yaml: `
+secrets:
+  server-cert:
+    file: ./server.cert
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - server-cert
+`,
+			expectedSecrets: build.Secrets{
+				"server-cert": build.Secret{File: "./server.cert"},
+			},
+		},
+		{
+			name: "env secret resolved via top-level",
+			yaml: `
+secrets:
+  npm_token:
+    environment: NPM_TOKEN
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+			expectedSecrets: build.Secrets{
+				"npm_token": build.Secret{Env: "NPM_TOKEN"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack([]byte(tt.yaml), true)
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedSecrets, s.Services["api"].Build.Secrets)
+		})
+	}
+}
+
+func TestComposeBuildSecretsNotSupportedFields(t *testing.T) {
+	tests := []struct {
+		name           string
+		yaml           string
+		expectedFields []string
+	}{
+		{
+			name: "name field in secret triggers warning",
+			yaml: `
+secrets:
+  npm_token:
+    file: ./server.cert
+    name: docker_secret_npm_token
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+			expectedFields: []string{"secrets[npm_token].name"},
+		},
+		{
+			name: "external field in secret triggers warning",
+			yaml: `
+secrets:
+  npm_token:
+    file: ./server.cert
+    external: true
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+			expectedFields: []string{"secrets[npm_token].external"},
+		},
+		{
+			name: "both name and external fields trigger warnings",
+			yaml: `
+secrets:
+  npm_token:
+    file: ./server.cert
+    name: docker_secret_npm_token
+    external: true
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+			expectedFields: []string{"secrets[npm_token].name", "secrets[npm_token].external"},
+		},
+		{
+			name: "labels field in secret triggers warning",
+			yaml: `
+secrets:
+  npm_token:
+    file: ./server.cert
+    labels:
+      app: myapp
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+			expectedFields: []string{"secrets[npm_token].labels"},
+		},
+		{
+			name: "driver field in secret triggers warning",
+			yaml: `
+secrets:
+  npm_token:
+    file: ./server.cert
+    driver: vault
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+			expectedFields: []string{"secrets[npm_token].driver"},
+		},
+		{
+			name: "driver_opts field in secret triggers warning",
+			yaml: `
+secrets:
+  npm_token:
+    file: ./server.cert
+    driver_opts:
+      key: value
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+			expectedFields: []string{"secrets[npm_token].driver_opts"},
+		},
+		{
+			name: "template_driver field in secret triggers warning",
+			yaml: `
+secrets:
+  npm_token:
+    file: ./server.cert
+    template_driver: vault
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+			expectedFields: []string{"secrets[npm_token].template_driver"},
+		},
+		{
+			name: "x- extension field in secret is allowed without warning",
+			yaml: `
+secrets:
+  npm_token:
+    file: ./server.cert
+    x-custom: some-value
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+			expectedFields: []string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack([]byte(tt.yaml), true)
+			require.NoError(t, err)
+			for _, field := range tt.expectedFields {
+				assert.Contains(t, s.Warnings.NotSupportedFields, field)
+			}
+		})
+	}
+}
+
+func TestComposeRestartPolicyNotSupportedFields(t *testing.T) {
+	manifest := `services:
+  app:
+    image: okteto/vote:1
+    deploy:
+      restart_policy:
+        delay: 5s
+        window: 120s`
+	s, err := ReadStack([]byte(manifest), true)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{
+		"services[app].deploy.restart_policy.delay",
+		"services[app].deploy.restart_policy.window",
+	}, s.Warnings.NotSupportedFields)
+}
+
+func TestSecretsExtensionValidation(t *testing.T) {
+	invalidYAML := `
+secrets:
+  npm_token:
+    file: ./server.cert
+    unknown_field: value
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`
+	_, err := ReadStack([]byte(invalidYAML), true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "secrets[npm_token].unknown_field")
+}
+
+func TestComposeBuildSecretsResolutionErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "undefined secret reference returns error",
+			yaml: `
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - undefined_secret
+`,
+		},
+		{
+			name: "top-level secret with both file and environment returns error",
+			yaml: `
+secrets:
+  npm_token:
+    file: ./server.cert
+    environment: NPM_TOKEN
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+		},
+		{
+			name: "top-level secret with unknown field returns error",
+			yaml: `
+secrets:
+  npm_token:
+    potato: potato
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - npm_token
+`,
+		},
+		{
+			name: "top-level secret with no file or environment returns error",
+			yaml: `
+secrets:
+  bare_secret:
+services:
+  api:
+    build:
+      context: .
+      secrets:
+        - bare_secret
+`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ReadStack([]byte(tt.yaml), true)
+			require.Error(t, err)
+		})
+	}
+}
+
+func Test_IdentityTokenUnmarshalling_Valid(t *testing.T) {
+	tests := []struct {
+		expected *ServiceIdentityToken
+		name     string
+		manifest string
+	}{
+		{
+			name: "audience and absolute mount_path",
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: sts.amazonaws.com
+      mount_path: /var/run/secrets/tokens`,
+			expected: &ServiceIdentityToken{
+				Audience:  "sts.amazonaws.com",
+				MountPath: "/var/run/secrets/tokens",
+			},
+		},
+		{
+			name: "with expiration_seconds 3600",
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: sts.amazonaws.com
+      mount_path: /var/run/secrets/tokens
+      expiration_seconds: 3600`,
+			expected: &ServiceIdentityToken{
+				Audience:          "sts.amazonaws.com",
+				MountPath:         "/var/run/secrets/tokens",
+				ExpirationSeconds: ptr.To(IdentityTokenExpiration(3600)),
+			},
+		},
+		{
+			name: "with expiration_seconds at minimum 600",
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: sts.amazonaws.com
+      mount_path: /var/run/secrets/tokens
+      expiration_seconds: 600`,
+			expected: &ServiceIdentityToken{
+				Audience:          "sts.amazonaws.com",
+				MountPath:         "/var/run/secrets/tokens",
+				ExpirationSeconds: ptr.To(IdentityTokenExpiration(600)),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack([]byte(tt.manifest), true)
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, s.Services["app"].IdentityToken)
+		})
+	}
+}
+
+// Test_IdentityTokenUnmarshalling_ExpandsEnvVars verifies that the x-okteto-identity-token fields go
+// through the manifest-wide environment expansion (ExpandStackEnvs) like any other compose field, so
+// ${VAR} and ${VAR:-default} notations resolve before the directive is parsed.
+func Test_IdentityTokenUnmarshalling_ExpandsEnvVars(t *testing.T) {
+	tests := []struct {
+		expected *ServiceIdentityToken
+		envs     map[string]string
+		name     string
+		manifest string
+	}{
+		{
+			name: "expands audience and mount_path from env vars",
+			envs: map[string]string{
+				"IDENTITY_AUDIENCE":   "sts.amazonaws.com",
+				"IDENTITY_MOUNT_PATH": "/var/run/secrets/tokens/aws",
+			},
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: ${IDENTITY_AUDIENCE}
+      mount_path: ${IDENTITY_MOUNT_PATH}`,
+			expected: &ServiceIdentityToken{
+				Audience:  "sts.amazonaws.com",
+				MountPath: "/var/run/secrets/tokens/aws",
+			},
+		},
+		{
+			name: "uses default when audience env var is unset",
+			envs: map[string]string{},
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: ${IDENTITY_AUDIENCE:-sts.amazonaws.com}
+      mount_path: /var/run/secrets/tokens`,
+			expected: &ServiceIdentityToken{
+				Audience:  "sts.amazonaws.com",
+				MountPath: "/var/run/secrets/tokens",
+			},
+		},
+		{
+			name: "expands expiration_seconds from env var",
+			envs: map[string]string{
+				"IDENTITY_EXPIRATION": "1800",
+			},
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: sts.amazonaws.com
+      mount_path: /var/run/secrets/tokens
+      expiration_seconds: ${IDENTITY_EXPIRATION}`,
+			expected: &ServiceIdentityToken{
+				Audience:          "sts.amazonaws.com",
+				MountPath:         "/var/run/secrets/tokens",
+				ExpirationSeconds: ptr.To(IdentityTokenExpiration(1800)),
+			},
+		},
+		{
+			name: "uses default expiration_seconds when env var is unset",
+			envs: map[string]string{},
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: sts.amazonaws.com
+      mount_path: /var/run/secrets/tokens
+      expiration_seconds: ${IDENTITY_EXPIRATION:-3600}`,
+			expected: &ServiceIdentityToken{
+				Audience:          "sts.amazonaws.com",
+				MountPath:         "/var/run/secrets/tokens",
+				ExpirationSeconds: ptr.To(IdentityTokenExpiration(3600)),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for key, value := range tt.envs {
+				t.Setenv(key, value)
+			}
+			s, err := ReadStack([]byte(tt.manifest), true)
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, s.Services["app"].IdentityToken)
+		})
+	}
+}
+
+func Test_IdentityTokenUnmarshalling_Invalid(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+	}{
+		{
+			name: "missing audience",
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      mount_path: /var/run/secrets/tokens`,
+		},
+		{
+			name: "missing mount_path",
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: sts.amazonaws.com`,
+		},
+		{
+			name: "relative mount_path",
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: sts.amazonaws.com
+      mount_path: var/run/x`,
+		},
+		{
+			name: "expiration_seconds below minimum",
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: sts.amazonaws.com
+      mount_path: /var/run/secrets/tokens
+      expiration_seconds: 300`,
+		},
+		{
+			name: "expiration_seconds non-numeric",
+			manifest: `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: sts.amazonaws.com
+      mount_path: /var/run/secrets/tokens
+      expiration_seconds: not-a-number`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ReadStack([]byte(tt.manifest), true)
+			require.Error(t, err)
+		})
+	}
+}
+
+func Test_IdentityTokenUnmarshalling_NotSet(t *testing.T) {
+	manifest := `services:
+  app:
+    image: okteto/vote:1`
+	s, err := ReadStack([]byte(manifest), true)
+	require.NoError(t, err)
+	require.Nil(t, s.Services["app"].IdentityToken)
+}
+
+// Test_IdentityTokenUnmarshalling_NotRejectedByExtensions is a regression test ensuring that the
+// 'x-okteto-identity-token' service-level directive is captured by the dedicated IdentityToken field
+// and therefore is NOT treated as an unsupported service extension by validateExtensions.
+func Test_IdentityTokenUnmarshalling_NotRejectedByExtensions(t *testing.T) {
+	manifest := `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: sts.amazonaws.com
+      mount_path: /var/run/secrets/tokens`
+	s, err := ReadStack([]byte(manifest), true)
+	require.NoError(t, err)
+	require.NotNil(t, s.Services["app"].IdentityToken)
+	require.Empty(t, s.Warnings.NotSupportedFields)
+}
+
+func Test_IdentityTokenUnmarshalling_PerService(t *testing.T) {
+	manifest := `services:
+  first:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: first.audience
+      mount_path: /var/run/first
+  second:
+    image: okteto/vote:1
+    x-okteto-identity-token:
+      audience: second.audience
+      mount_path: /var/run/second`
+	s, err := ReadStack([]byte(manifest), true)
+	require.NoError(t, err)
+	require.Equal(t, &ServiceIdentityToken{
+		Audience:  "first.audience",
+		MountPath: "/var/run/first",
+	}, s.Services["first"].IdentityToken)
+	require.Equal(t, &ServiceIdentityToken{
+		Audience:  "second.audience",
+		MountPath: "/var/run/second",
+	}, s.Services["second"].IdentityToken)
+}
+
+func Test_validateIdentityToken(t *testing.T) {
+	tests := []struct {
+		token       *ServiceIdentityToken
+		name        string
+		expectedErr bool
+	}{
+		{
+			name: "valid with audience and absolute mount_path",
+			token: &ServiceIdentityToken{
+				Audience:  "sts.amazonaws.com",
+				MountPath: "/var/run/secrets/tokens",
+			},
+			expectedErr: false,
+		},
+		{
+			name: "valid with expiration_seconds at minimum",
+			token: &ServiceIdentityToken{
+				Audience:          "sts.amazonaws.com",
+				MountPath:         "/var/run/secrets/tokens",
+				ExpirationSeconds: ptr.To(IdentityTokenExpiration(600)),
+			},
+			expectedErr: false,
+		},
+		{
+			name: "valid with expiration_seconds above minimum",
+			token: &ServiceIdentityToken{
+				Audience:          "sts.amazonaws.com",
+				MountPath:         "/var/run/secrets/tokens",
+				ExpirationSeconds: ptr.To(IdentityTokenExpiration(3600)),
+			},
+			expectedErr: false,
+		},
+		{
+			name: "missing audience",
+			token: &ServiceIdentityToken{
+				MountPath: "/var/run/secrets/tokens",
+			},
+			expectedErr: true,
+		},
+		{
+			name: "missing mount_path",
+			token: &ServiceIdentityToken{
+				Audience: "sts.amazonaws.com",
+			},
+			expectedErr: true,
+		},
+		{
+			name: "relative mount_path",
+			token: &ServiceIdentityToken{
+				Audience:  "sts.amazonaws.com",
+				MountPath: "var/run/x",
+			},
+			expectedErr: true,
+		},
+		{
+			name: "expiration_seconds below minimum",
+			token: &ServiceIdentityToken{
+				Audience:          "sts.amazonaws.com",
+				MountPath:         "/var/run/secrets/tokens",
+				ExpirationSeconds: ptr.To(IdentityTokenExpiration(300)),
+			},
+			expectedErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateIdentityToken(tt.token)
+			require.Equal(t, tt.expectedErr, err != nil)
+		})
+	}
+}
+
+func Test_ServiceAccountUnmarshalling_NotSet(t *testing.T) {
+	manifest := `services:
+  app:
+    image: okteto/vote:1`
+	s, err := ReadStack([]byte(manifest), true)
+	require.NoError(t, err)
+	require.Empty(t, s.Services["app"].ServiceAccount)
+}
+
+func Test_ServiceAccountUnmarshalling_Valid(t *testing.T) {
+	manifest := `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-service-account: my-service-account
+  worker:
+    image: okteto/vote:1`
+	s, err := ReadStack([]byte(manifest), true)
+	require.NoError(t, err)
+	require.Equal(t, "my-service-account", s.Services["app"].ServiceAccount)
+	require.Empty(t, s.Services["worker"].ServiceAccount)
+	require.Empty(t, s.Warnings.NotSupportedFields)
+}
+
+func Test_ServiceAccountUnmarshalling_ExpandsEnvVars(t *testing.T) {
+	t.Setenv("SA_NAME", "expanded-sa")
+	manifest := `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-service-account: ${SA_NAME}`
+	s, err := ReadStack([]byte(manifest), true)
+	require.NoError(t, err)
+	require.Equal(t, "expanded-sa", s.Services["app"].ServiceAccount)
+}
+
+func Test_ServiceAccountUnmarshalling_Invalid(t *testing.T) {
+	tests := []struct {
+		name           string
+		serviceAccount string
+	}{
+		{name: "uppercase", serviceAccount: "MyServiceAccount"},
+		{name: "underscore", serviceAccount: "my_service_account"},
+		{name: "leading dash", serviceAccount: "-my-sa"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manifest := fmt.Sprintf("services:\n  app:\n    image: okteto/vote:1\n    x-okteto-service-account: %s", tt.serviceAccount)
+			_, err := ReadStack([]byte(manifest), true)
+			require.ErrorContains(t, err, fmt.Sprintf("invalid 'x-okteto-service-account' for service 'app': %q is not a valid ServiceAccount name", tt.serviceAccount))
+		})
+	}
+}
+
+// Test_ServiceAccountUnmarshalling_Empty ensures an empty x-okteto-service-account (e.g. an unset ${SA_NAME}) fails
+// instead of silently falling back to the namespace "default" ServiceAccount.
+func Test_ServiceAccountUnmarshalling_Empty(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "unset env var", value: "${OKTETO_TEST_UNSET_SA_NAME}"},
+		{name: "quoted unset env var", value: `"${OKTETO_TEST_UNSET_SA_NAME}"`},
+		{name: "unset env var with empty default", value: "${OKTETO_TEST_UNSET_SA_NAME:-}"},
+		{name: "empty string", value: `""`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manifest := fmt.Sprintf("services:\n  app:\n    image: okteto/vote:1\n    x-okteto-service-account: %s", tt.value)
+			_, err := ReadStack([]byte(manifest), true)
+			require.ErrorContains(t, err, "invalid 'x-okteto-service-account' for service 'app': value can't be empty")
+		})
+	}
+}
+
+func Test_validateServiceAccount(t *testing.T) {
+	require.NoError(t, validateServiceAccount("my-sa"))
+	require.NoError(t, validateServiceAccount("my.sa"))
+	require.ErrorContains(t, validateServiceAccount(""), "can't be empty")
+	require.ErrorContains(t, validateServiceAccount("My_SA"), `"My_SA" is not a valid ServiceAccount name`)
+}
+
+func Test_expandRangePorts(t *testing.T) {
+	tests := []struct {
+		name     string
+		ports    []PortRaw
+		expected []PortRaw
+	}{
+		{
+			name: "single port",
+			ports: []PortRaw{
+				{ContainerPort: 8080, Protocol: apiv1.ProtocolTCP},
+			},
+			expected: []PortRaw{
+				{ContainerPort: 8080, Protocol: apiv1.ProtocolTCP},
+			},
+		},
+		{
+			name: "port range without host map",
+			ports: []PortRaw{
+				{ContainerFrom: 5000, ContainerTo: 5002, Protocol: apiv1.ProtocolUDP},
+			},
+			expected: []PortRaw{
+				{ContainerPort: 5000, Protocol: apiv1.ProtocolUDP},
+				{ContainerPort: 5001, Protocol: apiv1.ProtocolUDP},
+				{ContainerPort: 5002, Protocol: apiv1.ProtocolUDP},
+			},
+		},
+		{
+			name: "port range with host map",
+			ports: []PortRaw{
+				{ContainerFrom: 5000, ContainerTo: 5002, HostFrom: 6000, HostTo: 6002, Protocol: apiv1.ProtocolUDP},
+			},
+			expected: []PortRaw{
+				{ContainerPort: 5000, Protocol: apiv1.ProtocolUDP},
+				{ContainerPort: 5001, Protocol: apiv1.ProtocolUDP},
+				{ContainerPort: 5002, Protocol: apiv1.ProtocolUDP},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, expandRangePorts(tt.ports))
+		})
+	}
+}
+
+// Test_ServiceAccountUnmarshalling_BareKeyIsOmitted documents that a key with no value is an explicit null, which
+// is treated as if the field were omitted
+func Test_ServiceAccountUnmarshalling_BareKeyIsOmitted(t *testing.T) {
+	manifest := `services:
+  app:
+    image: okteto/vote:1
+    x-okteto-service-account:`
+	s, err := ReadStack([]byte(manifest), true)
+	require.NoError(t, err)
+	require.Empty(t, s.Services["app"].ServiceAccount)
+}
+
+// Test_ServiceAccountUnmarshalling_MergeKeyOverride is a regression test: services that use a YAML merge key and
+// override one of the anchor's keys must keep loading, including when the anchor sets x-okteto-service-account
+func Test_ServiceAccountUnmarshalling_MergeKeyOverride(t *testing.T) {
+	manifest := `x-defaults: &defaults
+  image: okteto/vote:1
+  x-okteto-service-account: base-sa
+services:
+  app:
+    <<: *defaults
+    image: okteto/vote:2
+  worker:
+    <<: *defaults
+    x-okteto-service-account: worker-sa`
+	s, err := ReadStack([]byte(manifest), true)
+	require.NoError(t, err)
+	require.Equal(t, "okteto/vote:2", s.Services["app"].Image)
+	require.Equal(t, "base-sa", s.Services["app"].ServiceAccount)
+	require.Equal(t, "worker-sa", s.Services["worker"].ServiceAccount)
+}
+
+// Test_MergeKeyOverrideWithoutServiceAccount is a regression test for compose files that don't use
+// x-okteto-service-account at all but override a key from a merge key
+func Test_MergeKeyOverrideWithoutServiceAccount(t *testing.T) {
+	manifest := `x-defaults: &defaults
+  image: okteto/vote:1
+services:
+  api:
+    <<: *defaults
+    image: okteto/vote:2`
+	s, err := ReadStack([]byte(manifest), true)
+	require.NoError(t, err)
+	require.Equal(t, "okteto/vote:2", s.Services["api"].Image)
+}
+
+func Test_EndpointRulesFollowSanitizedServiceNames(t *testing.T) {
+	manifest := []byte(`services:
+  web_app:
+    image: nginx
+    ports:
+      - 8080:8080
+  api:
+    image: nginx
+    ports:
+      - 3000:3000
+endpoints:
+  main:
+    - path: /
+      service: web_app
+      port: 8080
+    - path: /api
+      service: api
+      port: 3000
+`)
+
+	s, err := ReadStack(manifest, true)
+	require.NoError(t, err)
+
+	require.Contains(t, s.Services, "web-app")
+	require.Len(t, s.Endpoints["main"].Rules, 2)
+	assert.Equal(t, "web-app", s.Endpoints["main"].Rules[0].Service)
+	assert.Equal(t, "api", s.Endpoints["main"].Rules[1].Service)
+}
+
+func Test_UnmarshalComposeMemoryUnits(t *testing.T) {
+	tests := []struct {
+		name     string
+		memory   string
+		expected int64
+	}{
+		{name: "megabytes-short", memory: "300m", expected: 300 * 1024 * 1024},
+		{name: "megabytes-long", memory: "512mb", expected: 512 * 1024 * 1024},
+		{name: "gigabytes-short", memory: "1g", expected: 1024 * 1024 * 1024},
+		{name: "gigabytes-long", memory: "1gb", expected: 1024 * 1024 * 1024},
+		{name: "kilobytes", memory: "512k", expected: 512 * 1024},
+		{name: "bytes", memory: "2048b", expected: 2048},
+		{name: "uppercase", memory: "1G", expected: 1024 * 1024 * 1024},
+		{name: "fractional", memory: "1.5g", expected: 1536 * 1024 * 1024},
+		{name: "kubernetes-units", memory: "512Mi", expected: 512 * 1024 * 1024},
+		{name: "plain-bytes", memory: "1048576", expected: 1048576},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manifest := []byte("services:\n  app:\n    image: okteto/vote:1\n    mem_limit: " + tt.memory + "\n    mem_reservation: " + tt.memory + "\n")
+			s, err := ReadStack(manifest, true)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, s.Services["app"].Resources.Limits.Memory.Value.Value())
+			assert.Equal(t, tt.expected, s.Services["app"].Resources.Requests.Memory.Value.Value())
+		})
+	}
+}
+
+func Test_UnmarshalComposeDeployResourcesMemoryUnits(t *testing.T) {
+	manifest := []byte("services:\n  app:\n    image: okteto/vote:1\n    deploy:\n      resources:\n        limits:\n          memory: 300m\n        reservations:\n          memory: 1gb\n")
+
+	s, err := ReadStack(manifest, true)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(300*1024*1024), s.Services["app"].Resources.Limits.Memory.Value.Value())
+	assert.Equal(t, int64(1024*1024*1024), s.Services["app"].Resources.Requests.Memory.Value.Value())
+}
+
+func Test_UnmarshalRestartOnFailureWithMaxRetries(t *testing.T) {
+	manifest := []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: on-failure:3")
+
+	s, err := ReadStack(manifest, true)
+
+	require.NoError(t, err)
+	assert.Equal(t, apiv1.RestartPolicyOnFailure, s.Services["app"].RestartPolicy)
+	assert.Equal(t, int32(3), s.Services["app"].BackOffLimit)
+	assert.True(t, s.Services["app"].IsJob())
+}
+
+func Test_UnmarshalRestartIgnoredWhenDeployConditionIsSet(t *testing.T) {
+	for _, restart := range []string{"on-failure:3", "on-failure:abc"} {
+		manifest := []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: \"" + restart + "\"\n    deploy:\n      restart_policy:\n        condition: on-failure")
+
+		s, err := ReadStack(manifest, true)
+
+		require.NoError(t, err, restart)
+		assert.Equal(t, apiv1.RestartPolicyOnFailure, s.Services["app"].RestartPolicy, restart)
+		assert.Equal(t, int32(0), s.Services["app"].BackOffLimit, restart)
+		assert.True(t, s.Services["app"].IsDeployment(), restart)
+	}
+}
+
+func Test_UnmarshalRestartDeployMaxAttemptsOverRestartRetries(t *testing.T) {
+	manifest := []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: on-failure:3\n    deploy:\n      restart_policy:\n        max_attempts: 5")
+
+	s, err := ReadStack(manifest, true)
+
+	require.NoError(t, err)
+	assert.Equal(t, apiv1.RestartPolicyOnFailure, s.Services["app"].RestartPolicy)
+	assert.Equal(t, int32(5), s.Services["app"].BackOffLimit)
+}
+
+func Test_UnmarshalRestartOnFailureWithoutRetriesIsDeployment(t *testing.T) {
+	for _, restart := range []string{"on-failure", "on-failure:0"} {
+		manifest := []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: \"" + restart + "\"")
+
+		s, err := ReadStack(manifest, true)
+
+		require.NoError(t, err, restart)
+		assert.Equal(t, apiv1.RestartPolicyOnFailure, s.Services["app"].RestartPolicy, restart)
+		assert.Equal(t, int32(0), s.Services["app"].BackOffLimit, restart)
+		assert.True(t, s.Services["app"].IsDeployment(), restart)
+	}
+}
+
+func Test_UnmarshalRestartOnFailureInvalidMaxRetries(t *testing.T) {
+	for _, restart := range []string{"on-failure:abc", "on-failure:-1", "on-failure:", "on-failure:2147483648"} {
+		manifest := []byte("services:\n  app:\n    image: okteto/vote:1\n    restart: \"" + restart + "\"")
+
+		_, err := ReadStack(manifest, true)
+
+		assert.ErrorContains(t, err, "invalid restart policy", restart)
 	}
 }

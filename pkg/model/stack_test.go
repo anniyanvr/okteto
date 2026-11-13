@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,12 +14,48 @@
 package model
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/config"
+	"github.com/okteto/okteto/pkg/build"
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/env"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/model/forward"
+	"github.com/okteto/okteto/pkg/model/utils"
+	"github.com/spf13/afero"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/utils/ptr"
+)
+
+const (
+	testEnv = `A=hello
+# comment
+OKTETO_TEST=
+EMPTY_VAR=
+
+B=$B
+
+C=3
+
+D="4
+5 $B
+\"6\"
+'7'"
+E=word -notword`
+	envOverride = "A=1"
 )
 
 func Test_ReadStack(t *testing.T) {
+	t.Setenv("PWD", "hello")
 	manifest := []byte(`name: voting-app
 services:
   vote:
@@ -30,6 +66,7 @@ services:
     environment:
       - OPTION_A=Cats
       - OPTION_B=Dogs
+      - PWD=$PWD
     ports:
       - 80
     replicas: 2
@@ -74,28 +111,33 @@ services:
 	if s.Services["vote"].Build.Context != "vote" {
 		t.Errorf("'vote.build' was not parsed: %+v", s.Services["vote"].Build)
 	}
-	if len(s.Services["vote"].Entrypoint.Values) != 3 {
-		t.Errorf("'vote.entrypoint' was not parsed: %+v", s)
+	if len(s.Services["vote"].Entrypoint.Values) != 2 {
+		t.Errorf("'vote.entrypoint' was not parsed: %+v", s.Services["vote"].Entrypoint.Values)
 	}
-	if s.Services["vote"].Entrypoint.Values[0] != "sh" || s.Services["vote"].Entrypoint.Values[1] != "-c" || s.Services["vote"].Entrypoint.Values[2] != "python app.py" {
-		t.Errorf("'vote.entrypoint' was not parsed: %+v", s)
+	if s.Services["vote"].Entrypoint.Values[0] != "python" && s.Services["vote"].Entrypoint.Values[0] != "app.py" {
+		t.Errorf("'vote.entrypoint' was not parsed: %+v", s.Services["vote"].Entrypoint.Values)
 	}
 	if s.Services["vote"].Replicas != 2 {
 		t.Errorf("'vote.deploy.replicas' was not parsed: %+v", s)
 	}
-	if len(s.Services["vote"].Environment) != 2 {
+	if len(s.Services["vote"].Environment) != 3 {
 		t.Errorf("'vote.env' was not parsed: %+v", s)
 	}
-	if s.Services["vote"].Environment[0].Name != "OPTION_A" || s.Services["vote"].Environment[0].Value != "Cats" {
-		t.Errorf("'vote.env[0]' was not parsed: %+v", s)
-	}
-	if s.Services["vote"].Environment[1].Name != "OPTION_B" || s.Services["vote"].Environment[1].Value != "Dogs" {
-		t.Errorf("'vote.env[1]' was not parsed: %+v", s)
+	for _, env := range s.Services["vote"].Environment {
+		if env.Name == "OPTION_A" && env.Value == "Cats" {
+			continue
+		} else if env.Name == "OPTION_B" && env.Value == "Dogs" {
+			continue
+		} else if env.Name == "PWD" && env.Value == "hello" {
+			continue
+		} else {
+			t.Errorf("'vote.env' was not parsed correctly: %+v", s.Services["vote"].Environment)
+		}
 	}
 	if len(s.Services["vote"].Ports) != 1 {
 		t.Errorf("'vote.ports' was not parsed: %+v", s)
 	}
-	if s.Services["vote"].Ports[0].Port != 80 {
+	if s.Services["vote"].Ports[0].ContainerPort != 80 {
 		t.Errorf("'vote.ports[0]' was not parsed: %+v", s)
 	}
 	if s.Services["vote"].StopGracePeriod != 5 {
@@ -152,11 +194,13 @@ services:
 	}
 	memory = s.Services["db"].Resources.Requests.Memory.Value
 	if memory.Cmp(resource.MustParse("128Mi")) != 0 {
-		t.Errorf("'vote.resources.memory' was not parsed: %+v", s)
+		t.Errorf("'db.resources.memory' was not parsed: %+v", s)
 	}
+	assert.Equal(t, manifest, s.Manifest)
 }
 
 func Test_ReadStackCompose(t *testing.T) {
+	t.Setenv("PWD", "hello")
 	manifest := []byte(`name: voting-app
 services:
   vote:
@@ -167,6 +211,8 @@ services:
     environment:
       - OPTION_A=Cats
       - OPTION_B=Dogs
+      - EMPTY_VAR=
+      - PWD
     ports:
       - 80
     replicas: 2
@@ -175,6 +221,8 @@ services:
       cpu: 100m
       memory: 258Mi
       storage: 1Gi
+    labels:
+      - traefik.routes=Path("/")
   db:
     image: postgres:9.4
     resources:
@@ -186,7 +234,8 @@ services:
     entrypoint: e
     command: c
     volumes:
-      - /var/lib/postgresql/data`)
+      - /var/lib/postgresql/data
+      - $PWD/src`)
 	s, err := ReadStack(manifest, true)
 	if err != nil {
 		t.Fatal(err)
@@ -211,28 +260,33 @@ services:
 	if s.Services["vote"].Build.Context != "vote" {
 		t.Errorf("'vote.build' was not parsed: %+v", s.Services["vote"].Build)
 	}
-	if len(s.Services["vote"].Entrypoint.Values) != 3 {
-		t.Errorf("'vote.entrypoint' was not parsed: %+v", s)
+	if len(s.Services["vote"].Entrypoint.Values) != 2 {
+		t.Errorf("'vote.entrypoint' was not parsed: %+v", s.Services["vote"].Entrypoint.Values)
 	}
-	if s.Services["vote"].Entrypoint.Values[0] != "sh" || s.Services["vote"].Entrypoint.Values[1] != "-c" || s.Services["vote"].Entrypoint.Values[2] != "python app.py" {
-		t.Errorf("'vote.entrypoint' was not parsed: %+v", s)
+	if s.Services["vote"].Entrypoint.Values[0] != "python" && s.Services["vote"].Entrypoint.Values[0] != "app.py" {
+		t.Errorf("'vote.entrypoint' was not parsed: %+v", s.Services["vote"].Entrypoint.Values)
 	}
 	if s.Services["vote"].Replicas != 2 {
 		t.Errorf("'vote.deploy.replicas' was not parsed: %+v", s)
 	}
-	if len(s.Services["vote"].Environment) != 2 {
+	if len(s.Services["vote"].Environment) != 3 {
 		t.Errorf("'vote.env' was not parsed: %+v", s)
 	}
-	if s.Services["vote"].Environment[0].Name != "OPTION_A" || s.Services["vote"].Environment[0].Value != "Cats" {
-		t.Errorf("'vote.env[0]' was not parsed: %+v", s)
-	}
-	if s.Services["vote"].Environment[1].Name != "OPTION_B" || s.Services["vote"].Environment[1].Value != "Dogs" {
-		t.Errorf("'vote.env[1]' was not parsed: %+v", s)
+	for _, env := range s.Services["vote"].Environment {
+		if env.Name == "OPTION_A" && env.Value == "Cats" {
+			continue
+		} else if env.Name == "OPTION_B" && env.Value == "Dogs" {
+			continue
+		} else if env.Name == "PWD" && env.Value == "hello" {
+			continue
+		} else {
+			t.Errorf("'vote.env' was not parsed correctly: %+v", s.Services["vote"].Environment)
+		}
 	}
 	if len(s.Services["vote"].Ports) != 1 {
 		t.Errorf("'vote.ports' was not parsed: %+v", s)
 	}
-	if s.Services["vote"].Ports[0].Port != 80 {
+	if s.Services["vote"].Ports[0].ContainerPort != 80 {
 		t.Errorf("'vote.ports[0]' was not parsed: %+v", s)
 	}
 	if s.Services["vote"].StopGracePeriod != 5 {
@@ -251,6 +305,16 @@ services:
 	storage := s.Services["vote"].Resources.Requests.Storage.Size.Value
 	if storage.Cmp(resource.MustParse("1Gi")) != 0 {
 		t.Errorf("'vote.resources.storage' was not parsed: %+v", s)
+	}
+	for key, value := range s.Services["vote"].Annotations {
+		if key == "traefik.routes" && value == `Path("/")` {
+			continue
+		}
+		t.Errorf("'vote.annotations' was not parsed correctly: %+v", s.Services["vote"].Annotations)
+	}
+
+	if len(s.Services["vote"].Labels) > 0 {
+		t.Errorf("'vote.labels' has labels inside")
 	}
 	if _, ok := s.Services["db"]; !ok {
 		t.Errorf("'db' was not parsed: %+v", s)
@@ -274,11 +338,14 @@ services:
 		t.Errorf("'db.command' was not parsed: %+v", s.Services["db"].Command.Values)
 	}
 
-	if len(s.Services["db"].Volumes) != 1 {
+	if len(s.Services["db"].Volumes) != 2 {
 		t.Errorf("'db.volumes' was not parsed: %+v", s)
 	}
 	if s.Services["db"].Volumes[0].RemotePath != "/var/lib/postgresql/data" {
 		t.Errorf("'db.volumes[0]' was not parsed: %+v", s)
+	}
+	if s.Services["db"].Volumes[1].RemotePath != "hello/src" {
+		t.Errorf("'db.volumes[1]' was not parsed: %+v", s)
 	}
 	storage = s.Services["db"].Resources.Requests.Storage.Size.Value
 	if storage.Cmp(resource.MustParse("1Gi")) != 0 {
@@ -289,14 +356,51 @@ services:
 	}
 	memory = s.Services["db"].Resources.Requests.Memory.Value
 	if memory.Cmp(resource.MustParse("128Mi")) != 0 {
-		t.Errorf("'vote.resources.memory' was not parsed: %+v", s)
+		t.Errorf("'db.resources.memory' was not parsed: %+v", s)
 	}
+	assert.Equal(t, string(manifest), string(s.Manifest))
+}
+
+func Test_ReadStackComposeInterpolatedTypes(t *testing.T) {
+	t.Setenv("REPLICAS", "3")
+	t.Setenv("PUBLIC", "true")
+	t.Setenv("SCALE", "2")
+	t.Setenv("VERSION", "1.10")
+	t.Setenv("ZIP", "0123")
+	t.Setenv("ANSWER", "yes")
+	manifest := []byte(`services:
+  app:
+    image: okteto/vote:1
+    public: ${PUBLIC}
+    deploy:
+      replicas: ${REPLICAS}
+    environment:
+      VERSION: ${VERSION}
+      ZIP: ${ZIP}
+      ANSWER: ${ANSWER}
+      QUOTED: "${REPLICAS}"
+  worker:
+    image: okteto/vote:1
+    scale: ${SCALE}`)
+	s, err := ReadStack(manifest, true)
+	require.NoError(t, err)
+
+	app := s.Services["app"]
+	assert.Equal(t, int32(3), app.Replicas)
+	assert.True(t, app.Public)
+	assert.Equal(t, env.Environment{
+		{Name: "ANSWER", Value: "yes"},
+		{Name: "QUOTED", Value: "3"},
+		{Name: "VERSION", Value: "1.10"},
+		{Name: "ZIP", Value: "0123"},
+	}, app.Environment)
+	assert.Equal(t, int32(2), s.Services["worker"].Replicas)
 }
 
 func TestStack_validate(t *testing.T) {
 	tests := []struct {
-		name  string
 		stack *Stack
+		name  string
 	}{
 		{
 			name:  "empty-name",
@@ -347,7 +451,7 @@ func TestStack_validate(t *testing.T) {
 				Name: "name",
 				Services: map[string]*Service{
 					"name": {
-						Volumes: []StackVolume{{RemotePath: "relative"}},
+						Volumes: []build.VolumeMounts{{RemotePath: "relative"}},
 					},
 				},
 			},
@@ -358,24 +462,8 @@ func TestStack_validate(t *testing.T) {
 				Name: "name",
 				Services: map[string]*Service{
 					"name": {
-						Volumes: []StackVolume{{LocalPath: "/source", RemotePath: "/dest"}},
+						Volumes: []build.VolumeMounts{{LocalPath: "/source", RemotePath: "/dest"}},
 					},
-				},
-			},
-		},
-		{
-			name: "endpoint-of-undefined-service",
-			stack: &Stack{
-				Name: "name",
-				Endpoints: map[string]Endpoint{
-					"endpoint1": {
-						Rules: []EndpointRule{
-							{Service: "app"},
-						},
-					},
-				},
-				Services: map[string]*Service{
-					"name": {},
 				},
 			},
 		},
@@ -392,10 +480,10 @@ func TestStack_validate(t *testing.T) {
 					},
 				},
 				Services: map[string]*Service{
-					"name": {Image: "test",
+					"app": {Image: "test",
 						Ports: []Port{
 							{
-								Port: 8080,
+								ContainerPort: 8080,
 							},
 						}},
 				},
@@ -404,8 +492,8 @@ func TestStack_validate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.stack.validate(); err == nil {
-				t.Errorf("Stack.validate() not failed for test '%s'", tt.name)
+			if err := tt.stack.Validate(); err == nil {
+				t.Errorf("Stack.validate() did not fail for test '%s'", tt.name)
 			}
 		})
 	}
@@ -427,8 +515,1332 @@ func Test_validateStackName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := validateStackName(tt.stackName); (err != nil) != tt.wantErr {
-				t.Errorf("Stack.validate() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("validateStackName() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
+}
+
+func TestStack_readImageContext(t *testing.T) {
+	tests := []struct {
+		expected *build.Info
+		name     string
+		manifest []byte
+	}{
+		{
+			name: "context pointing to url",
+			manifest: []byte(`services:
+  test:
+    build:
+      context: https://github.com/okteto/okteto.git
+`),
+			expected: &build.Info{
+				Context: "https://github.com/okteto/okteto.git",
+			},
+		},
+		{
+			name: "context pointing to path",
+			manifest: []byte(`services:
+  test:
+    build:
+      context: .
+`),
+			expected: &build.Info{
+				Context:    ".",
+				Dockerfile: "Dockerfile",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stack, err := ReadStack(tt.manifest, true)
+			if err != nil {
+				t.Fatalf("Wrong unmarshalling: %s", err.Error())
+			}
+
+			assert.Equal(t, tt.expected, stack.Services["test"].Build)
+		})
+	}
+}
+
+func TestStack_Merge(t *testing.T) {
+	tests := []struct {
+		stack      *Stack
+		otherStack *Stack
+		result     *Stack
+		name       string
+	}{
+		{
+			name: "Namespace overwrite",
+			stack: &Stack{
+				Namespace: "test",
+			},
+			otherStack: &Stack{
+				Namespace: "overwrite",
+			},
+			result: &Stack{
+				Namespace: "overwrite",
+			},
+		},
+		{
+			name: "volumes overwrite",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Volumes: []build.VolumeMounts{
+							{
+								LocalPath:  "/app",
+								RemotePath: "/app",
+							},
+						},
+						VolumeMounts: []build.VolumeMounts{
+							{
+								LocalPath:  "/data",
+								RemotePath: "/data",
+							},
+						},
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Volumes: []build.VolumeMounts{
+							{
+								LocalPath:  "/app-test",
+								RemotePath: "/app-test",
+							},
+						},
+						VolumeMounts: []build.VolumeMounts{
+							{
+								LocalPath:  "/data-test",
+								RemotePath: "/data",
+							},
+						},
+					},
+				},
+			},
+			result: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Volumes: []build.VolumeMounts{
+							{
+								LocalPath:  "/app-test",
+								RemotePath: "/app-test",
+							},
+						},
+						VolumeMounts: []build.VolumeMounts{
+							{
+								LocalPath:  "/data-test",
+								RemotePath: "/data",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Restart policy test",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:         "okteto",
+						RestartPolicy: corev1.RestartPolicyNever,
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:         "",
+						RestartPolicy: corev1.RestartPolicyAlways,
+					},
+				},
+			},
+			result: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:         "okteto",
+						RestartPolicy: corev1.RestartPolicyNever,
+					},
+				},
+			},
+		},
+		{
+			name: "Overwrite primitive field",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:           "okteto",
+						Workdir:         "",
+						Replicas:        2,
+						StopGracePeriod: 10,
+						BackOffLimit:    5,
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:           "okteto-dev",
+						Workdir:         "/app",
+						Replicas:        3,
+						StopGracePeriod: 20,
+						BackOffLimit:    3,
+					},
+				},
+			},
+			result: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:           "okteto-dev",
+						Workdir:         "/app",
+						Replicas:        3,
+						StopGracePeriod: 20,
+						BackOffLimit:    3,
+					},
+				},
+			},
+		},
+		{
+			name: "Overwrite non primitive",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Build: &build.Info{
+							Context:    "test",
+							Dockerfile: "test-Dockerfile",
+						},
+						Healtcheck: &HealthCheck{
+							HTTP: &HTTPHealtcheck{
+								Path: "/api",
+								Port: 8008,
+							},
+						},
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Build: &build.Info{
+							Context:    "test-overwrite",
+							Dockerfile: "test-overwrite-Dockerfile",
+						},
+						Healtcheck: &HealthCheck{
+							HTTP: &HTTPHealtcheck{
+								Path: "/",
+								Port: 8008,
+							},
+						},
+					},
+				},
+			},
+			result: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Build: &build.Info{
+							Context:    "test-overwrite",
+							Dockerfile: "test-overwrite-Dockerfile",
+						},
+						Healtcheck: &HealthCheck{
+							HTTP: &HTTPHealtcheck{
+								Path: "/",
+								Port: 8008,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Overwrite list field",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						CapAdd:  []corev1.Capability{"tpu"},
+						CapDrop: []corev1.Capability{"cpu"},
+						Entrypoint: Entrypoint{
+							Values: []string{"python"},
+						},
+						Command: Command{
+							Values: []string{"app.py"},
+						},
+						EnvFiles: env.Files{".env"},
+						Environment: env.Environment{
+							env.Var{
+								Name:  "test",
+								Value: "ok",
+							},
+						},
+						Labels:       Labels{"test": "ok"},
+						Annotations:  Annotations{"test": "ok"},
+						NodeSelector: Selector{"test": "ok"},
+						Ports: []Port{
+							{
+								HostPort:      8080,
+								ContainerPort: 8080,
+							},
+						},
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						CapAdd:  []corev1.Capability{"cpu"},
+						CapDrop: []corev1.Capability{"tpu"},
+						Entrypoint: Entrypoint{
+							Values: []string{"go"},
+						},
+						Command: Command{
+							Values: []string{"run", "main.go"},
+						},
+						EnvFiles: env.Files{".env-test"},
+						Environment: env.Environment{
+							env.Var{
+								Name:  "test",
+								Value: "overwrite",
+							},
+						},
+						Labels:       Labels{"test": "overwrite"},
+						Annotations:  Annotations{"test": "overwrite"},
+						NodeSelector: Selector{"test": "overwrite"},
+						Ports: []Port{
+							{
+								HostPort:      3000,
+								ContainerPort: 3000,
+							},
+						},
+					},
+				},
+			},
+			result: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						CapAdd:  []corev1.Capability{"cpu"},
+						CapDrop: []corev1.Capability{"tpu"},
+						Entrypoint: Entrypoint{
+							Values: []string{"go"},
+						},
+						Command: Command{
+							Values: []string{"run", "main.go"},
+						},
+						EnvFiles: env.Files{".env-test"},
+						Environment: env.Environment{
+							env.Var{
+								Name:  "test",
+								Value: "overwrite",
+							},
+						},
+						Labels:       Labels{"test": "overwrite"},
+						Annotations:  Annotations{"test": "overwrite"},
+						NodeSelector: Selector{"test": "overwrite"},
+						Ports: []Port{
+							{
+								HostPort:      3000,
+								ContainerPort: 3000,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.stack.Merge(tt.otherStack)
+			if !reflect.DeepEqual(result, tt.result) {
+				t.Fatalf("Expected %v but got %v", tt.result, result)
+			}
+		})
+	}
+}
+
+func TestStack_MergeKeepsBaseVolumesAndEndpoints(t *testing.T) {
+	base := &Stack{
+		Volumes: map[string]*VolumeSpec{
+			"db-data":    {Size: Quantity{Value: resource.MustParse("1Gi")}},
+			"cache-data": {Size: Quantity{Value: resource.MustParse("1Gi")}},
+		},
+		Endpoints: EndpointSpec{
+			"api": {Rules: []EndpointRule{{Path: "/api", Service: "api", Port: 8080}}},
+		},
+		Services: map[string]*Service{},
+	}
+	override := &Stack{
+		Volumes: map[string]*VolumeSpec{
+			"cache-data": {Size: Quantity{Value: resource.MustParse("5Gi")}},
+			"logs":       {Size: Quantity{Value: resource.MustParse("2Gi")}},
+		},
+		Endpoints: EndpointSpec{
+			"web": {Rules: []EndpointRule{{Path: "/", Service: "web", Port: 80}}},
+		},
+		Services: map[string]*Service{},
+	}
+
+	result := base.Merge(override)
+
+	expectedVolumes := map[string]*VolumeSpec{
+		"db-data":    {Size: Quantity{Value: resource.MustParse("1Gi")}},
+		"cache-data": {Size: Quantity{Value: resource.MustParse("5Gi")}},
+		"logs":       {Size: Quantity{Value: resource.MustParse("2Gi")}},
+	}
+	expectedEndpoints := EndpointSpec{
+		"api": {Rules: []EndpointRule{{Path: "/api", Service: "api", Port: 8080}}},
+		"web": {Rules: []EndpointRule{{Path: "/", Service: "web", Port: 80}}},
+	}
+	assert.Equal(t, expectedVolumes, result.Volumes)
+	assert.Equal(t, expectedEndpoints, result.Endpoints)
+}
+
+func TestStack_MergeIdentityToken(t *testing.T) {
+	overrideExpiration := IdentityTokenExpiration(3600)
+	tests := []struct {
+		stack      *Stack
+		otherStack *Stack
+		expected   *ServiceIdentityToken
+		name       string
+	}{
+		{
+			name: "override sets identity token when base has none",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image: "okteto",
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						IdentityToken: &ServiceIdentityToken{
+							Audience:  "sts.amazonaws.com",
+							MountPath: "/var/run/secrets/tokens",
+						},
+					},
+				},
+			},
+			expected: &ServiceIdentityToken{
+				Audience:  "sts.amazonaws.com",
+				MountPath: "/var/run/secrets/tokens",
+			},
+		},
+		{
+			name: "override replaces existing identity token",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image: "okteto",
+						IdentityToken: &ServiceIdentityToken{
+							Audience:  "base.audience",
+							MountPath: "/var/run/base",
+						},
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						IdentityToken: &ServiceIdentityToken{
+							Audience:          "override.audience",
+							MountPath:         "/var/run/override",
+							ExpirationSeconds: &overrideExpiration,
+						},
+					},
+				},
+			},
+			expected: &ServiceIdentityToken{
+				Audience:          "override.audience",
+				MountPath:         "/var/run/override",
+				ExpirationSeconds: &overrideExpiration,
+			},
+		},
+		{
+			name: "override without identity token keeps base value",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image: "okteto",
+						IdentityToken: &ServiceIdentityToken{
+							Audience:  "base.audience",
+							MountPath: "/var/run/base",
+						},
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image: "okteto-dev",
+					},
+				},
+			},
+			expected: &ServiceIdentityToken{
+				Audience:  "base.audience",
+				MountPath: "/var/run/base",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.stack.Merge(tt.otherStack)
+			require.Equal(t, tt.expected, result.Services["app"].IdentityToken)
+		})
+	}
+}
+
+func TestStack_MergeEnableServiceLinks(t *testing.T) {
+	tests := []struct {
+		stack      *Stack
+		otherStack *Stack
+		expected   *bool
+		name       string
+	}{
+		{
+			name: "override sets enable service links when base has none",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image: "okteto",
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						EnableServiceLinks: ptr.To(false),
+					},
+				},
+			},
+			expected: ptr.To(false),
+		},
+		{
+			name: "override replaces existing enable service links",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:              "okteto",
+						EnableServiceLinks: ptr.To(true),
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						EnableServiceLinks: ptr.To(false),
+					},
+				},
+			},
+			expected: ptr.To(false),
+		},
+		{
+			name: "override without enable service links keeps base value",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:              "okteto",
+						EnableServiceLinks: ptr.To(false),
+					},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image: "okteto-dev",
+					},
+				},
+			},
+			expected: ptr.To(false),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.stack.Merge(tt.otherStack)
+			require.Equal(t, tt.expected, result.Services["app"].EnableServiceLinks)
+		})
+	}
+}
+
+func TestStack_MergeServiceAccount(t *testing.T) {
+	tests := []struct {
+		stack      *Stack
+		otherStack *Stack
+		name       string
+		expected   string
+	}{
+		{
+			name: "override sets service account when base has none",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto"},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {ServiceAccount: "override-sa"},
+				},
+			},
+			expected: "override-sa",
+		},
+		{
+			name: "override replaces existing service account",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto", ServiceAccount: "base-sa"},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {ServiceAccount: "override-sa"},
+				},
+			},
+			expected: "override-sa",
+		},
+		{
+			name: "override without service account keeps base value",
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto", ServiceAccount: "base-sa"},
+				},
+			},
+			otherStack: &Stack{
+				Services: map[string]*Service{
+					"app": {Image: "okteto-dev"},
+				},
+			},
+			expected: "base-sa",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.stack.Merge(tt.otherStack)
+			require.Equal(t, tt.expected, result.Services["app"].ServiceAccount)
+		})
+	}
+}
+
+func TestStack_ResourcesIsDefault(t *testing.T) {
+	tests := []struct {
+		resources *StackResources
+		name      string
+		expected  bool
+	}{
+		{
+			name:      "nil",
+			resources: nil,
+			expected:  true,
+		},
+		{
+			name:      "resources zero",
+			resources: &StackResources{},
+			expected:  true,
+		},
+		{
+			name: "resources limits not zero",
+			resources: &StackResources{
+				Limits: ServiceResources{
+					CPU: Quantity{resource.MustParse("1")},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "resources requests not zero",
+			resources: &StackResources{
+				Requests: ServiceResources{
+					CPU: Quantity{resource.MustParse("1")},
+				},
+			},
+			expected: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.resources.IsDefaultValue() && !tt.expected {
+				t.Fatal("Expected false but got true")
+			} else if !tt.resources.IsDefaultValue() && tt.expected {
+				t.Fatal("Expected true but got false")
+			}
+		})
+	}
+}
+
+func TestStack_ExpandEnvsAtFileLevel(t *testing.T) {
+	tests := []struct {
+		envs     map[string]string
+		stack    *Stack
+		name     string
+		manifest []byte
+	}{
+		{
+			name: "not expanding anything",
+			manifest: []byte(`services:
+  app:
+    image: alpine`),
+			envs: map[string]string{},
+			stack: &Stack{
+				Name: "test",
+				Services: map[string]*Service{
+					"app": {
+						Image:         "alpine",
+						RestartPolicy: "Always",
+						Replicas:      1,
+					},
+				},
+			},
+		},
+		{
+			name: "expand image with default",
+			manifest: []byte(`services:
+  app:
+    image: ${IMAGE:-alpine}`),
+			envs: map[string]string{},
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:         "alpine",
+						RestartPolicy: "Always",
+						Replicas:      1,
+					},
+				},
+			},
+		},
+		{
+			name: "override env image",
+			manifest: []byte(`services:
+  app:
+    image: ${IMAGE:-alpine}`),
+			envs: map[string]string{
+				"IMAGE": "test",
+			},
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:         "test",
+						RestartPolicy: "Always",
+						Replicas:      1,
+					},
+				},
+			},
+		},
+		{
+			name: "expand image and ports",
+			manifest: []byte(`services:
+  app:
+    image: ${IMAGE:-alpine}
+    ports:
+    - 8080:${CONTAINER_PORT}`),
+			envs: map[string]string{
+				"IMAGE":          "test",
+				"CONTAINER_PORT": "8080",
+			},
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:         "test",
+						RestartPolicy: "Always",
+						Replicas:      1,
+						Ports: []Port{
+							{
+								HostPort:      8080,
+								ContainerPort: 8080,
+								Protocol:      corev1.ProtocolTCP,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "expand image and environment",
+			manifest: []byte(`services:
+  app:
+    image: ${IMAGE:-alpine}
+    environment:
+    - TEST`),
+			envs: map[string]string{
+				"IMAGE": "test",
+				"TEST":  "hello",
+			},
+			stack: &Stack{
+				Services: map[string]*Service{
+					"app": {
+						Image:         "test",
+						RestartPolicy: "Always",
+						Replicas:      1,
+						Environment: env.Environment{
+							{
+								Name:  "TEST",
+								Value: "hello",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpFile, err := os.CreateTemp("", "stack.yml")
+			if err != nil {
+				t.Fatalf("failed to create dynamic manifest file: %s", err.Error())
+			}
+			if err := os.WriteFile(tmpFile.Name(), tt.manifest, 0600); err != nil {
+				t.Fatalf("failed to write manifest file: %s", err.Error())
+			}
+			defer os.RemoveAll(tmpFile.Name())
+
+			for key, value := range tt.envs {
+				t.Setenv(key, value)
+			}
+
+			stack, err := GetStackFromPath("test", tmpFile.Name(), false, afero.NewMemMapFs())
+			if err != nil {
+				t.Fatalf("Error detected: %s", err.Error())
+			}
+			stack.Services["app"].Resources = nil
+			if !reflect.DeepEqual(stack.Services["app"].Resources, tt.stack.Services["app"].Resources) {
+				t.Fatalf("Got:\n %+v\n expected:\n %+v", stack.Services["app"], tt.stack.Services["app"])
+			}
+		})
+	}
+}
+
+func Test_validateDependsOn(t *testing.T) {
+	tests := []struct {
+		dependsOn  DependsOn
+		name       string
+		manifest   []byte
+		throwError bool
+	}{
+		{
+			name:       "defined dependent service",
+			manifest:   []byte("services:\n  app:\n    image: okteto/vote:1\n    depends_on:\n      - test\n  test:\n    image: okteto/vote:1"),
+			throwError: false,
+			dependsOn: DependsOn{
+				"test": DependsOnConditionSpec{Condition: DependsOnServiceRunning},
+			},
+		},
+		{
+			name:       "defined dependent service needs to be sanitized",
+			manifest:   []byte("services:\n  app:\n    image: okteto/vote:1\n    depends_on:\n      - test_db\n  test_db:\n    image: okteto/vote:1"),
+			throwError: false,
+			dependsOn: DependsOn{
+				"test-db": DependsOnConditionSpec{Condition: DependsOnServiceRunning},
+			},
+		},
+		{
+			name:       "defined dependent service started",
+			manifest:   []byte("services:\n  app:\n    image: okteto/vote:1\n    depends_on:\n      test:\n        condition: service_started\n  test:\n    image: okteto/vote:1"),
+			throwError: false,
+			dependsOn: DependsOn{
+				"test": DependsOnConditionSpec{Condition: DependsOnServiceRunning},
+			},
+		},
+		{
+			name:       "defined dependent service healthy",
+			manifest:   []byte("services:\n  app:\n    image: okteto/vote:1\n    depends_on:\n      test:\n        condition: service_healthy\n  test:\n    image: okteto/vote:1"),
+			throwError: false,
+			dependsOn: DependsOn{
+				"test": DependsOnConditionSpec{Condition: DependsOnServiceHealthy},
+			},
+		},
+		{
+			name:       "defined dependent service completed",
+			manifest:   []byte("services:\n  app:\n    image: okteto/vote:1\n    depends_on:\n      test:\n        condition: service_completed_successfully\n  test:\n    image: okteto/vote:1\n    restart: never"),
+			throwError: false,
+			dependsOn: DependsOn{
+				"test": DependsOnConditionSpec{Condition: DependsOnServiceCompleted},
+			},
+		},
+		{
+			name:       "not defined dependent service",
+			manifest:   []byte("services:\n  app:\n    image: okteto/vote:1\n    depends_on:\n      - ads"),
+			throwError: true,
+		},
+		{
+			name:       "self dependent service",
+			manifest:   []byte("services:\n  app:\n    image: okteto/vote:1\n    depends_on:\n      - app"),
+			throwError: true,
+		},
+		{
+			name:       "circular dependency",
+			manifest:   []byte("services:\n  app:\n    image: okteto/vote:1\n    depends_on:\n      - test\n  test:\n    image: okteto/vote:1\n    depends_on:\n      - app"),
+			throwError: true,
+		},
+		{
+			name:       "circular dependency difficult",
+			manifest:   []byte("services:\n  app:\n    image: okteto/vote:1\n    depends_on:\n      - test\n  test:\n    image: okteto/vote:1\n    depends_on:\n      - test2\n  test1:\n    image: okteto/vote:1\n    depends_on:\n      - test2\n  test2:\n    image: okteto/vote:1\n    depends_on:\n      - app"),
+			throwError: true,
+		},
+		{
+			name:       "circular dependency not first",
+			manifest:   []byte("services:\n  test:\n    image: okteto/vote:1\n    depends_on:\n      - test2\n  app:\n    image: okteto/vote:1\n    depends_on:\n      - test\n  test1:\n    image: okteto/vote:1\n    depends_on:\n      - test2\n  test2:\n    image: okteto/vote:1\n    depends_on:\n      - app"),
+			throwError: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := ReadStack(tt.manifest, false)
+			if err != nil {
+				t.Fatal("Could not read stack")
+			}
+			s.Name = "test"
+			err = s.Validate()
+			if err == nil && tt.throwError {
+				t.Fatal("Expected error but not thrown")
+			}
+			if err != nil && !tt.throwError {
+				t.Fatal(err)
+			}
+			if err == nil && !tt.throwError {
+				if !reflect.DeepEqual(s.Services["app"].DependsOn, tt.dependsOn) {
+					t.Fatalf("Expected %v but got %v", tt.dependsOn, s.Services["app"].DependsOn)
+				}
+			}
+		})
+	}
+}
+
+func Test_getStackName(t *testing.T) {
+	tests := []struct {
+		testName        string
+		name            string
+		stackPath       string
+		actualStackName string
+		nameEnv         string
+		expected        string
+		expectedErr     bool
+	}{
+		{
+			testName: "name is not empty",
+			name:     "stack1",
+			expected: "stack1",
+		},
+		{
+			testName:        "actualStackName is not empty",
+			actualStackName: "stack2",
+			expected:        "stack2",
+		},
+		{
+			testName: "name and actualName and stackPath are empty - name env var not empty",
+			nameEnv:  "stack3",
+			expected: "stack3",
+		},
+		{
+			testName:  "name and actualName are empty - name env var and stackPath not empty",
+			nameEnv:   "stack3",
+			stackPath: "path/to/stack4/compose.yaml",
+			expected:  "stack3",
+		},
+		{
+			testName:  "name and actualName are empty - infer from folder",
+			stackPath: "path/to/stack4/compose.yaml",
+			expected:  "stack4",
+		},
+		{
+			testName:        "(name and actualStackName) are not empty",
+			name:            "stack1",
+			actualStackName: "stack2",
+			expected:        "stack1",
+		},
+		{
+			testName:        "name is empty and (nameEnv and actualStackName) are not empty",
+			actualStackName: "stack1",
+			nameEnv:         "stack2",
+			expected:        "stack1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.testName, func(t *testing.T) {
+			dir := t.TempDir()
+			stackPath := filepath.Join(dir, tt.stackPath)
+			t.Setenv(constants.OktetoNameEnvVar, tt.nameEnv)
+			res, err := getStackName(tt.name, stackPath, tt.actualStackName)
+			resEnv := os.Getenv(constants.OktetoNameEnvVar)
+
+			if err == nil && tt.expectedErr {
+				t.Fatal("expected error but not thrown")
+			}
+			if err != nil && !tt.expectedErr {
+				t.Fatal(err)
+			}
+			if res != tt.expected {
+				t.Fatalf("expected %s, got %s", tt.expected, res)
+			}
+			if resEnv != tt.expected {
+				t.Fatalf("expected env OKTETO_NAME %s, got %s", tt.expected, resEnv)
+			}
+		})
+
+	}
+}
+
+func Test_getStackNameWithinRepository(t *testing.T) {
+	// As getStackName internally does os.Setenv, when all the tests run at the same time,
+	// it might happen that the env var with the name is set. That env var has priority over
+	// the repository calculation. In order to avoid this, we need to unset the env var before running the test
+	t.Setenv(constants.OktetoNameEnvVar, "")
+	repository := "https://github.com/okteto/compose-repository-test.git"
+	dir := t.TempDir()
+	path := "path/to/stack4/compose.yaml"
+	stackPath := filepath.Join(dir, path)
+
+	r, err := git.PlainInit(dir, false)
+	require.NoError(t, err)
+
+	_, err = r.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{repository}})
+	require.NoError(t, err)
+
+	res, err := getStackName("", stackPath, "")
+	resEnv := os.Getenv(constants.OktetoNameEnvVar)
+
+	require.NoError(t, err)
+	require.Equal(t, "compose-repository-test", res)
+	require.Equal(t, "compose-repository-test", resEnv)
+}
+
+func Test_translateEnvVars(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", ".env")
+	if err != nil {
+		t.Fatalf("failed to create dynamic env file: %s", err.Error())
+	}
+	if err := os.WriteFile(tmpFile.Name(), []byte(testEnv), 0600); err != nil {
+		t.Fatalf("failed to write env file: %s", err.Error())
+	}
+	defer os.RemoveAll(tmpFile.Name())
+
+	tmpFile2, err := os.CreateTemp("", ".env")
+	if err != nil {
+		t.Fatalf("failed to create dynamic env file: %s", err.Error())
+	}
+	if err := os.WriteFile(tmpFile2.Name(), []byte(envOverride), 0600); err != nil {
+		t.Fatalf("failed to write env file: %s", err.Error())
+	}
+	defer os.RemoveAll(tmpFile2.Name())
+
+	t.Setenv("B", "2")
+	t.Setenv("ENV_PATH", tmpFile.Name())
+	t.Setenv("ENV_PATH2", tmpFile2.Name())
+	t.Setenv("OKTETO_TEST", "myvalue")
+	stack := &Stack{
+		Name: "name",
+		Services: map[string]*Service{
+			"1": {
+				Image:    "image",
+				EnvFiles: []string{"${ENV_PATH}", "${ENV_PATH2}"},
+				Environment: []env.Var{
+					{
+						Name:  "C",
+						Value: "original",
+					},
+				},
+			},
+		},
+	}
+	if err := loadEnvFiles(stack.Services["1"], "1"); err != nil {
+		t.Fatal("error should not be returned")
+	}
+	if stack.Services["1"].Image != "image" {
+		t.Errorf("Wrong image: %s", stack.Services["1"].Image)
+	}
+	if len(stack.Services["1"].Environment) != 7 {
+		t.Errorf("Wrong environment: %v", stack.Services["1"].Environment)
+	}
+	for _, e := range stack.Services["1"].Environment {
+		if e.Name == "A" && e.Value != "1" {
+			t.Errorf("Wrong environment variable A: %s", e.Value)
+		}
+		if e.Name == "B" && e.Value != "2" {
+			t.Errorf("Wrong environment variable B: %s", e.Value)
+		}
+		if e.Name == "C" && e.Value != "original" {
+			t.Errorf("Wrong environment variable C: %s", e.Value)
+		}
+		if e.Name == "D" && e.Value != "4\n5 2\n\"6\"\n'7'" {
+			t.Errorf("Wrong environment variable D: %s", e.Value)
+		}
+		if e.Name == "E" && e.Value != "word -notword" {
+			t.Errorf("Wrong environment variable E: %s", e.Value)
+		}
+		if e.Name == "OKTETO_TEST" && e.Value != "myvalue" {
+			t.Errorf("Wrong environment variable OKTETO_TEST: %s", e.Value)
+		}
+		if e.Name == "EMPTY_VAR" && e.Value != "" {
+			t.Errorf("Wrong environment variable EMPTY_VAR: %s", e.Value)
+		}
+	}
+}
+
+func TestServicesToGraph(t *testing.T) {
+	tests := []struct {
+		services      ComposeServices
+		expectedGraph utils.Graph
+		name          string
+	}{
+		{
+			name: "no cycle - no connections",
+			services: ComposeServices{
+				"a": &Service{},
+				"b": &Service{},
+				"c": &Service{},
+			},
+			expectedGraph: utils.Graph{
+				"a": []string{},
+				"b": []string{},
+				"c": []string{},
+			},
+		},
+		{
+			name: "no cycle - connections",
+			services: ComposeServices{
+				"a": &Service{
+					DependsOn: DependsOn{
+						"b": DependsOnConditionSpec{},
+					},
+				},
+				"b": &Service{
+					DependsOn: DependsOn{
+						"c": DependsOnConditionSpec{},
+					},
+				},
+				"c": &Service{},
+			},
+			expectedGraph: utils.Graph{
+				"a": []string{"b"},
+				"b": []string{"c"},
+				"c": []string{},
+			},
+		},
+		{
+			name: "cycle - direct cycle",
+			services: ComposeServices{
+				"a": &Service{
+					DependsOn: DependsOn{
+						"b": DependsOnConditionSpec{},
+					},
+				},
+				"b": &Service{
+					DependsOn: DependsOn{
+						"a": DependsOnConditionSpec{},
+					},
+				},
+				"c": &Service{},
+			},
+			expectedGraph: utils.Graph{
+				"a": []string{"b"},
+				"b": []string{"a"},
+				"c": []string{},
+			},
+		},
+		{
+			name: "cycle - indirect cycle",
+			services: ComposeServices{
+				"a": &Service{
+					DependsOn: DependsOn{
+						"b": DependsOnConditionSpec{},
+					},
+				},
+				"b": &Service{
+					DependsOn: DependsOn{
+						"c": DependsOnConditionSpec{},
+					},
+				},
+				"c": &Service{
+					DependsOn: DependsOn{
+						"a": DependsOnConditionSpec{},
+					},
+				},
+			},
+			expectedGraph: utils.Graph{
+				"a": []string{"b"},
+				"b": []string{"c"},
+				"c": []string{"a"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.services.toGraph()
+			assert.Equal(t, tt.expectedGraph, result)
+		})
+
+	}
+}
+
+func TestValidateServices(t *testing.T) {
+	tc := []struct {
+		expected error
+		services ComposeServices
+		name     string
+	}{
+		{
+			name: "no cycle - no connections",
+			services: ComposeServices{
+				"a": &Service{},
+				"b": &Service{},
+				"c": &Service{},
+			},
+			expected: nil,
+		},
+		{
+			name: "no cycle - connections",
+			services: ComposeServices{
+				"a": &Service{
+					DependsOn: DependsOn{
+						"b": DependsOnConditionSpec{},
+					},
+				},
+				"b": &Service{
+					DependsOn: DependsOn{
+						"c": DependsOnConditionSpec{},
+					},
+				},
+				"c": &Service{},
+			},
+			expected: nil,
+		},
+		{
+			name: "cycle - connections itself",
+			services: ComposeServices{
+				"a": &Service{
+					DependsOn: DependsOn{
+						"a": DependsOnConditionSpec{},
+					},
+				},
+			},
+			expected: errDependsOn,
+		},
+		{
+			name: "no cycle - undefined dependency",
+			services: ComposeServices{
+				"a": &Service{
+					DependsOn: DependsOn{
+						"b": DependsOnConditionSpec{},
+					},
+				},
+			},
+			expected: errDependsOn,
+		},
+		{
+			name: "cycle - indirect cycle",
+			services: ComposeServices{
+				"a": &Service{
+					DependsOn: DependsOn{
+						"b": DependsOnConditionSpec{},
+					},
+				},
+				"b": &Service{
+					DependsOn: DependsOn{
+						"c": DependsOnConditionSpec{},
+					},
+				},
+				"c": &Service{
+					DependsOn: DependsOn{
+						"a": DependsOnConditionSpec{},
+					},
+				},
+			},
+			expected: errDependsOn,
+		},
+	}
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.services.ValidateDependsOn(tt.services.getNames())
+			assert.ErrorIs(t, err, tt.expected)
+		})
+	}
+
+}
+func Test_isPathAComposeFile(t *testing.T) {
+	tests := []struct {
+		name        string
+		path        string
+		envVarValue string
+		expected    bool
+	}{
+		{
+			name:     "compose file - default value for OKTETO_SUPPORT_STACKS_ENABLED",
+			path:     "compose.yml",
+			expected: true,
+		},
+		{
+			name:        "compose file - OKTETO_SUPPORT_STACKS_ENABLED=true",
+			envVarValue: "true",
+			path:        "compose.yml",
+			expected:    true,
+		},
+		{
+			name:        "compose file - OKTETO_SUPPORT_STACKS_ENABLED=false",
+			envVarValue: "false",
+			path:        "compose.yml",
+			expected:    true,
+		},
+		{
+			name:     "compose file - default value for OKTETO_SUPPORT_STACKS_ENABLED",
+			path:     "okteto-compose.yml",
+			expected: true,
+		},
+		{
+			name:     "compose file - default value for OKTETO_SUPPORT_STACKS_ENABLED",
+			path:     "docker-compose-dev.yml",
+			expected: true,
+		},
+		{
+			name:        "no compose file - OKTETO_SUPPORT_STACKS_ENABLED=false",
+			envVarValue: "false",
+			path:        "okteto-stack.yml",
+			expected:    true,
+		},
+		{
+			name:        "no compose file - OKTETO_SUPPORT_STACKS_ENABLED=true",
+			envVarValue: "true",
+			path:        "stack.yml",
+			expected:    false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(stackSupportEnabledEnvVar, test.envVarValue)
+			result := isFileCompose(test.path)
+			assert.Equal(t, test.expected, result)
+		})
+	}
+}
+func Test_warnAboutComposeFileName(t *testing.T) {
+	oktetoLog.Init(1)
+	writer := &bytes.Buffer{}
+	oktetoLog.SetOutput(writer)
+	warnAboutComposeFileName("docker-compose.yml")
+	assert.Contains(t, writer.String(), "")
+	writer.Reset()
+	warnAboutComposeFileName("stack.yml")
+	assert.Equal(t, writer.String(), "")
+	// Check that the warning is printed if the env var is set to true
+	t.Setenv(stackSupportEnabledEnvVar, "true")
+	warnAboutComposeFileName("stack.yml")
+	assert.Equal(t, writer.String(), " !  Okteto Stack syntax is deprecated.\n    Please consider migrating to Docker Compose syntax: https://community.okteto.com/t/important-update-migrating-from-okteto-stacks-to-docker-compose/1262\n")
+	// Check that the warning is only printed once even if the function is called multiple times
+	warnAboutComposeFileName("stack.yml")
+	assert.Equal(t, writer.String(), " !  Okteto Stack syntax is deprecated.\n    Please consider migrating to Docker Compose syntax: https://community.okteto.com/t/important-update-migrating-from-okteto-stacks-to-docker-compose/1262\n")
+	writer.Reset()
+}
+
+func TestService_ToDevPortForwards(t *testing.T) {
+	// compose "ports: [8080:80, 9090]": 8080 is the host port, 80 and 9090 are container ports
+	svc := &Service{
+		Ports: []Port{
+			{HostPort: 8080, ContainerPort: 80},
+			{ContainerPort: 9090},
+		},
+	}
+
+	dev, err := svc.ToDev("api")
+
+	require.NoError(t, err)
+	require.Equal(t, []forward.Forward{{Local: 8080, Remote: 80}}, dev.Forward)
 }

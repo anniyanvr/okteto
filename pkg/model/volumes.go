@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,19 +15,25 @@ package model
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/okteto/okteto/pkg/errors"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+	apiv1 "k8s.io/api/core/v1"
+)
+
+const (
+	defaultVolumeSize = "5Gi"
+
+	// devPersistentVolumeSizeEnvVar is the name of the environment variable to change the defaultVolumeSize value
+	devPersistentVolumeSizeEnvVar = "OKTETO_DEV_PERSISTENT_VOLUME_SIZE"
 )
 
 func (dev *Dev) translateDeprecatedVolumeFields() error {
-	if dev.WorkDir == "" && dev.MountPath == "" && len(dev.Sync.Folders) == 0 {
-		dev.WorkDir = "/okteto"
-	}
-	if err := dev.translateDeprecatedMountPath(nil); err != nil {
-		return err
+	if dev.Workdir == "" && len(dev.Sync.Folders) == 0 {
+		dev.Workdir = "/okteto"
 	}
 	if err := dev.translateDeprecatedWorkdir(nil); err != nil {
 		return err
@@ -35,9 +41,6 @@ func (dev *Dev) translateDeprecatedVolumeFields() error {
 	dev.translateDeprecatedVolumes()
 
 	for _, s := range dev.Services {
-		if err := s.translateDeprecatedMountPath(dev); err != nil {
-			return err
-		}
 		if err := s.translateDeprecatedWorkdir(dev); err != nil {
 			return err
 		}
@@ -46,43 +49,18 @@ func (dev *Dev) translateDeprecatedVolumeFields() error {
 	return nil
 }
 
-func (dev *Dev) translateDeprecatedMountPath(main *Dev) error {
-	if dev.MountPath == "" {
-		return nil
-	}
-	if main != nil && main.MountPath == "" {
-		return fmt.Errorf("'mountpath' is not supported to define your synchronized folders in 'services'. Use the field 'sync' instead (%s)", syncFieldDocsURL)
-	}
-
-	warnMessage := func() {
-		log.Yellow("'mounthpath' is deprecated to define your synchronized folders. Use the field 'sync' instead (%s)", syncFieldDocsURL)
-	}
-
-	once.Do(warnMessage)
-	dev.Sync.Folders = append(
-		dev.Sync.Folders,
-		SyncFolder{
-			LocalPath:  filepath.Join(".", dev.SubPath),
-			RemotePath: dev.MountPath,
-		},
-	)
-	return nil
-}
-
 func (dev *Dev) translateDeprecatedWorkdir(main *Dev) error {
-	if dev.WorkDir == "" || len(dev.Sync.Folders) > 0 {
+	if dev.Workdir == "" || len(dev.Sync.Folders) > 0 {
 		return nil
 	}
-	if main != nil && main.MountPath == "" {
+	if main != nil {
 		return fmt.Errorf("'workdir' is not supported to define your synchronized folders in 'services'. Use the field 'sync' instead (%s)", syncFieldDocsURL)
 	}
-
-	dev.MountPath = dev.WorkDir
 	dev.Sync.Folders = append(
 		dev.Sync.Folders,
 		SyncFolder{
-			LocalPath:  filepath.Join(".", dev.SubPath),
-			RemotePath: dev.WorkDir,
+			LocalPath:  ".",
+			RemotePath: dev.Workdir,
 		},
 	)
 	return nil
@@ -100,13 +78,13 @@ func (dev *Dev) translateDeprecatedVolumes() {
 	dev.Volumes = volumes
 }
 
-//IsSubPathFolder checks if a sync folder is a subpath of another sync folder
+// IsSubPathFolder checks if a sync folder is a subpath of another sync folder
 func (dev *Dev) IsSubPathFolder(path string) (bool, error) {
 	found := false
 	for _, sync := range dev.Sync.Folders {
 		rel, err := filepath.Rel(sync.LocalPath, path)
 		if err != nil {
-			log.Infof("error making rel '%s' and '%s'", sync.LocalPath, path)
+			oktetoLog.Infof("error making rel '%s' and '%s'", sync.LocalPath, path)
 			return false, err
 		}
 		if strings.HasPrefix(rel, "..") {
@@ -120,9 +98,10 @@ func (dev *Dev) IsSubPathFolder(path string) (bool, error) {
 	if found {
 		return false, nil
 	}
-	return false, errors.ErrNotFound
+	return false, oktetoErrors.ErrNotFound
 }
 
+// computeParentSyncFolder calculates the parent sync folder
 func (dev *Dev) computeParentSyncFolder() {
 	pathSplits := map[int]string{}
 	maxIndex := -1
@@ -160,10 +139,26 @@ func getDataSubPath(path string) string {
 }
 
 func (dev *Dev) getSourceSubPath(path string) string {
-	path = path[len(filepath.VolumeName(path)):]
-	rel, err := filepath.Rel(dev.parentSyncFolder, filepath.ToSlash(path))
-	if err != nil {
-		log.Fatalf("error on getSourceSubPath of '%s': %s", path, err.Error())
+	sourceSubPath := path[len(filepath.VolumeName(path)):]
+	if dev.parentSyncFolder == "" {
+		dev.parentSyncFolder = "."
+	}
+	rel, err := filepath.Rel(dev.parentSyncFolder, filepath.ToSlash(sourceSubPath))
+	if filepath.IsAbs(sourceSubPath) {
+		if err != nil || strings.HasPrefix(rel, "..") {
+			if err != nil {
+				oktetoLog.Debugf("error on getSourceSubPath of '%s': %s", path, err.Error())
+			}
+			if filepath.IsAbs(path) {
+				oktetoLog.Info("could not retrieve subpath")
+			} else {
+				p, err := filepath.Abs(path)
+				if err != nil {
+					oktetoLog.Debugf("error on getSourceSubPath of '%s': %s", path, err.Error())
+				}
+				return filepath.ToSlash(p)
+			}
+		}
 	}
 	return filepath.ToSlash(filepath.Join(SourceCodeSubPath, filepath.ToSlash(rel)))
 }
@@ -176,15 +171,68 @@ func (dev *Dev) PersistentVolumeEnabled() bool {
 	return dev.PersistentVolumeInfo.Enabled
 }
 
-// PersistentVolumeSize returns the persistent volume size
+// PersistentVolumeAccessMode returns the persistent volume accessMode
+func (dev *Dev) PersistentVolumeAccessMode() apiv1.PersistentVolumeAccessMode {
+	if dev.PersistentVolumeInfo == nil {
+		return apiv1.ReadWriteOnce
+	}
+	if dev.PersistentVolumeInfo.AccessMode == "" {
+		return apiv1.ReadWriteOnce
+	}
+	return dev.PersistentVolumeInfo.AccessMode
+}
+
+// PersistentVolumeMode returns the persistent volume volumeMode
+func (dev *Dev) PersistentVolumeMode() apiv1.PersistentVolumeMode {
+	if dev.PersistentVolumeInfo == nil {
+		return apiv1.PersistentVolumeFilesystem
+	}
+	if dev.PersistentVolumeInfo.VolumeMode == "" {
+		return apiv1.PersistentVolumeFilesystem
+	}
+	return dev.PersistentVolumeInfo.VolumeMode
+}
+
+// PersistentVolumeAnnotations returns the persistent volume annotations
+func (dev *Dev) PersistentVolumeAnnotations() Annotations {
+	if dev.PersistentVolumeInfo == nil {
+		return nil
+	}
+	return dev.PersistentVolumeInfo.Annotations
+}
+
+// PersistentVolumeLabels returns the persistent volume labels
+func (dev *Dev) PersistentVolumeLabels() Labels {
+	if dev.PersistentVolumeInfo == nil {
+		return nil
+	}
+	return dev.PersistentVolumeInfo.Labels
+}
+
+// devPersistentVolumeSizeEnvValueOrDefault returns the value of the environment variable OKTETO_DEV_PERSISTENT_VOLUME_SIZE
+// if not set, it will return the default value at defaultVolumeSize local variable
+func devPersistentVolumeSizeEnvValueOrDefault() string {
+	if v, ok := os.LookupEnv(devPersistentVolumeSizeEnvVar); ok && v != "" {
+		return v
+	}
+	return defaultVolumeSize
+}
+
+// PersistentVolumeSize returns the persistent volume size set at the dev object
+// if not set, it will return the value of the environment variable OKTETO_DEV_PERSISTENT_VOLUME_SIZE
+// if the env is not set, the default value at defaultVolumeSize local variable
 func (dev *Dev) PersistentVolumeSize() string {
 	if dev.PersistentVolumeInfo == nil {
-		return OktetoDefaultPVSize
+		return devPersistentVolumeSizeEnvValueOrDefault()
 	}
 	if dev.PersistentVolumeInfo.Size == "" {
-		return OktetoDefaultPVSize
+		return devPersistentVolumeSizeEnvValueOrDefault()
 	}
 	return dev.PersistentVolumeInfo.Size
+}
+
+func (dev *Dev) HasDefaultPersistentVolumeSize() bool {
+	return dev.PersistentVolumeSize() == defaultVolumeSize
 }
 
 // PersistentVolumeStorageClass returns the persistent volume storage class
@@ -197,7 +245,7 @@ func (dev *Dev) PersistentVolumeStorageClass() string {
 
 func (dev *Dev) AreDefaultPersistentVolumeValues() bool {
 	if dev.PersistentVolumeInfo != nil {
-		if dev.PersistentVolumeSize() == OktetoDefaultPVSize && dev.PersistentVolumeStorageClass() == "" && dev.PersistentVolumeEnabled() {
+		if dev.HasDefaultPersistentVolumeSize() && dev.PersistentVolumeStorageClass() == "" && dev.PersistentVolumeEnabled() {
 			return true
 		}
 	}
@@ -286,7 +334,7 @@ func (dev *Dev) validateServiceSyncFolders(main *Dev) error {
 	for _, sync := range dev.Sync.Folders {
 		_, err := main.IsSubPathFolder(sync.LocalPath)
 		if err != nil {
-			if err == errors.ErrNotFound {
+			if err == oktetoErrors.ErrNotFound {
 				return fmt.Errorf("LocalPath '%s' in 'services' not defined in the field 'sync' of the main development container", sync.LocalPath)
 			}
 			return err

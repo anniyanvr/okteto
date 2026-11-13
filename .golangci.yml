@@ -1,0 +1,88 @@
+version: '2'
+
+run:
+  modules-download-mode: readonly
+
+output:
+  print-issued-lines: false
+  sort-results: true
+
+linters-settings:
+  unparam:
+    check-exported: true
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+  goheader:
+    values:
+      regexp:
+        YEAR: 202[3-9]|20[3-9][0-9]
+    template-path: .copyright-header.tmpl
+  mnd:
+    checks: [argument, case, condition]
+    ignored-functions:
+      - '\.NewWriter'
+      - '\.NewTabWriter'
+      - '\.WriteFile'
+      - '^time.'
+      - '^os.'
+      - '^bcrypt.'
+      - '^math.'
+      - '^big.'
+      - '\.SetIndent'
+      - int
+      - make
+      - '\.WithTimeout'
+  revive:
+    rules:
+      - name: exported
+
+linters:
+  enable:
+    - govet
+    - ineffassign
+    - unused
+    - unparam
+    - tparallel
+    - goheader
+    - unconvert
+    - predeclared
+    - asciicheck
+    - asasalint
+    - bidichk
+    - decorder
+    - makezero
+    - musttag
+    - bodyclose
+    - durationcheck
+    - exhaustive
+
+  disable:
+    # We need to revisit this. For now, we're disabling the following linters until we fix the issues they raise.
+    - copyloopvar # replaces "exportloopref"
+    - errcheck
+    - mnd
+    - revive
+    - staticcheck # replaces "gosimple"
+
+formatters:
+  enable:
+    - gci
+    # settings for gci:
+    # settings:
+    #   gci:
+    #     sections:
+    #       - standard
+    #       - default
+    #       - prefix(github.com/okteto/okteto)
+
+issues:
+  include:
+    - EXC0014 # revive: comment on exported...
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    - path: '(.+)_test\.go'
+      linters: [errcheck]
+    - linters: [unparam]
+      text: 'MarshalYAML()'

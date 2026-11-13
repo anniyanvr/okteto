@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,35 +16,40 @@ package stack
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
-	"github.com/okteto/okteto/pkg/cmd/build"
-	"github.com/okteto/okteto/pkg/errors"
-	okLabels "github.com/okteto/okteto/pkg/k8s/labels"
-	"github.com/okteto/okteto/pkg/log"
+	buildv2 "github.com/okteto/okteto/cmd/build/v2"
+	"github.com/okteto/okteto/cmd/utils"
+	"github.com/okteto/okteto/pkg/build"
+	buildCmd "github.com/okteto/okteto/pkg/cmd/build"
+	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/env"
+	"github.com/okteto/okteto/pkg/format"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/log/io"
 	"github.com/okteto/okteto/pkg/model"
-	"github.com/okteto/okteto/pkg/registry"
-	"github.com/subosito/gotenv"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/types"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	apiv1 "k8s.io/api/core/v1"
-	extensions "k8s.io/api/extensions/v1beta1"
-
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 const (
-	helmDriver = "secrets"
-
-	nameField   = "name"
-	statusField = "status"
-	yamlField   = "yaml"
-	outputField = "output"
+	NameField    = "name"
+	statusField  = "status"
+	YamlField    = "yaml"
+	ComposeField = "compose"
+	outputField  = "output"
 
 	progressingStatus = "progressing"
 	deployedStatus    = "deployed"
@@ -52,129 +57,136 @@ const (
 	destroyingStatus  = "destroying"
 
 	pvcName = "pvc"
+
+	// oktetoComposeVolumeAffinityEnabledEnvVar represents whether the feature flag to enable volume affinity is enabled or not
+	oktetoComposeVolumeAffinityEnabledEnvVar = "OKTETO_COMPOSE_VOLUME_AFFINITY_ENABLED"
+
+	// oktetoComposeEndpointsTypeEnvVar defines the endpoint type: "gateway" or "ingress". Defaults to automatic detection based on cluster gateway metadata.
+	oktetoComposeEndpointsTypeEnvVar = "OKTETO_COMPOSE_ENDPOINTS_TYPE"
+
+	// oktetoDefaultGatewayTypeEnvVar defines the default gateway type: "gateway" or "ingress". Only used if oktetoComposeEndpointsTypeEnvVar is not set.
+	oktetoDefaultGatewayTypeEnvVar = "OKTETO_DEFAULT_GATEWAY_TYPE"
+
+	// dependsOnAnnotation represents the annotation to define the depends_on field
+	dependsOnAnnotation = "dev.okteto.com/depends-on"
+
+	// identityTokenVolumeName is the name of the projected service account token volume created for x-okteto-identity-token
+	identityTokenVolumeName = "okteto-identity-token"
+
+	// identityTokenFileName is the file name of the projected token inside the mount path
+	identityTokenFileName = "token"
+
+	// defaultIdentityTokenExpirationSeconds is the default expiration applied to the projected token when not set by the user
+	defaultIdentityTokenExpirationSeconds int64 = 3600
 )
 
-func translate(ctx context.Context, s *model.Stack, forceBuild, noCache bool) error {
-	if err := translateStackEnvVars(s); err != nil {
-		return err
+// +enum
+type updateStrategy string
+
+const (
+	// rollingUpdateStrategy represents a rolling update strategy
+	rollingUpdateStrategy updateStrategy = "rolling"
+
+	// recreateUpdateStrategy represents a recreate update strategy
+	recreateUpdateStrategy updateStrategy = "recreate"
+
+	// onDeleteUpdateStrategy represents an on-delete update strategy
+	onDeleteUpdateStrategy updateStrategy = "on-delete"
+)
+
+func buildStackImages(ctx context.Context, s *model.Stack, options *DeployOptions, analyticsTracker, insights buildTrackerInterface, ioCtrl *io.Controller) error {
+	manifest := model.NewManifestFromStack(s)
+
+	onBuildFinish := []buildv2.OnBuildFinish{
+		analyticsTracker.TrackImageBuild,
+		insights.TrackImageBuild,
 	}
-
-	return translateBuildImages(ctx, s, forceBuild, noCache)
-}
-
-func translateStackEnvVars(s *model.Stack) error {
-	var err error
-	for _, svc := range s.Services {
-		svc.Image, err = model.ExpandEnv(svc.Image)
+	okCtx := &okteto.ContextStateless{
+		Store: okteto.GetContextStore(),
+	}
+	builder := buildv2.NewBuilderFromScratch(ioCtrl, onBuildFinish, buildCmd.GetBuildkitConnector(okCtx, ioCtrl, analyticsTracker))
+	if options.ForceBuild {
+		buildOptions := &types.BuildOptions{
+			Manifest:    manifest,
+			CommandArgs: options.ServicesToDeploy,
+		}
+		if err := builder.Build(ctx, buildOptions); err != nil {
+			return err
+		}
+	} else {
+		svcsToBuild, err := builder.GetServicesToBuildDuringExecution(ctx, manifest, options.ServicesToDeploy)
 		if err != nil {
 			return err
 		}
-		for _, envFilepath := range svc.EnvFiles {
-			if err := translateServiceEnvFile(svc, envFilepath); err != nil {
+
+		if len(svcsToBuild) != 0 {
+			buildOptions := &types.BuildOptions{
+				CommandArgs: svcsToBuild,
+				Manifest:    manifest,
+			}
+			if err := builder.Build(ctx, buildOptions); err != nil {
 				return err
 			}
 		}
-		sort.SliceStable(svc.Environment, func(i, j int) bool {
-			return strings.Compare(svc.Environment[i].Name, svc.Environment[j].Name) < 0
-		})
-		svc.EnvFiles = nil
 	}
-	return nil
-}
-
-func translateServiceEnvFile(svc *model.Service, filename string) error {
-	var err error
-	filename, err = model.ExpandEnv(filename)
-	if err != nil {
-		return err
-	}
-
-	f, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	envMap, err := gotenv.StrictParse(f)
-	if err != nil {
-		return fmt.Errorf("error parsing env_file %s: %s", filename, err.Error())
-	}
-
-	for _, e := range svc.Environment {
-		delete(envMap, e.Name)
-	}
-
-	for name, value := range envMap {
-		svc.Environment = append(
-			svc.Environment,
-			model.EnvVar{Name: name, Value: value},
-		)
-	}
-	return nil
-}
-
-func translateBuildImages(ctx context.Context, s *model.Stack, forceBuild, noCache bool) error {
-	buildKitHost, isOktetoCluster, err := build.GetBuildKitHost()
-	if err != nil {
-		return err
-	}
-	building := false
-
-	for name, svc := range s.Services {
-		if svc.Build == nil {
-			continue
-		}
-		if !isOktetoCluster && svc.Image == "" {
-			return fmt.Errorf("'build' and 'image' fields of service '%s' cannot be empty", name)
-		}
-		if isOktetoCluster && !strings.HasPrefix(svc.Image, "okteto.dev") {
-			svc.Image = fmt.Sprintf("okteto.dev/%s-%s:okteto", s.Name, name)
-		}
-		if !forceBuild {
-			if _, err := registry.GetImageTagWithDigest(ctx, s.Namespace, svc.Image); err != errors.ErrNotFound {
-				s.Services[name] = svc
-				continue
-			}
-			log.Infof("image '%s' not found, building it", svc.Image)
-		}
-		if !building {
-			building = true
-			log.Information("Running your build in %s...", buildKitHost)
-		}
-		log.Information("Building image for service '%s'...", name)
-		buildArgs := model.SerializeBuildArgs(svc.Build.Args)
-		if err := build.Run(ctx, s.Namespace, buildKitHost, isOktetoCluster, svc.Build.Context, svc.Build.Dockerfile, svc.Image, svc.Build.Target, noCache, svc.Build.CacheFrom, buildArgs, nil, "tty"); err != nil {
-			return fmt.Errorf("error building image for '%s': %s", name, err)
-		}
-		svc.SetLastBuiltAnnotation()
-		s.Services[name] = svc
-		log.Success("Image for service '%s' successfully pushed", name)
-	}
-
-	if !building && forceBuild {
-		log.Warning("Ignoring '--build' argument. There are not 'build' primitives in your stack")
-	}
-
+	*s = *manifest.Deploy.ComposeSection.Stack
 	return nil
 }
 
 func translateConfigMap(s *model.Stack) *apiv1.ConfigMap {
 	return &apiv1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: s.GetConfigMapName(),
+			Name: model.GetStackConfigMapName(s.Name),
 			Labels: map[string]string{
-				okLabels.StackLabel: "true",
+				model.StackLabel:      "true",
+				model.DeployedByLabel: format.ResourceK8sMetaString(s.Name),
 			},
 		},
 		Data: map[string]string{
-			nameField: s.Name,
-			yamlField: base64.StdEncoding.EncodeToString(s.Manifest),
+			NameField:    s.Name,
+			YamlField:    base64.StdEncoding.EncodeToString(s.Manifest),
+			ComposeField: strconv.FormatBool(s.IsCompose),
 		},
 	}
 }
 
-func translateDeployment(svcName string, s *model.Stack) *appsv1.Deployment {
+func translateDeployment(svcName string, s *model.Stack, divert Divert) *appsv1.Deployment {
 	svc := s.Services[svcName]
+
+	svcHealthchecks := getSvcHealthProbe(svc)
+
+	podSpec := apiv1.PodSpec{
+		TerminationGracePeriodSeconds: ptr.To(svc.StopGracePeriod),
+		NodeSelector:                  svc.NodeSelector,
+		EnableServiceLinks:            svc.EnableServiceLinks,
+		ServiceAccountName:            svc.ServiceAccount,
+		Containers: []apiv1.Container{
+			{
+				Name:            svcName,
+				Image:           svc.Image,
+				Command:         svc.Entrypoint.Values,
+				Args:            svc.Command.Values,
+				Env:             translateServiceEnvironment(svc),
+				Ports:           translateContainerPorts(svc),
+				SecurityContext: translateSecurityContext(svc),
+				Resources:       translateResources(svc),
+				WorkingDir:      svc.Workdir,
+				ReadinessProbe:  svcHealthchecks.readiness,
+				LivenessProbe:   svcHealthchecks.liveness,
+			},
+		},
+	}
+
+	if v := translateIdentityTokenVolume(svc); v != nil {
+		m := translateIdentityTokenVolumeMount(svc)
+		podSpec.Volumes = append(podSpec.Volumes, *v)
+		podSpec.Containers[0].VolumeMounts = append(podSpec.Containers[0].VolumeMounts, *m)
+	}
+
+	if divert != nil {
+		podSpec = divert.UpdatePod(podSpec)
+	}
+
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        svcName,
@@ -183,28 +195,322 @@ func translateDeployment(svcName string, s *model.Stack) *appsv1.Deployment {
 			Annotations: translateAnnotations(svc),
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: pointer.Int32Ptr(svc.Replicas),
+			Replicas: ptr.To(svc.Replicas),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: translateLabelSelector(svcName, s),
 			},
+			Strategy: getDeploymentUpdateStrategy(svc),
 			Template: apiv1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      translateLabels(svcName, s),
 					Annotations: translateAnnotations(svc),
 				},
-				Spec: apiv1.PodSpec{
-					TerminationGracePeriodSeconds: pointer.Int64Ptr(svc.StopGracePeriod),
-					Containers: []apiv1.Container{
-						{
-							Name:            svcName,
-							Image:           svc.Image,
-							Command:         svc.Entrypoint.Values,
-							Args:            svc.Command.Values,
-							Env:             translateServiceEnvironment(svc),
-							Ports:           translateContainerPorts(svc),
-							SecurityContext: translateSecurityContext(svc),
-							Resources:       translateResources(svc),
-							WorkingDir:      svc.WorkingDir,
+				Spec: podSpec,
+			},
+		},
+	}
+}
+
+func translatePersistentVolumeClaim(volumeName string, s *model.Stack) apiv1.PersistentVolumeClaim {
+	volumeSpec := s.Volumes[volumeName]
+	labels := translateVolumeLabels(volumeName, s)
+	pvc := apiv1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        volumeName,
+			Namespace:   s.Namespace,
+			Labels:      labels,
+			Annotations: volumeSpec.Annotations,
+		},
+		Spec: apiv1.PersistentVolumeClaimSpec{
+			AccessModes: []apiv1.PersistentVolumeAccessMode{apiv1.ReadWriteOnce},
+			Resources: apiv1.VolumeResourceRequirements{
+				Requests: apiv1.ResourceList{
+					"storage": volumeSpec.Size.Value,
+				},
+			},
+			StorageClassName: translateStorageClass(volumeSpec.Class),
+		},
+	}
+	return pvc
+}
+
+func translateStatefulSet(svcName string, s *model.Stack, divert Divert) *appsv1.StatefulSet {
+	svc := s.Services[svcName]
+
+	initContainers := getInitContainers(svcName, s)
+	svcHealthchecks := getSvcHealthProbe(svc)
+
+	podSpec := apiv1.PodSpec{
+		TerminationGracePeriodSeconds: ptr.To(svc.StopGracePeriod),
+		InitContainers:                initContainers,
+		Affinity:                      translateAffinity(svc),
+		NodeSelector:                  svc.NodeSelector,
+		EnableServiceLinks:            svc.EnableServiceLinks,
+		ServiceAccountName:            svc.ServiceAccount,
+		Volumes:                       translateVolumes(svc),
+		Containers: []apiv1.Container{
+			{
+				Name:            svcName,
+				Image:           svc.Image,
+				Command:         svc.Entrypoint.Values,
+				Args:            svc.Command.Values,
+				Env:             translateServiceEnvironment(svc),
+				Ports:           translateContainerPorts(svc),
+				SecurityContext: translateSecurityContext(svc),
+				VolumeMounts:    translateVolumeMounts(svc),
+				Resources:       translateResources(svc),
+				WorkingDir:      svc.Workdir,
+				ReadinessProbe:  svcHealthchecks.readiness,
+				LivenessProbe:   svcHealthchecks.liveness,
+			},
+		},
+	}
+
+	if divert != nil {
+		podSpec = divert.UpdatePod(podSpec)
+	}
+
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        svcName,
+			Namespace:   s.Namespace,
+			Labels:      translateLabels(svcName, s),
+			Annotations: translateAnnotations(svc),
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:             ptr.To(svc.Replicas),
+			RevisionHistoryLimit: ptr.To(int32(2)),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: translateLabelSelector(svcName, s),
+			},
+			UpdateStrategy: getStatefulsetUpdateStrategy(svc),
+			ServiceName:    svcName,
+			Template: apiv1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      translateLabels(svcName, s),
+					Annotations: translateAnnotations(svc),
+				},
+				Spec: podSpec,
+			},
+			VolumeClaimTemplates: translateVolumeClaimTemplates(svcName, s),
+		},
+	}
+}
+
+func translateJob(svcName string, s *model.Stack, divert Divert) *batchv1.Job {
+	svc := s.Services[svcName]
+
+	initContainers := getInitContainers(svcName, s)
+	svcHealthchecks := getSvcHealthProbe(svc)
+	podSpec := apiv1.PodSpec{
+		RestartPolicy:                 svc.RestartPolicy,
+		TerminationGracePeriodSeconds: ptr.To(svc.StopGracePeriod),
+		InitContainers:                initContainers,
+		Affinity:                      translateAffinity(svc),
+		NodeSelector:                  svc.NodeSelector,
+		EnableServiceLinks:            svc.EnableServiceLinks,
+		ServiceAccountName:            svc.ServiceAccount,
+		Containers: []apiv1.Container{
+			{
+				Name:            svcName,
+				Image:           svc.Image,
+				Command:         svc.Entrypoint.Values,
+				Args:            svc.Command.Values,
+				Env:             translateServiceEnvironment(svc),
+				Ports:           translateContainerPorts(svc),
+				SecurityContext: translateSecurityContext(svc),
+				VolumeMounts:    translateVolumeMounts(svc),
+				Resources:       translateResources(svc),
+				WorkingDir:      svc.Workdir,
+				ReadinessProbe:  svcHealthchecks.readiness,
+				LivenessProbe:   svcHealthchecks.liveness,
+			},
+		},
+		Volumes: translateVolumes(svc),
+	}
+
+	if divert != nil {
+		podSpec = divert.UpdatePod(podSpec)
+	}
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        svcName,
+			Namespace:   s.Namespace,
+			Labels:      translateLabels(svcName, s),
+			Annotations: translateAnnotations(svc),
+		},
+		Spec: batchv1.JobSpec{
+			Completions:  ptr.To(svc.Replicas),
+			Parallelism:  ptr.To(int32(1)),
+			BackoffLimit: &svc.BackOffLimit,
+			Template: apiv1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      translateLabels(svcName, s),
+					Annotations: translateAnnotations(svc),
+				},
+				Spec: podSpec,
+			},
+		},
+	}
+}
+
+func getInitContainers(svcName string, s *model.Stack) []apiv1.Container {
+	svc := s.Services[svcName]
+	initContainers := []apiv1.Container{}
+	if len(svc.Volumes) > 0 {
+		addPermissionsContainer := getAddPermissionsInitContainer(svcName, svc)
+		initContainers = append(initContainers, addPermissionsContainer)
+
+	}
+	initializationContainer := getInitializeVolumeContentContainer(svcName, svc)
+	if initializationContainer != nil {
+		initContainers = append(initContainers, *initializationContainer)
+	}
+
+	return initContainers
+}
+
+func getAddPermissionsInitContainer(svcName string, svc *model.Service) apiv1.Container {
+	initContainerCommand, initContainerVolumeMounts := getInitContainerCommandAndVolumeMounts(*svc)
+	initContainer := apiv1.Container{
+		Name:            fmt.Sprintf("init-%s", svcName),
+		Image:           config.NewImageConfig(oktetoLog.GetOutputWriter()).GetCliImage(),
+		ImagePullPolicy: apiv1.PullIfNotPresent,
+		Command:         initContainerCommand,
+		VolumeMounts:    initContainerVolumeMounts,
+	}
+	return initContainer
+}
+
+func getInitializeVolumeContentContainer(svcName string, svc *model.Service) *apiv1.Container {
+	c := &apiv1.Container{
+		Name:            fmt.Sprintf("init-volume-%s", svcName),
+		Image:           svc.Image,
+		ImagePullPolicy: apiv1.PullIfNotPresent,
+		VolumeMounts:    []apiv1.VolumeMount{},
+	}
+	command := "echo initializing volume..."
+	for idx, v := range svc.Volumes {
+		subpath := fmt.Sprintf("data-%d", idx)
+		if v.LocalPath != "" {
+			subpath = v.LocalPath
+		}
+		c.VolumeMounts = append(
+			c.VolumeMounts,
+			apiv1.VolumeMount{
+				Name:      getVolumeClaimName(&v),
+				MountPath: fmt.Sprintf("/init-volume-%d", idx),
+				SubPath:   subpath,
+			},
+		)
+		command = fmt.Sprintf("%s && (cp -Rv %s/. /init-volume-%d || true)", command, v.RemotePath, idx)
+	}
+	if len(c.VolumeMounts) != 0 {
+		c.Command = []string{"sh", "-c", command}
+		return c
+	}
+	return nil
+}
+
+func getInitContainerCommandAndVolumeMounts(svc model.Service) ([]string, []apiv1.VolumeMount) {
+	volumeMounts := make([]apiv1.VolumeMount, 0)
+
+	var command string
+	var addedVolumesVolume, addedDataVolume bool
+	for _, volume := range svc.Volumes {
+		volumeName := getVolumeClaimName(&volume)
+		if volumeName != pvcName {
+			volumeMounts = append(volumeMounts, apiv1.VolumeMount{Name: volumeName, MountPath: fmt.Sprintf("/volumes/%s", volumeName)})
+			if !addedVolumesVolume {
+				if command == "" {
+					command = "chmod 777 /volumes/*"
+					addedVolumesVolume = true
+				} else {
+					command += " && chmod 777 /volumes/*"
+				}
+			}
+		} else if !addedDataVolume {
+			volumeMounts = append(volumeMounts, apiv1.VolumeMount{Name: volumeName, MountPath: "/data"})
+			if command == "" {
+				command = "chmod 777 /data"
+				addedDataVolume = true
+			} else {
+				command += " && chmod 777 /data"
+			}
+		}
+	}
+	return []string{"sh", "-c", command}, volumeMounts
+}
+
+func translateVolumeClaimTemplates(svcName string, s *model.Stack) []apiv1.PersistentVolumeClaim {
+	svc := s.Services[svcName]
+	for _, volume := range svc.Volumes {
+		if volume.LocalPath == "" {
+			return []apiv1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        pvcName,
+						Labels:      translateLabels(svcName, s),
+						Annotations: translateAnnotations(svc),
+					},
+					Spec: apiv1.PersistentVolumeClaimSpec{
+						AccessModes: []apiv1.PersistentVolumeAccessMode{apiv1.ReadWriteOnce},
+						Resources: apiv1.VolumeResourceRequirements{
+							Requests: apiv1.ResourceList{
+								"storage": svc.Resources.Requests.Storage.Size.Value,
+							},
+						},
+						StorageClassName: translateStorageClass(svc.Resources.Requests.Storage.Class),
+					},
+				},
+			}
+		}
+	}
+	return nil
+}
+
+func translateVolumes(svc *model.Service) []apiv1.Volume {
+	volumes := make([]apiv1.Volume, 0)
+	for _, volume := range svc.Volumes {
+		name := getVolumeClaimName(&volume)
+		volumes = append(volumes, apiv1.Volume{
+			Name: name,
+			VolumeSource: apiv1.VolumeSource{
+				PersistentVolumeClaim: &apiv1.PersistentVolumeClaimVolumeSource{
+					ClaimName: volume.LocalPath,
+				},
+			},
+		})
+	}
+
+	if v := translateIdentityTokenVolume(svc); v != nil {
+		volumes = append(volumes, *v)
+	}
+
+	return volumes
+}
+
+// translateIdentityTokenVolume builds the projected service account token volume for a service with
+// x-okteto-identity-token configured. It returns nil when the directive is not set.
+func translateIdentityTokenVolume(svc *model.Service) *apiv1.Volume {
+	if svc.IdentityToken == nil {
+		return nil
+	}
+	expiration := defaultIdentityTokenExpirationSeconds
+	if svc.IdentityToken.ExpirationSeconds != nil {
+		expiration = int64(*svc.IdentityToken.ExpirationSeconds)
+	}
+	return &apiv1.Volume{
+		Name: identityTokenVolumeName,
+		VolumeSource: apiv1.VolumeSource{
+			Projected: &apiv1.ProjectedVolumeSource{
+				Sources: []apiv1.VolumeProjection{
+					{
+						ServiceAccountToken: &apiv1.ServiceAccountTokenProjection{
+							Audience:          svc.IdentityToken.Audience,
+							ExpirationSeconds: ptr.To(expiration),
+							Path:              identityTokenFileName,
 						},
 					},
 				},
@@ -213,86 +519,34 @@ func translateDeployment(svcName string, s *model.Stack) *appsv1.Deployment {
 	}
 }
 
-func translateStatefulSet(name string, s *model.Stack) *appsv1.StatefulSet {
-	svc := s.Services[name]
-	return &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Namespace:   s.Namespace,
-			Labels:      translateLabels(name, s),
-			Annotations: translateAnnotations(svc),
-		},
-		Spec: appsv1.StatefulSetSpec{
-			Replicas:             pointer.Int32Ptr(svc.Replicas),
-			RevisionHistoryLimit: pointer.Int32Ptr(2),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: translateLabelSelector(name, s),
-			},
-			ServiceName: name,
-			Template: apiv1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels:      translateLabels(name, s),
-					Annotations: translateAnnotations(svc),
-				},
-				Spec: apiv1.PodSpec{
-					TerminationGracePeriodSeconds: pointer.Int64Ptr(svc.StopGracePeriod),
-					InitContainers: []apiv1.Container{
-						{
-							Name:    fmt.Sprintf("init-%s", name),
-							Image:   "busybox",
-							Command: []string{"chmod", "-R", "777", "/data"},
-							VolumeMounts: []apiv1.VolumeMount{
-								{
-									MountPath: "/data",
-									Name:      pvcName,
-								},
-							},
-						},
-					},
-					Containers: []apiv1.Container{
-						{
-							Name:            name,
-							Image:           svc.Image,
-							Command:         svc.Entrypoint.Values,
-							Args:            svc.Command.Values,
-							Env:             translateServiceEnvironment(svc),
-							Ports:           translateContainerPorts(svc),
-							SecurityContext: translateSecurityContext(svc),
-							VolumeMounts:    translateVolumeMounts(svc),
-							Resources:       translateResources(svc),
-							WorkingDir:      svc.WorkingDir,
-						},
-					},
-				},
-			},
-			VolumeClaimTemplates: []apiv1.PersistentVolumeClaim{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:        pvcName,
-						Labels:      translateLabels(name, s),
-						Annotations: translateAnnotations(svc),
-					},
-					Spec: apiv1.PersistentVolumeClaimSpec{
-						AccessModes: []apiv1.PersistentVolumeAccessMode{apiv1.ReadWriteOnce},
-						Resources: apiv1.ResourceRequirements{
-							Requests: apiv1.ResourceList{
-								"storage": svc.Resources.Requests.Storage.Size.Value,
-							},
-						},
-						StorageClassName: translateStorageClass(svc),
-					},
-				},
-			},
-		},
+// translateIdentityTokenVolumeMount builds the read-only mount for the projected service account
+// token volume. It returns nil when x-okteto-identity-token is not set.
+func translateIdentityTokenVolumeMount(svc *model.Service) *apiv1.VolumeMount {
+	if svc.IdentityToken == nil {
+		return nil
+	}
+	return &apiv1.VolumeMount{
+		Name:      identityTokenVolumeName,
+		MountPath: svc.IdentityToken.MountPath,
+		ReadOnly:  true,
 	}
 }
 
 func translateService(svcName string, s *model.Stack) *apiv1.Service {
 	svc := s.Services[svcName]
 	annotations := translateAnnotations(svc)
-	if s.Services[svcName].Public {
-		annotations[okLabels.OktetoAutoIngressAnnotation] = "true"
+
+	serviceSpec := apiv1.ServiceSpec{
+		Selector: translateLabelSelector(svcName, s),
+		Type:     apiv1.ServiceTypeClusterIP,
+		Ports:    translateServicePorts(*svc),
 	}
+
+	// Configure headless service for DNS round-robin endpoint mode
+	if svc.EndpointMode == model.EndpointModeDNSRR {
+		serviceSpec.ClusterIP = "None"
+	}
+
 	return &apiv1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        svcName,
@@ -300,125 +554,156 @@ func translateService(svcName string, s *model.Stack) *apiv1.Service {
 			Labels:      translateLabels(svcName, s),
 			Annotations: annotations,
 		},
-		Spec: apiv1.ServiceSpec{
-			Selector: translateLabelSelector(svcName, s),
-			Type:     translateServiceType(*svc),
-			Ports:    translateServicePorts(*svc),
-		},
+		Spec: serviceSpec,
 	}
 }
 
-func translateIngress(ingressName string, s *model.Stack) *extensions.Ingress {
-	endpoints := s.Endpoints[ingressName]
-	return &extensions.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        ingressName,
-			Namespace:   s.Namespace,
-			Labels:      translateIngressLabels(ingressName, s),
-			Annotations: translateIngressAnnotations(ingressName, s),
-		},
-		Spec: extensions.IngressSpec{
-			Rules: []extensions.IngressRule{
-				{
-					IngressRuleValue: extensions.IngressRuleValue{
-						HTTP: &extensions.HTTPIngressRuleValue{
-							Paths: translateEndpoints(endpoints),
-						},
+func getSvcPublicPorts(svcName string, s *model.Stack) []model.Port {
+	result := []model.Port{}
+	for _, p := range s.Services[svcName].Ports {
+		if !model.IsSkippablePort(p.ContainerPort) && p.HostPort != 0 {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+func translateVolumeLabels(volumeName string, s *model.Stack) map[string]string {
+	volume := s.Volumes[volumeName]
+	labels := map[string]string{
+		model.StackNameLabel:       format.ResourceK8sMetaString(s.Name),
+		model.StackVolumeNameLabel: volumeName,
+		model.DeployedByLabel:      format.ResourceK8sMetaString(s.Name),
+	}
+	for k := range volume.Labels {
+		labels[k] = volume.Labels[k]
+	}
+	return labels
+}
+
+func translateAffinity(svc *model.Service) *apiv1.Affinity {
+	if !env.LoadBooleanOrDefault(oktetoComposeVolumeAffinityEnabledEnvVar, true) {
+		return nil
+	}
+
+	requirements := make([]apiv1.PodAffinityTerm, 0)
+	for _, volume := range svc.Volumes {
+		if volume.LocalPath == "" {
+			continue
+		}
+		requirements = append(requirements, apiv1.PodAffinityTerm{
+			TopologyKey: "kubernetes.io/hostname",
+			LabelSelector: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{
+						Key:      fmt.Sprintf("%s-%s", model.StackVolumeNameLabel, volume.LocalPath),
+						Operator: metav1.LabelSelectorOpExists,
 					},
 				},
 			},
 		},
+		)
 	}
-}
-
-func translateEndpoints(endpoints model.Endpoint) []extensions.HTTPIngressPath {
-	paths := make([]extensions.HTTPIngressPath, 0)
-	for _, rule := range endpoints.Rules {
-		path := extensions.HTTPIngressPath{
-			Path: rule.Path,
-			Backend: extensions.IngressBackend{
-				ServiceName: rule.Service,
-				ServicePort: intstr.IntOrString{IntVal: rule.Port},
+	if len(requirements) > 0 {
+		return &apiv1.Affinity{
+			PodAffinity: &apiv1.PodAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: requirements,
 			},
 		}
-		paths = append(paths, path)
 	}
-	return paths
-}
 
-func translateIngressAnnotations(endpointName string, s *model.Stack) map[string]string {
-	endpoint := s.Endpoints[endpointName]
-	annotations := map[string]string{okLabels.OktetoIngressAutoGenerateHost: "true"}
-	for k := range endpoint.Annotations {
-		annotations[k] = endpoint.Annotations[k]
-	}
-	return annotations
-}
-
-func translateIngressLabels(endpointName string, s *model.Stack) map[string]string {
-	endpoint := s.Endpoints[endpointName]
-	labels := map[string]string{
-		okLabels.StackNameLabel:         s.Name,
-		okLabels.StackEndpointNameLabel: endpointName,
-	}
-	for k := range endpoint.Labels {
-		labels[k] = endpoint.Labels[k]
-	}
-	return labels
+	return nil
 }
 
 func translateLabels(svcName string, s *model.Stack) map[string]string {
 	svc := s.Services[svcName]
 	labels := map[string]string{
-		okLabels.StackNameLabel:        s.Name,
-		okLabels.StackServiceNameLabel: svcName,
+		model.StackNameLabel:        format.ResourceK8sMetaString(s.Name),
+		model.StackServiceNameLabel: svcName,
+		model.DeployedByLabel:       format.ResourceK8sMetaString(s.Name),
 	}
 	for k := range svc.Labels {
 		labels[k] = svc.Labels[k]
+	}
+
+	for _, volume := range svc.Volumes {
+		if volume.LocalPath != "" {
+			labels[fmt.Sprintf("%s-%s", model.StackVolumeNameLabel, volume.LocalPath)] = "true"
+		}
 	}
 	return labels
 }
 
 func translateLabelSelector(svcName string, s *model.Stack) map[string]string {
 	labels := map[string]string{
-		okLabels.StackNameLabel:        s.Name,
-		okLabels.StackServiceNameLabel: svcName,
+		model.StackNameLabel:        format.ResourceK8sMetaString(s.Name),
+		model.StackServiceNameLabel: svcName,
 	}
 	return labels
 }
 
 func translateAnnotations(svc *model.Service) map[string]string {
-	result := map[string]string{}
+	result := getAnnotations(svc)
 	for k, v := range svc.Annotations {
 		result[k] = v
 	}
 	return result
 }
 
-func translateServiceType(svc model.Service) apiv1.ServiceType {
-	if svc.Public {
-		return apiv1.ServiceTypeLoadBalancer
+func getAnnotations(svc *model.Service) map[string]string {
+	annotations := map[string]string{}
+	if utils.IsOktetoRepo() {
+		annotations[model.OktetoSampleAnnotation] = "true"
 	}
-	return apiv1.ServiceTypeClusterIP
+	if len(svc.DependsOn) > 0 {
+		dependsOn, err := json.Marshal(svc.DependsOn)
+		if err != nil {
+			oktetoLog.Infof("error marshalling depends_on annotation: %s", err)
+		} else {
+			annotations[dependsOnAnnotation] = string(dependsOn)
+		}
+	}
+
+	return annotations
 }
 
 func translateVolumeMounts(svc *model.Service) []apiv1.VolumeMount {
 	result := []apiv1.VolumeMount{}
 	for i, v := range svc.Volumes {
+		name := getVolumeClaimName(&v)
+		subpath := fmt.Sprintf("data-%d", i)
+		if v.LocalPath != "" {
+			subpath = v.LocalPath
+		}
 		result = append(
 			result,
 			apiv1.VolumeMount{
 				MountPath: v.RemotePath,
-				Name:      pvcName,
-				SubPath:   fmt.Sprintf("data-%d", i),
+				Name:      name,
+				SubPath:   subpath,
 			},
 		)
 	}
+
+	if m := translateIdentityTokenVolumeMount(svc); m != nil {
+		result = append(result, *m)
+	}
+
 	return result
 }
 
+func getVolumeClaimName(v *build.VolumeMounts) string {
+	var name string
+	if v.LocalPath != "" {
+		name = v.LocalPath
+	} else {
+		name = pvcName
+	}
+	return name
+}
+
 func translateSecurityContext(svc *model.Service) *apiv1.SecurityContext {
-	if len(svc.CapAdd) == 0 && len(svc.CapDrop) == 0 {
+	if len(svc.CapAdd) == 0 && len(svc.CapDrop) == 0 && svc.User == nil {
 		return nil
 	}
 	result := &apiv1.SecurityContext{Capabilities: &apiv1.Capabilities{}}
@@ -428,12 +713,16 @@ func translateSecurityContext(svc *model.Service) *apiv1.SecurityContext {
 	if len(svc.CapDrop) > 0 {
 		result.Capabilities.Drop = svc.CapDrop
 	}
+	if svc.User != nil {
+		result.RunAsUser = svc.User.RunAsUser
+		result.RunAsGroup = svc.User.RunAsGroup
+	}
 	return result
 }
 
-func translateStorageClass(svc *model.Service) *string {
-	if svc.Resources.Requests.Storage.Class != "" {
-		return &svc.Resources.Requests.Storage.Class
+func translateStorageClass(className string) *string {
+	if className != "" {
+		return &className
 	}
 	return nil
 }
@@ -441,15 +730,20 @@ func translateStorageClass(svc *model.Service) *string {
 func translateServiceEnvironment(svc *model.Service) []apiv1.EnvVar {
 	result := []apiv1.EnvVar{}
 	for _, e := range svc.Environment {
-		result = append(result, apiv1.EnvVar{Name: e.Name, Value: e.Value})
+		if e.Name != "" {
+			result = append(result, apiv1.EnvVar{Name: e.Name, Value: e.Value})
+		}
 	}
 	return result
 }
 
 func translateContainerPorts(svc *model.Service) []apiv1.ContainerPort {
 	result := []apiv1.ContainerPort{}
+	sort.Slice(svc.Ports, func(i, j int) bool {
+		return svc.Ports[i].ContainerPort < svc.Ports[j].ContainerPort
+	})
 	for _, p := range svc.Ports {
-		result = append(result, apiv1.ContainerPort{ContainerPort: p.Port})
+		result = append(result, apiv1.ContainerPort{ContainerPort: p.ContainerPort})
 	}
 	return result
 }
@@ -457,17 +751,39 @@ func translateContainerPorts(svc *model.Service) []apiv1.ContainerPort {
 func translateServicePorts(svc model.Service) []apiv1.ServicePort {
 	result := []apiv1.ServicePort{}
 	for _, p := range svc.Ports {
-		result = append(
-			result,
-			apiv1.ServicePort{
-				Name:       fmt.Sprintf("p-%d-%s", p.Port, strings.ToLower(fmt.Sprintf("%v", p.Protocol))),
-				Port:       int32(p.Port),
-				TargetPort: intstr.IntOrString{IntVal: p.Port},
-				Protocol:   p.Protocol,
-			},
-		)
+		if !isServicePortAdded(p.ContainerPort, result) {
+			result = append(
+				result,
+				apiv1.ServicePort{
+					Name:       fmt.Sprintf("p-%d-%d-%s", p.ContainerPort, p.ContainerPort, strings.ToLower(fmt.Sprintf("%v", p.Protocol))),
+					Port:       p.ContainerPort,
+					TargetPort: intstr.IntOrString{IntVal: p.ContainerPort},
+					Protocol:   p.Protocol,
+				},
+			)
+		}
+		if p.HostPort != 0 && p.ContainerPort != p.HostPort && !isServicePortAdded(p.HostPort, result) {
+			result = append(
+				result,
+				apiv1.ServicePort{
+					Name:       fmt.Sprintf("p-%d-%d-%s", p.HostPort, p.ContainerPort, strings.ToLower(fmt.Sprintf("%v", p.Protocol))),
+					Port:       p.HostPort,
+					TargetPort: intstr.IntOrString{IntVal: p.ContainerPort},
+					Protocol:   p.Protocol,
+				},
+			)
+		}
 	}
 	return result
+}
+
+func isServicePortAdded(newPort int32, existentPorts []apiv1.ServicePort) bool {
+	for _, p := range existentPorts {
+		if p.Port == newPort {
+			return true
+		}
+	}
+	return false
 }
 
 func translateResources(svc *model.Service) apiv1.ResourceRequirements {
@@ -492,9 +808,137 @@ func translateResources(svc *model.Service) apiv1.ResourceRequirements {
 		if svc.Resources.Requests.Memory.Value.Cmp(resource.MustParse("0")) > 0 {
 			if result.Requests == nil {
 				result.Requests = apiv1.ResourceList{}
-				result.Requests[apiv1.ResourceMemory] = svc.Resources.Requests.Memory.Value
 			}
+			result.Requests[apiv1.ResourceMemory] = svc.Resources.Requests.Memory.Value
 		}
 	}
 	return result
+}
+
+type healthcheckProbes struct {
+	readiness *apiv1.Probe
+	liveness  *apiv1.Probe
+}
+
+func getSvcHealthProbe(svc *model.Service) healthcheckProbes {
+	result := healthcheckProbes{}
+	if svc.Healtcheck != nil {
+		var handler apiv1.ProbeHandler
+		if len(svc.Healtcheck.Test) != 0 {
+			handler = apiv1.ProbeHandler{
+				Exec: &apiv1.ExecAction{
+					Command: svc.Healtcheck.Test,
+				},
+			}
+		} else {
+			handler = apiv1.ProbeHandler{
+				HTTPGet: &apiv1.HTTPGetAction{
+					Path: svc.Healtcheck.HTTP.Path,
+					Port: intstr.IntOrString{IntVal: svc.Healtcheck.HTTP.Port},
+				},
+			}
+		}
+		probe := &apiv1.Probe{
+			ProbeHandler:        handler,
+			TimeoutSeconds:      int32(svc.Healtcheck.Timeout.Seconds()),
+			PeriodSeconds:       int32(svc.Healtcheck.Interval.Seconds()),
+			FailureThreshold:    int32(svc.Healtcheck.Retries),
+			InitialDelaySeconds: int32(svc.Healtcheck.StartPeriod.Seconds()),
+		}
+
+		if svc.Healtcheck.Readiness {
+			result.readiness = probe
+		}
+		if svc.Healtcheck.Liveness {
+			result.liveness = probe
+		}
+	}
+	return result
+}
+
+type updateStrategyGetter interface {
+	validate(updateStrategy) error
+	getDefault() updateStrategy
+}
+
+type deploymentStrategyGetter struct{}
+
+func (*deploymentStrategyGetter) validate(updateStrategy updateStrategy) error {
+	if updateStrategy != rollingUpdateStrategy && updateStrategy != recreateUpdateStrategy {
+		return fmt.Errorf("invalid deployment update strategy: '%s'", updateStrategy)
+	}
+	return nil
+}
+
+func (*deploymentStrategyGetter) getDefault() updateStrategy {
+	return recreateUpdateStrategy
+}
+
+type statefulSetStrategyGetter struct{}
+
+func (*statefulSetStrategyGetter) validate(updateStrategy updateStrategy) error {
+	if updateStrategy != rollingUpdateStrategy && updateStrategy != onDeleteUpdateStrategy {
+		return fmt.Errorf("invalid statefulset update strategy: '%s'", updateStrategy)
+	}
+	return nil
+}
+
+func (*statefulSetStrategyGetter) getDefault() updateStrategy {
+	return rollingUpdateStrategy
+}
+
+func getDeploymentUpdateStrategy(svc *model.Service) appsv1.DeploymentStrategy {
+	result := getUpdateStrategy(svc, &deploymentStrategyGetter{})
+	if result == rollingUpdateStrategy {
+		return appsv1.DeploymentStrategy{
+			Type: appsv1.RollingUpdateDeploymentStrategyType,
+		}
+	}
+	return appsv1.DeploymentStrategy{
+		Type: appsv1.RecreateDeploymentStrategyType,
+	}
+}
+
+func getStatefulsetUpdateStrategy(svc *model.Service) appsv1.StatefulSetUpdateStrategy {
+	result := getUpdateStrategy(svc, &statefulSetStrategyGetter{})
+	if result == rollingUpdateStrategy {
+		return appsv1.StatefulSetUpdateStrategy{
+			Type: appsv1.RollingUpdateStatefulSetStrategyType,
+		}
+	}
+	return appsv1.StatefulSetUpdateStrategy{
+		Type: appsv1.OnDeleteStatefulSetStrategyType,
+	}
+}
+
+func getUpdateStrategy(svc *model.Service, strategy updateStrategyGetter) updateStrategy {
+	if result := getUpdateStrategyByAnnotation(svc); result != "" {
+		err := strategy.validate(result)
+		if err == nil {
+			return result
+		}
+		oktetoLog.Debugf("invalid strategy: %s", err)
+	}
+	if result := getUpdateStrategyByEnvVar(); result != "" {
+		err := strategy.validate(result)
+		if err == nil {
+			return result
+		}
+		oktetoLog.Debugf("invalid strategy: %s", err)
+	}
+	return strategy.getDefault()
+}
+
+func getUpdateStrategyByAnnotation(svc *model.Service) updateStrategy {
+	if v, ok := svc.Annotations[model.OktetoComposeUpdateStrategyAnnotation]; ok {
+		return updateStrategy(v)
+	}
+	return ""
+}
+
+func getUpdateStrategyByEnvVar() updateStrategy {
+	if v := os.Getenv(model.OktetoComposeUpdateStrategyEnvVar); v != "" {
+		return updateStrategy(v)
+	}
+	return ""
 }

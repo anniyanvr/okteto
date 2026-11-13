@@ -1,17 +1,33 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package ssh
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gliderlabs/ssh"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
+	forwardModel "github.com/okteto/okteto/pkg/model/forward"
 )
 
 type testHTTPHandler struct {
@@ -19,12 +35,15 @@ type testHTTPHandler struct {
 }
 type testSSHHandler struct{}
 
-func (t *testHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Println(fmt.Sprintf("message %s", t.message))
-	_, _ = w.Write([]byte(t.message))
+func (t *testHTTPHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	oktetoLog.Println(fmt.Sprintf("message %s", t.message))
+	_, err := w.Write([]byte(t.message))
+	if err != nil {
+		oktetoLog.Infof("error writing message %s: %s", t.message, err)
+	}
 }
 
-func (t *testSSHHandler) listenAndServe(address string) {
+func (*testSSHHandler) listenAndServe(address string) {
 	forwardHandler := &ssh.ForwardedTCPHandler{}
 	server := &ssh.Server{
 		Addr: address,
@@ -33,11 +52,11 @@ func (t *testSSHHandler) listenAndServe(address string) {
 			"session":      ssh.DefaultSessionHandler,
 		},
 		LocalPortForwardingCallback: ssh.LocalPortForwardingCallback(func(ctx ssh.Context, dhost string, dport uint32) bool {
-			log.Println("Accepted forward", dhost, dport)
+			oktetoLog.Println("Accepted forward", dhost, dport)
 			return true
 		}),
 		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
-			log.Println("attempt to bind", host, port, "granted")
+			oktetoLog.Println("attempt to bind", host, port, "granted")
 			return true
 		}),
 		RequestHandlers: map[string]ssh.RequestHandler{
@@ -47,7 +66,7 @@ func (t *testSSHHandler) listenAndServe(address string) {
 	}
 
 	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf(err.Error())
+		oktetoLog.Fatalf("%s", err.Error())
 	}
 }
 
@@ -75,7 +94,7 @@ func TestForward(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	log.Info("forwards connected")
+	oktetoLog.Info("forwards connected")
 
 	if err := callForwards(fm); err != nil {
 		t.Error(err)
@@ -134,13 +153,22 @@ func startServers(fm *ForwardManager) error {
 			return err
 		}
 
-		if err := fm.Add(model.Forward{Local: local, Remote: remote}); err != nil {
+		if err := fm.Add(forwardModel.Forward{Local: local, Remote: remote}); err != nil {
 			return err
 		}
 
 		go func() {
 			handler := &testHTTPHandler{message: fmt.Sprintf("%d", remote)}
-			_ = http.ListenAndServe(fmt.Sprintf(":%d", remote), handler)
+			server := &http.Server{
+				Addr:              net.JoinHostPort("", strconv.Itoa(remote)),
+				Handler:           handler,
+				ReadHeaderTimeout: 3 * time.Second,
+			}
+
+			err = server.ListenAndServe()
+			if err != nil {
+				oktetoLog.Infof("forward server %d failed: %s", remote, err.Error())
+			}
 		}()
 	}
 
@@ -165,7 +193,16 @@ func connectReverseForwards(fm *ForwardManager) error {
 
 		go func() {
 			handler := &testHTTPHandler{message: fmt.Sprintf("%d", local)}
-			_ = http.ListenAndServe(fmt.Sprintf(":%d", local), handler)
+			server := &http.Server{
+				Addr:              net.JoinHostPort("", strconv.Itoa(local)),
+				Handler:           handler,
+				ReadHeaderTimeout: 3 * time.Second,
+			}
+
+			err = server.ListenAndServe()
+			if err != nil {
+				oktetoLog.Infof("reverse server %d failed: %s", local, err.Error())
+			}
 		}()
 	}
 
@@ -207,7 +244,7 @@ func callForwards(fm *ForwardManager) error {
 		}
 
 		defer r.Body.Close()
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			return fmt.Errorf("%s failed to read response: %w", f.String(), err)
 		}
@@ -235,7 +272,7 @@ func callReverseForwards(fm *ForwardManager) error {
 		}
 
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return fmt.Errorf("%s failed to read response: %w", r.String(), err)
 		}
@@ -294,7 +331,7 @@ func (fm *ForwardManager) waitForwardsDisconnected() error {
 		disconnected := true
 		for _, f := range fm.forwards {
 			if f.connected() {
-				log.Infof("%s is still connected", f)
+				oktetoLog.Infof("%s is still connected", f)
 				disconnected = false
 			}
 		}
@@ -310,23 +347,23 @@ func (fm *ForwardManager) waitForwardsDisconnected() error {
 func TestAdd(t *testing.T) {
 
 	pf := NewForwardManager(context.Background(), "0.0.0.0:22000", "0.0.0.0", "0.0.0.0", nil, "")
-	if err := pf.Add(model.Forward{Local: 10010, Remote: 1010}); err != nil {
+	if err := pf.Add(forwardModel.Forward{Local: 10010, Remote: 1010}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := pf.Add(model.Forward{Local: 10011, Remote: 1011}); err != nil {
+	if err := pf.Add(forwardModel.Forward{Local: 10011, Remote: 1011}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := pf.Add(model.Forward{Local: 10010, Remote: 1011}); err == nil {
+	if err := pf.Add(forwardModel.Forward{Local: 10010, Remote: 1011}); err == nil {
 		t.Fatal("duplicated local port didn't return an error")
 	}
 
-	if err := pf.Add(model.Forward{Local: 10012, Remote: 15123, Service: true, ServiceName: "svc"}); err != nil {
+	if err := pf.Add(forwardModel.Forward{Local: 10012, Remote: 15123, Service: true, ServiceName: "svc"}); err != nil {
 		t.Fatal(err)
 	}
 
 	if pf.forwards[10012].remoteAddress != "svc:15123" {
-		t.Fatalf("expected 'svc:15123', got '%s'", pf.forwards[1012].remoteAddress)
+		t.Fatalf("expected 'svc:15123', got '%s'", pf.forwards[10012].remoteAddress)
 	}
 }

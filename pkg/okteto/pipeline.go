@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,101 +15,470 @@ package okteto
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+	"time"
 
-	"github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/config"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/types"
+	"github.com/shurcooL/graphql"
 )
 
-// DeployPipelineBody top body answer
-type DeployPipelineBody struct {
-	PipelineRun PipelineRun `json:"createSpace"`
-}
+var (
+	ErrDeployPipelineLabelsFeatureNotSupported = oktetoErrors.UserError{
+		E: errors.New(`deploying a pipeline with labels requires a more recent version of Okteto.
 
-// SpaceBody top body answer
-type SpaceBody struct {
-	Space Space `json:"space"`
-}
-
-// DestroyPipelineBody top body answer
-type DestroyPipelineBody struct {
-	PipelineRun PipelineRun `json:"deleteSpace"`
-}
-
-//PipelineRun represents an Okteto pipeline status
-type PipelineRun struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
-}
-
-// Space represents the contents of an Okteto Cloud space
-type Space struct {
-	GitDeploys []PipelineRun `json:"gitDeploys"`
-}
-
-// DeployPipeline creates a pipeline
-func DeployPipeline(ctx context.Context, name, namespace, repository, branch string) (string, error) {
-	q := fmt.Sprintf(`mutation{
-		deployGitRepository(name: "%s", repository: "%s", space: "%s", branch: "%s"){
-			id,status
-		},
-	}`, name, repository, namespace, branch)
-
-	var body DeployPipelineBody
-	if err := query(ctx, q, &body); err != nil {
-		return "", err
+		Consider removing the "--label" flag, or please upgrade to the latest version`),
+		Hint: "For more information and upgrade instructions, please visit our docs at https://www.okteto.com/docs or contact your system administrator.",
 	}
+)
 
-	return body.PipelineRun.Status, nil
+type pipelineClient struct {
+	client        graphqlClientInterface
+	provideTicker func(time.Duration) *time.Ticker
+	provideTimer  func(time.Duration) *time.Timer
+	url           string
 }
 
-// GetPipelineByName creates a namespace
-func GetPipelineByName(ctx context.Context, name, namespace string) (*PipelineRun, error) {
-	q := fmt.Sprintf(`query{
-		space(id: "%s"){
-			gitDeploys{
-				id,name,status
+func newPipelineClient(client graphqlClientInterface, url string) *pipelineClient {
+	return &pipelineClient{
+		client:        client,
+		url:           url,
+		provideTicker: time.NewTicker,
+		provideTimer:  time.NewTimer,
+	}
+}
+
+type deployPipelineMutation struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, source: $source)"`
+}
+
+type deployPipelineMutationWithRedeployDependencies struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, dependencies: $dependencies, isDependency: $isDependency, source: $source)"`
+}
+
+type deployPipelineMutationWithLabels struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, labels: $labels, source: $source)"`
+}
+
+type deployPipelineMutationWithLabelsWithRedeployDependencies struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, dependencies: $dependencies, labels: $labels, isDependency: $isDependency, source: $source)"`
+}
+
+type deployPipelineMutationWithWorkflowID struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, workflowId: $workflowId, source: $source)"`
+}
+
+type deployPipelineMutationWithRedeployDependenciesAndWorkflowID struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, dependencies: $dependencies, isDependency: $isDependency, workflowId: $workflowId, source: $source)"`
+}
+
+type deployPipelineMutationWithLabelsAndWorkflowID struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, labels: $labels, workflowId: $workflowId, source: $source)"`
+}
+
+type deployPipelineMutationWithLabelsWithRedeployDependenciesAndWorkflowID struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, dependencies: $dependencies, labels: $labels, isDependency: $isDependency, workflowId: $workflowId, source: $source)"`
+}
+
+type deployPipelineMutationWithRedeployDependenciesWorkflowIDAndParentWorkflowID struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, dependencies: $dependencies, isDependency: $isDependency, workflowId: $workflowId, parentWorkflowId: $parentWorkflowId, source: $source)"`
+}
+
+type deployPipelineMutationWithLabelsRedeployDependenciesWorkflowIDAndParentWorkflowID struct {
+	Response deployPipelineResponse `graphql:"deployGitRepository(name: $name, repository: $repository, space: $space, branch: $branch, variables: $variables, filename: $filename, dependencies: $dependencies, labels: $labels, isDependency: $isDependency, workflowId: $workflowId, parentWorkflowId: $parentWorkflowId, source: $source)"`
+}
+
+type getPipelineByNameQuery struct {
+	Response getPipelineByNameResponse `graphql:"space(id: $id)"`
+}
+
+type destroyPipelineMutation struct {
+	Response destroyPipelineResponse `graphql:"destroyGitRepository(name: $name, space: $space, destroyVolumes: $destroyVolumes)"`
+}
+
+type destroyPipelineDependenciesMutation struct {
+	Response destroyPipelineResponse `graphql:"destroyGitRepository(name: $name, space: $space, destroyVolumes: $destroyVolumes, dependencies: $dependencies, isDependency: $isDependency)"`
+}
+
+type getPipelineResources struct {
+	Response previewResourcesStatus `graphql:"space(id: $id)"`
+}
+
+type deployPipelineResponse struct {
+	Action    actionStruct
+	GitDeploy gitDeployInfoWithRepoInfo
+}
+
+type gitDeployInfoWithRepoInfo struct {
+	Id         graphql.String
+	Name       graphql.String
+	Status     graphql.String
+	Repository graphql.String
+}
+
+type getPipelineByNameResponse struct {
+	GitDeploys []gitDeployInfoIdNameStatus
+}
+
+type gitDeployInfoIdNameStatus struct {
+	Id     graphql.String
+	Name   graphql.String
+	Status graphql.String
+}
+
+type destroyPipelineResponse struct {
+	Action    actionStruct
+	GitDeploy gitDeployInfoWithRepoInfo
+}
+
+// Deploy creates a pipeline
+func (c *pipelineClient) Deploy(ctx context.Context, opts types.PipelineDeployOptions) (*types.GitDeployResponse, error) {
+	oktetoLog.Infof("deploying pipeline '%s' mutation on %s", opts.Name, opts.Namespace)
+
+	mutationVariables := c.getDeployVariables(opts)
+	mutationVariables["workflowId"] = graphql.String(opts.WorkflowID)
+	oktetoLog.Infof("deploying pipeline with variables: %v", mutationVariables)
+
+	// Only pipelines deployed as a dependency have a parent. When there is none, skip
+	// the parentWorkflowId argument entirely instead of sending an empty value.
+	if opts.ParentWorkflowID == "" {
+		return c.deployWithoutParent(ctx, opts, mutationVariables)
+	}
+	mutationVariables["parentWorkflowId"] = graphql.String(opts.ParentWorkflowID)
+
+	var response deployPipelineResponse
+	var err error
+	if len(opts.Labels) == 0 {
+		mutationStruct := &deployPipelineMutationWithRedeployDependenciesWorkflowIDAndParentWorkflowID{}
+		err = mutate(ctx, mutationStruct, mutationVariables, c.client)
+		if err != nil {
+			if !isAnyUnknownArgErr(err) {
+				return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
 			}
-		},
-	}`, namespace)
-
-	var body SpaceBody
-	if err := query(ctx, q, &body); err != nil {
-		return nil, err
+			delete(mutationVariables, "parentWorkflowId")
+			return c.deployWithoutParent(ctx, opts, mutationVariables)
+		}
+		response = mutationStruct.Response
+	} else {
+		mutationStruct := &deployPipelineMutationWithLabelsRedeployDependenciesWorkflowIDAndParentWorkflowID{}
+		err = mutate(ctx, mutationStruct, mutationVariables, c.client)
+		if err != nil {
+			if !isAnyUnknownArgErr(err) {
+				return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+			}
+			delete(mutationVariables, "parentWorkflowId")
+			return c.deployWithoutParent(ctx, opts, mutationVariables)
+		}
+		response = mutationStruct.Response
 	}
 
-	for _, g := range body.Space.GitDeploys {
-		if g.Name == name {
-			return &g, nil
+	gitDeployResponse := &types.GitDeployResponse{
+		Action: &types.Action{
+			ID:     string(response.Action.Id),
+			Name:   string(response.Action.Name),
+			Status: string(response.Action.Status),
+		},
+		GitDeploy: &types.GitDeploy{
+			ID:         string(response.GitDeploy.Id),
+			Name:       string(response.GitDeploy.Name),
+			Repository: string(response.GitDeploy.Repository),
+			Status:     string(response.GitDeploy.Status),
+		},
+	}
+	return gitDeployResponse, nil
+}
+
+// deployWithoutParent runs the legacy deploy mutation ladder (without parentWorkflowId),
+// falling back to older mutation variants when the backend does not support newer arguments.
+func (c *pipelineClient) deployWithoutParent(ctx context.Context, opts types.PipelineDeployOptions, mutationVariables map[string]interface{}) (*types.GitDeployResponse, error) {
+	var response deployPipelineResponse
+	if len(opts.Labels) == 0 {
+		mutationStruct := &deployPipelineMutationWithRedeployDependenciesAndWorkflowID{}
+		err := mutate(ctx, mutationStruct, mutationVariables, c.client)
+		if err != nil {
+			oktetoLog.Infof("deploy pipeline error: %s", err)
+			if isUnknownArgErr(err, "workflowId") {
+				delete(mutationVariables, "workflowId")
+				legacyMutation := &deployPipelineMutationWithRedeployDependencies{}
+				err = mutate(ctx, legacyMutation, mutationVariables, c.client)
+				if err != nil {
+					if isUnknownArgErr(err, "dependencies") {
+						delete(mutationVariables, "dependencies")
+						delete(mutationVariables, "isDependency")
+						basicMutation := &deployPipelineMutation{}
+						err = mutate(ctx, basicMutation, mutationVariables, c.client)
+						if err != nil {
+							return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+						}
+						response = basicMutation.Response
+					} else {
+						return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+					}
+				} else {
+					response = legacyMutation.Response
+				}
+			} else if isUnknownArgErr(err, "dependencies") {
+				delete(mutationVariables, "dependencies")
+				delete(mutationVariables, "isDependency")
+				mutationWithWID := &deployPipelineMutationWithWorkflowID{}
+				err = mutate(ctx, mutationWithWID, mutationVariables, c.client)
+				if err != nil {
+					if isUnknownArgErr(err, "workflowId") {
+						delete(mutationVariables, "workflowId")
+						basicMutation := &deployPipelineMutation{}
+						err = mutate(ctx, basicMutation, mutationVariables, c.client)
+						if err != nil {
+							return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+						}
+						response = basicMutation.Response
+					} else {
+						return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+					}
+				} else {
+					response = mutationWithWID.Response
+				}
+			} else {
+				return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+			}
+		} else {
+			response = mutationStruct.Response
+		}
+	} else {
+		mutationStruct := &deployPipelineMutationWithLabelsWithRedeployDependenciesAndWorkflowID{}
+		err := mutate(ctx, mutationStruct, mutationVariables, c.client)
+		if err != nil {
+			if isUnknownArgErr(err, "workflowId") {
+				delete(mutationVariables, "workflowId")
+				legacyMutation := &deployPipelineMutationWithLabelsWithRedeployDependencies{}
+				err = mutate(ctx, legacyMutation, mutationVariables, c.client)
+				if err != nil {
+					if isUnknownArgErr(err, "labels") {
+						return nil, oktetoErrors.UserError{E: ErrDeployPipelineLabelsFeatureNotSupported, Hint: "Please upgrade to the latest version or ask your administrator"}
+					}
+					if isUnknownArgErr(err, "dependencies") {
+						delete(mutationVariables, "dependencies")
+						delete(mutationVariables, "isDependency")
+						mutationWithLabels := &deployPipelineMutationWithLabels{}
+						err = mutate(ctx, mutationWithLabels, mutationVariables, c.client)
+						if err != nil {
+							return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+						}
+						response = mutationWithLabels.Response
+					} else {
+						return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+					}
+				} else {
+					response = legacyMutation.Response
+				}
+			} else if isUnknownArgErr(err, "labels") {
+				return nil, oktetoErrors.UserError{E: ErrDeployPipelineLabelsFeatureNotSupported, Hint: "Please upgrade to the latest version or ask your administrator"}
+			} else if isUnknownArgErr(err, "dependencies") {
+				delete(mutationVariables, "dependencies")
+				delete(mutationVariables, "isDependency")
+				mutationWithLabelsAndWID := &deployPipelineMutationWithLabelsAndWorkflowID{}
+				err = mutate(ctx, mutationWithLabelsAndWID, mutationVariables, c.client)
+				if err != nil {
+					if isUnknownArgErr(err, "workflowId") {
+						delete(mutationVariables, "workflowId")
+						mutationWithLabels := &deployPipelineMutationWithLabels{}
+						err = mutate(ctx, mutationWithLabels, mutationVariables, c.client)
+						if err != nil {
+							return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+						}
+						response = mutationWithLabels.Response
+					} else {
+						return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+					}
+				} else {
+					response = mutationWithLabelsAndWID.Response
+				}
+			} else {
+				return nil, fmt.Errorf("failed to deploy pipeline: %w", err)
+			}
+		} else {
+			response = mutationStruct.Response
 		}
 	}
 
-	return nil, fmt.Errorf("pipeline '%s' doesn't exist in namespace '%s'", name, namespace)
+	gitDeployResponse := &types.GitDeployResponse{
+		Action: &types.Action{
+			ID:     string(response.Action.Id),
+			Name:   string(response.Action.Name),
+			Status: string(response.Action.Status),
+		},
+		GitDeploy: &types.GitDeploy{
+			ID:         string(response.GitDeploy.Id),
+			Name:       string(response.GitDeploy.Name),
+			Repository: string(response.GitDeploy.Repository),
+			Status:     string(response.GitDeploy.Status),
+		},
+	}
+	return gitDeployResponse, nil
 }
 
-// DeletePipeline deletes a pipeline
-func DeletePipeline(ctx context.Context, name, namespace string, destroyVolumes bool) (string, error) {
-	log.Infof("delete pipeline: %s/%s", namespace, name)
-	q := ""
-	if destroyVolumes {
-		q = fmt.Sprintf(`mutation{
-			destroyGitRepository(name: "%s", space: "%s", destroyVolumes: %t){
-				id,status
-			},
-		}`, name, namespace, destroyVolumes)
-	} else {
-		q = fmt.Sprintf(`mutation{
-			destroyGitRepository(name: "%s", space: "%s"){
-				id,status
-			},
-		}`, name, namespace)
+func (c *pipelineClient) getDeployVariables(opts types.PipelineDeployOptions) map[string]interface{} {
+	variablesVariable := make([]InputVariable, 0)
+	for _, v := range opts.Variables {
+		variablesVariable = append(variablesVariable, InputVariable{
+			Name:  graphql.String(v.Name),
+			Value: graphql.String(v.Value),
+		})
+	}
+	injectOrigin := true
+	for _, v := range variablesVariable {
+		if v.Name == "OKTETO_ORIGIN" {
+			injectOrigin = false
+		}
+	}
+	if injectOrigin {
+		origin := config.GetDeployOrigin()
+		variablesVariable = append(variablesVariable, InputVariable{
+			Name:  graphql.String("OKTETO_ORIGIN"),
+			Value: graphql.String(origin),
+		})
+	}
+	vars := map[string]interface{}{
+		"name":         graphql.String(opts.Name),
+		"space":        graphql.String(opts.Namespace),
+		"repository":   graphql.String(opts.Repository),
+		"branch":       graphql.String(opts.Branch),
+		"variables":    variablesVariable,
+		"filename":     graphql.String(opts.Filename),
+		"dependencies": graphql.Boolean(opts.RedeployDependencies),
+		"isDependency": graphql.Boolean(opts.IsDependency),
+		"source":       graphql.String(cliSource),
 	}
 
-	var body DeployPipelineBody
-	if err := query(ctx, q, &body); err != nil {
-		return "", err
+	if len(opts.Labels) > 0 {
+		labelsVariable := make(labelList, 0)
+		for _, l := range opts.Labels {
+			labelsVariable = append(labelsVariable, graphql.String(l))
+		}
+		vars["labels"] = labelsVariable
+	}
+	return vars
+}
+
+// GetByName gets a pipeline given its name
+func (c *pipelineClient) GetByName(ctx context.Context, name, namespace string) (*types.GitDeploy, error) {
+	oktetoLog.Infof("getting pipeline '%s' in namespace '%s'", name, namespace)
+	var queryStruct getPipelineByNameQuery
+	variables := map[string]interface{}{
+		"id": graphql.String(namespace),
+	}
+	err := query(ctx, &queryStruct, variables, c.client)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pipeline: %w", err)
 	}
 
-	log.Infof("deleted pipeline: %+v", body.PipelineRun.Status)
-	return body.PipelineRun.Status, nil
+	for _, gitDeploy := range queryStruct.Response.GitDeploys {
+		if string(gitDeploy.Name) == name {
+			return &types.GitDeploy{
+				ID:     string(gitDeploy.Id),
+				Name:   string(gitDeploy.Name),
+				Status: string(gitDeploy.Status),
+			}, nil
+		}
+	}
+	return nil, oktetoErrors.ErrNotFound
+}
+
+// Destroy destroys a pipeline
+func (c *pipelineClient) Destroy(ctx context.Context, name, namespace string, destroyVolumes, destroyDependencies, isDependency bool) (*types.GitDeployResponse, error) {
+	oktetoLog.Infof("destroy pipeline: %s/%s", namespace, name)
+	gitDeployResponse := &types.GitDeployResponse{}
+	var mutation destroyPipelineDependenciesMutation
+	var response destroyPipelineResponse
+	queryVariables := map[string]interface{}{
+		"name":           graphql.String(name),
+		"space":          graphql.String(namespace),
+		"destroyVolumes": graphql.Boolean(destroyVolumes),
+		"dependencies":   graphql.Boolean(destroyDependencies),
+		"isDependency":   graphql.Boolean(isDependency),
+	}
+	err := mutate(ctx, &mutation, queryVariables, c.client)
+	response = mutation.Response
+	if err != nil {
+		if isUnknownArgErr(err, "dependencies") {
+			mutationWithoutDependencies := &destroyPipelineMutation{}
+			delete(queryVariables, "dependencies")
+			delete(queryVariables, "isDependency")
+			err = mutate(ctx, mutationWithoutDependencies, queryVariables, c.client)
+			if err != nil {
+				return nil, fmt.Errorf("failed to destroy pipeline: %w", err)
+			}
+			response = mutationWithoutDependencies.Response
+		} else {
+			return nil, fmt.Errorf("failed to destroy pipeline: %w", err)
+		}
+	}
+	gitDeployResponse.Action = &types.Action{
+		ID:     string(response.Action.Id),
+		Name:   string(response.Action.Name),
+		Status: string(response.Action.Status),
+	}
+	gitDeployResponse.GitDeploy = &types.GitDeploy{
+		ID:         string(response.GitDeploy.Id),
+		Name:       string(response.GitDeploy.Name),
+		Repository: string(response.GitDeploy.Repository),
+		Status:     string(response.GitDeploy.Status),
+	}
+	oktetoLog.Infof("destroy pipeline: %+v", gitDeployResponse.GitDeploy.Status)
+	return gitDeployResponse, nil
+}
+
+// GetResourcesStatus returns the status of deployments statefulsets and jobs
+func (c *pipelineClient) GetResourcesStatus(ctx context.Context, name, namespace string) (map[string]string, error) {
+	oktetoLog.Infof("get resource status started for pipeline: %s/%s", namespace, name)
+	var queryStruct getPipelineResources
+	variables := map[string]interface{}{
+		"id": graphql.String(namespace),
+	}
+
+	if err := query(ctx, &queryStruct, variables, c.client); err != nil {
+		if oktetoErrors.IsNotFound(err) {
+			okClient, err := NewOktetoClientFromUrlAndToken(c.url, GetContext().Token)
+			if err != nil {
+				return nil, err
+			}
+			return okClient.Previews().GetResourcesStatus(ctx, namespace, name)
+		}
+		return nil, fmt.Errorf("failed to get resources status: %w", err)
+	}
+
+	status := make(map[string]string)
+	for _, d := range queryStruct.Response.Deployments {
+		if string(d.DeployedBy) == name {
+			resourceName := getResourceFullName(Deployment, string(d.Name))
+			status[resourceName] = string(d.Status)
+
+		}
+	}
+	for _, sfs := range queryStruct.Response.Statefulsets {
+		if string(sfs.DeployedBy) == name {
+			resourceName := getResourceFullName(StatefulSet, string(sfs.Name))
+			status[resourceName] = string(sfs.Status)
+		}
+	}
+	for _, j := range queryStruct.Response.Jobs {
+		if string(j.DeployedBy) == name {
+			resourceName := getResourceFullName(Job, string(j.Name))
+			status[resourceName] = string(j.Status)
+		}
+	}
+	for _, cj := range queryStruct.Response.Cronjobs {
+		if string(cj.DeployedBy) == name {
+			resourceName := getResourceFullName(CronJob, string(cj.Name))
+			status[resourceName] = string(cj.Status)
+		}
+	}
+	return status, nil
+}
+
+func getResourceFullName(kind, name string) string {
+	return strings.ToLower(fmt.Sprintf("%s/%s", kind, name))
 }

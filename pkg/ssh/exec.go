@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,7 +15,6 @@ package ssh
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,29 +22,30 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alessio/shellescape"
+	"al.essio.dev/pkg/shellescape"
 	dockerterm "github.com/moby/term"
-	okErrors "github.com/okteto/okteto/pkg/errors"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/model"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 // Exec executes the command over SSH
 func Exec(ctx context.Context, iface string, remotePort int, tty bool, inR io.Reader, outW, errW io.Writer, command []string) error {
 	sshConfig, err := getSSHClientConfig()
 	if err != nil {
-		return fmt.Errorf("failed to get SSH configuration: %s", err)
+		return fmt.Errorf("failed to get SSH configuration: %w", err)
 	}
 
-	//dockerterm.StdStreams() configures the terminal on windows
+	// dockerterm.StdStreams() configures the terminal on windows
 	dockerterm.StdStreams()
 
 	var connection *ssh.Client
 	t := time.NewTicker(100 * time.Millisecond)
 	for i := 0; i < 100; i++ {
-		connection, err = dial(ctx, "tcp", fmt.Sprintf("%s:%d", iface, remotePort), sshConfig)
+		connection, err = dial(ctx, "tcp", net.JoinHostPort(iface, fmt.Sprintf("%d", remotePort)), sshConfig)
 		if err == nil {
 			break
 		}
@@ -54,28 +54,34 @@ func Exec(ctx context.Context, iface string, remotePort int, tty bool, inR io.Re
 	}
 
 	if err != nil {
-		return fmt.Errorf("failed to connect to SSH server: %s", err)
+		return fmt.Errorf("failed to connect to SSH server: %w", err)
 	}
-
-	defer connection.Close()
+	defer func() {
+		if err := connection.Close(); err != nil {
+			oktetoLog.Debugf("Error closing connection %s: %v", connection.SessionID(), err)
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		if connection != nil {
 			if err := connection.Close(); err != nil {
-				if !okErrors.IsClosedNetwork(err) {
-					log.Infof("failed to close ssh client for exec: %s", err)
+				if !oktetoErrors.IsClosedNetwork(err) {
+					oktetoLog.Infof("failed to close ssh client for exec: %s", err)
 				}
 			}
 		}
-		log.Infof("ssh client for exec closed")
+		oktetoLog.Infof("ssh client for exec closed")
 	}()
 
 	session, err := connection.NewSession()
 	if err != nil {
-		return fmt.Errorf("failed to create SSH session: %s", err)
+		return fmt.Errorf("failed to create SSH session: %w", err)
 	}
-
-	defer session.Close()
+	defer func() {
+		if err := session.Close(); err != nil {
+			oktetoLog.Debugf("Error closing session: %s", err)
+		}
+	}()
 
 	if tty {
 		modes := ssh.TerminalModes{
@@ -90,16 +96,16 @@ func Exec(ctx context.Context, iface string, remotePort int, tty bool, inR io.Re
 		var termFD int
 		var ok bool
 		if termFD, ok = isTerminal(inR); ok {
-			width, height, err = terminal.GetSize(int(os.Stdout.Fd()))
-			log.Infof("terminal width %d height %d", width, height)
+			width, height, err = term.GetSize(int(os.Stdout.Fd()))
+			oktetoLog.Infof("terminal width %d height %d", width, height)
 			if err != nil {
-				log.Infof("request for terminal size failed: %s", err)
+				oktetoLog.Infof("request for terminal size failed: %s", err)
 			}
 		}
 
-		state, err := terminal.MakeRaw(termFD)
+		state, err := term.MakeRaw(termFD)
 		if err != nil {
-			log.Infof("request for raw terminal failed: %s", err)
+			oktetoLog.Infof("request for raw terminal failed: %s", err)
 		}
 
 		defer func() {
@@ -107,79 +113,76 @@ func Exec(ctx context.Context, iface string, remotePort int, tty bool, inR io.Re
 				return
 			}
 
-			if err := terminal.Restore(termFD, state); err != nil {
-				log.Infof("failed to restore terminal: %s", err)
+			if err := term.Restore(termFD, state); err != nil {
+				oktetoLog.Infof("failed to restore terminal: %s", err)
 			}
 
-			log.Infof("terminal restored")
+			oktetoLog.Infof("terminal restored")
 		}()
 
 		if err := session.RequestPty("xterm-256color", height, width, modes); err != nil {
-			return fmt.Errorf("request for pseudo terminal failed: %s", err)
+			return fmt.Errorf("request for pseudo terminal failed: %w", err)
 		}
 	}
 
-	sockEnvVar, ok := os.LookupEnv("SSH_AUTH_SOCK")
+	sockEnvVar, ok := os.LookupEnv(model.SshAuthSockEnvVar)
 	if !ok {
-		log.Info("SSH_AUTH_SOCK is not set, not forwarding socket")
+		oktetoLog.Info("SSH_AUTH_SOCK is not set, not forwarding socket")
 	} else {
 		if err := agent.ForwardToRemote(connection, sockEnvVar); err != nil {
-			log.Infof("failed to existing SSH_AUTH_SOCK('%s'): %s", sockEnvVar, err)
+			oktetoLog.Infof("failed to forward to existing SSH_AUTH_SOCK('%s'): %s", sockEnvVar, err)
 		}
 		if err := agent.RequestAgentForwarding(session); err != nil {
-			log.Infof("failed to forward ssh agent to remote: %s", err)
+			oktetoLog.Infof("failed to forward ssh agent to remote: %s", err)
 		}
 	}
 
 	stdin, err := session.StdinPipe()
 	if err != nil {
-		return fmt.Errorf("unable to setup stdin for session: %v", err)
+		return fmt.Errorf("unable to setup stdin for session: %w", err)
 	}
-	go func() {
-		if _, err = io.Copy(stdin, inR); err != nil {
-			if !errors.Is(err, io.EOF) {
-				log.Infof("error while reading from stdIn: %s", err)
-			}
-		}
-	}()
+	Copy(inR, stdin)
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("unable to setup stdout for session: %v", err)
+		return fmt.Errorf("unable to setup stdout for session: %w", err)
 	}
 
 	go func() {
 		if _, err := io.Copy(outW, stdout); err != nil {
-			log.Infof("error while writing to stdOut: %s", err)
+			oktetoLog.Infof("error while writing to stdOut: %s", err)
 		}
 	}()
 
 	stderr, err := session.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("unable to setup stderr for session: %v", err)
+		return fmt.Errorf("unable to setup stderr for session: %w", err)
 	}
 
 	go func() {
 		if _, err := io.Copy(errW, stderr); err != nil {
-			log.Infof("error while writing to stdOut: %s", err)
+			oktetoLog.Infof("error while writing to stdErr: %s", err)
 		}
 	}()
 
+	resizeWindow(session)
+
 	cmd := shellescape.QuoteCommand(command)
-	log.Infof("executing command over ssh: '%s'", cmd)
+	oktetoLog.Infof("executing command over ssh: '%s'", cmd)
 	err = session.Run(cmd)
 	if err == nil {
 		return nil
 	}
+	oktetoLog.Println()
 	if strings.Contains(err.Error(), "status 130") || strings.Contains(err.Error(), "4294967295") {
 		return nil
 	}
 	if strings.Contains(err.Error(), "exit code 137") || strings.Contains(err.Error(), "exit status 137") {
-		log.Yellow(`Insufficient memory. Please update your resources on your okteto manifest.
-More information is available here: https://okteto.com/docs/reference/manifest#resources-object-optional`)
+		oktetoLog.Yellow(`Insufficient memory. Please update your resources on your okteto manifest.
+More information is available here: https://okteto.com/docs/reference/okteto-manifest/#resources-object-optional`)
 	}
 
-	log.Infof("command failed: %s", err)
+	oktetoLog.Infof("command failed: %s", err)
 
 	return err
 }
@@ -187,7 +190,7 @@ More information is available here: https://okteto.com/docs/reference/manifest#r
 func isTerminal(r io.Reader) (int, bool) {
 	switch v := r.(type) {
 	case *os.File:
-		return int(v.Fd()), terminal.IsTerminal(int(v.Fd()))
+		return int(v.Fd()), term.IsTerminal(int(v.Fd()))
 	default:
 		return 0, false
 	}

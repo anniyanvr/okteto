@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/Masterminds/semver/v3"
+	"github.com/okteto/okteto/pkg/model"
 )
 
 func TestInstall(t *testing.T) {
@@ -121,9 +122,9 @@ func Test_getBinaryPathInDownload(t *testing.T) {
 
 func Test_parseVersionFromOutput(t *testing.T) {
 	tests := []struct {
+		want    *semver.Version
 		name    string
 		output  []byte
-		want    *semver.Version
 		wantErr bool
 	}{
 		{
@@ -190,22 +191,16 @@ func TestGetMinimumVersion(t *testing.T) {
 		},
 	}
 
-	env := os.Getenv(syncthingVersionEnvVar)
-	if err := os.Setenv(syncthingVersionEnvVar, ""); err != nil {
-		t.Fatal(err)
-	}
+	env := os.Getenv(model.SyncthingVersionEnvVar)
+	t.Setenv(model.SyncthingVersionEnvVar, "")
 
 	defer func() {
-		if err := os.Setenv(syncthingVersionEnvVar, env); err != nil {
-			t.Fatal(err)
-		}
+		t.Setenv(model.SyncthingVersionEnvVar, env)
 	}()
 
 	for _, tt := range tests {
 		t.Run(tt.version, func(t *testing.T) {
-			if err := os.Setenv(syncthingVersionEnvVar, tt.version); err != nil {
-				t.Fatal(err)
-			}
+			t.Setenv(model.SyncthingVersionEnvVar, tt.version)
 			got := GetMinimumVersion()
 			if got.String() != tt.expected {
 				t.Errorf("got %s, expected %s", got.String(), tt.expected)

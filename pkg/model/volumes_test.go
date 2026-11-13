@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,19 +17,23 @@ import (
 	"reflect"
 	"runtime"
 	"testing"
+
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/sirupsen/logrus"
+	apiv1 "k8s.io/api/core/v1"
 )
 
 func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 	tests := []struct {
-		name    string
 		dev     *Dev
 		result  *Dev
+		name    string
 		wantErr bool
 	}{
 		{
 			name: "none",
 			dev: &Dev{
-				WorkDir: "",
+				Workdir: "",
 				Volumes: []Volume{},
 				Sync: Sync{
 					Folders: []SyncFolder{},
@@ -37,7 +41,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 			},
 			result: &Dev{
 				Volumes: []Volume{},
-				WorkDir: "/okteto",
+				Workdir: "/okteto",
 				Sync: Sync{
 					Folders: []SyncFolder{
 						{
@@ -52,7 +56,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 		{
 			name: "workdir",
 			dev: &Dev{
-				WorkDir: "/workdir",
+				Workdir: "/workdir",
 				Volumes: []Volume{},
 				Sync: Sync{
 					Folders: []SyncFolder{},
@@ -72,54 +76,9 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "mountpath",
-			dev: &Dev{
-				MountPath: "/mountpath",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "workdir-and-mountpath",
-			dev: &Dev{
-				WorkDir:   "/workdir",
-				MountPath: "/mountpath",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
 			name: "workdir-syncs",
 			dev: &Dev{
-				WorkDir: "/workdir",
+				Workdir: "/workdir",
 				Volumes: []Volume{},
 				Sync: Sync{
 					Folders: []SyncFolder{
@@ -137,279 +96,6 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 						{
 							LocalPath:  "local",
 							RemotePath: "remote",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "mountpath-syncs",
-			dev: &Dev{
-				MountPath: "/mountpath",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local",
-							RemotePath: "remote",
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local",
-							RemotePath: "remote",
-						},
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "workdir-and-mountpath-syncs",
-			dev: &Dev{
-				WorkDir:   "/workdir",
-				MountPath: "/mountpath",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local",
-							RemotePath: "remote",
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local",
-							RemotePath: "remote",
-						},
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "volumes-to-syncs",
-			dev: &Dev{
-				WorkDir:   "/workdir",
-				MountPath: "/mountpath",
-				Volumes: []Volume{
-					{
-						LocalPath:  "/local",
-						RemotePath: "/remote",
-					},
-				},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath",
-						},
-						{
-							LocalPath:  "/local",
-							RemotePath: "/remote",
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-workdir",
-			dev: &Dev{
-				WorkDir: "/workdir1",
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-				Services: []*Dev{
-					{
-						WorkDir: "/workdir2",
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/workdir1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  ".",
-									RemotePath: "/workdir2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-workdir-subpath",
-			dev: &Dev{
-				WorkDir: "/workdir1",
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-				Services: []*Dev{
-					{
-						WorkDir: "/workdir2",
-						SubPath: "subpath",
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/workdir1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "subpath",
-									RemotePath: "/workdir2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-mountpath",
-			dev: &Dev{
-				MountPath: "/mountpath1",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-				Services: []*Dev{
-					{
-						MountPath: "/mountpath2",
-						Volumes:   []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  ".",
-									RemotePath: "/mountpath2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-mountpath-subpath",
-			dev: &Dev{
-				MountPath: "/mountpath1",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-				Services: []*Dev{
-					{
-						MountPath: "/mountpath2",
-						SubPath:   "subpath",
-						Volumes:   []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "subpath",
-									RemotePath: "/mountpath2",
-								},
-							},
 						},
 					},
 				},
@@ -419,7 +105,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 		{
 			name: "services-workdir-error",
 			dev: &Dev{
-				WorkDir: "/workdir1",
+				Workdir: "/workdir1",
 				Sync: Sync{
 					Folders: []SyncFolder{
 						{
@@ -430,28 +116,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 				},
 				Services: []*Dev{
 					{
-						WorkDir: "/workdir1",
-					},
-				},
-			},
-			result:  nil,
-			wantErr: true,
-		},
-		{
-			name: "services-mountpath-error",
-			dev: &Dev{
-				WorkDir: "/mountpath1",
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local",
-							RemotePath: "remote",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						MountPath: "/mountpath2",
+						Workdir: "/workdir1",
 					},
 				},
 			},
@@ -461,7 +126,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 		{
 			name: "services-workdir-syncs",
 			dev: &Dev{
-				WorkDir: "/workdir1",
+				Workdir: "/workdir1",
 				Volumes: []Volume{},
 				Sync: Sync{
 					Folders: []SyncFolder{
@@ -473,7 +138,7 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 				},
 				Services: []*Dev{
 					{
-						WorkDir: "/workdir2",
+						Workdir: "/workdir2",
 						Volumes: []Volume{},
 						Sync: Sync{
 							Folders: []SyncFolder{
@@ -504,194 +169,6 @@ func TestDev_translateDeprecatedVolumeFields(t *testing.T) {
 								{
 									LocalPath:  "local2",
 									RemotePath: "remote2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-mountpath-syncs",
-			dev: &Dev{
-				MountPath: "/mountpath1",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local1",
-							RemotePath: "remote1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						MountPath: "/mountpath2",
-						Volumes:   []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "local2",
-									RemotePath: "remote2",
-								},
-							},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local1",
-							RemotePath: "remote1",
-						},
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "local2",
-									RemotePath: "remote2",
-								},
-								{
-									LocalPath:  ".",
-									RemotePath: "/mountpath2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-workdir-and-mountpath-syncs",
-			dev: &Dev{
-				WorkDir:   "/workdir1",
-				MountPath: "/mountpath1",
-				Volumes:   []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local1",
-							RemotePath: "remote1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						WorkDir:   "/workdir2",
-						MountPath: "/mountpath2",
-						Volumes:   []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "local2",
-									RemotePath: "remote2",
-								},
-							},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  "local1",
-							RemotePath: "remote1",
-						},
-						{
-							LocalPath:  ".",
-							RemotePath: "/mountpath1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  "local2",
-									RemotePath: "remote2",
-								},
-								{
-									LocalPath:  ".",
-									RemotePath: "/mountpath2",
-								},
-							},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "services-volumes-to-syncs",
-			dev: &Dev{
-				WorkDir: "/workdir1",
-				Volumes: []Volume{
-					{
-						LocalPath:  "/local1",
-						RemotePath: "/remote1",
-					},
-				},
-				Sync: Sync{
-					Folders: []SyncFolder{},
-				},
-				Services: []*Dev{
-					{
-						WorkDir: "/workdir2",
-						Volumes: []Volume{
-							{
-								LocalPath:  "/local2",
-								RemotePath: "/remote2",
-							},
-						},
-						Sync: Sync{
-							Folders: []SyncFolder{},
-						},
-					},
-				},
-			},
-			result: &Dev{
-				Volumes: []Volume{},
-				Sync: Sync{
-					Folders: []SyncFolder{
-						{
-							LocalPath:  ".",
-							RemotePath: "/workdir1",
-						},
-						{
-							LocalPath:  "/local1",
-							RemotePath: "/remote1",
-						},
-					},
-				},
-				Services: []*Dev{
-					{
-						Volumes: []Volume{},
-						Sync: Sync{
-							Folders: []SyncFolder{
-								{
-									LocalPath:  ".",
-									RemotePath: "/workdir2",
-								},
-								{
-									LocalPath:  "/local2",
-									RemotePath: "/remote2",
 								},
 							},
 						},
@@ -830,7 +307,7 @@ func Test_computeParentSyncFolder(t *testing.T) {
 		result string
 	}{
 		{
-			name: "linux-preffix",
+			name: "linux-prefix",
 			dev: &Dev{
 				Sync: Sync{
 					Folders: []SyncFolder{
@@ -847,7 +324,7 @@ func Test_computeParentSyncFolder(t *testing.T) {
 			result: "/aaa",
 		},
 		{
-			name: "windows-double-preffix",
+			name: "windows-double-prefix",
 			dev: &Dev{
 				Sync: Sync{
 					Folders: []SyncFolder{
@@ -1026,6 +503,7 @@ func Test_getDataSubPath(t *testing.T) {
 }
 
 func Test_getSourceSubPath(t *testing.T) {
+	oktetoLog.Init(logrus.DebugLevel)
 	var tests = []struct {
 		name   string
 		dev    *Dev
@@ -1075,6 +553,27 @@ func Test_getSourceSubPath(t *testing.T) {
 			goos:   "windows",
 			result: "src/func",
 		},
+		{
+			name:   "windows-non-relative",
+			dev:    &Dev{parentSyncFolder: "/code"},
+			path:   "c:\\test\\func",
+			goos:   "windows",
+			result: "test/func",
+		},
+		{
+			name:   "linux-non-relative",
+			dev:    &Dev{parentSyncFolder: "/code"},
+			path:   "/test/func",
+			goos:   "linux",
+			result: "test/func",
+		},
+		{
+			name:   "darwin-non-relative",
+			dev:    &Dev{parentSyncFolder: "/code"},
+			path:   "/test/func",
+			goos:   "darwin",
+			result: "test/func",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1091,8 +590,8 @@ func Test_getSourceSubPath(t *testing.T) {
 
 func Test_validatePersistentVolume(t *testing.T) {
 	var tests = []struct {
-		name    string
 		dev     *Dev
+		name    string
 		wantErr bool
 	}{
 		{
@@ -1195,7 +694,7 @@ func Test_validatePersistentVolume(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.dev.validatePersistentVolume()
 			if err == nil && tt.wantErr {
-				t.Errorf("'%s' did get an expected error", tt.name)
+				t.Errorf("'%s' did not get the expected error", tt.name)
 			}
 			if err != nil && !tt.wantErr {
 				t.Errorf("'%s' got unexpected error: %s", tt.name, err.Error())
@@ -1206,8 +705,8 @@ func Test_validatePersistentVolume(t *testing.T) {
 
 func Test_validateVolumes(t *testing.T) {
 	var tests = []struct {
-		name    string
 		dev     *Dev
+		name    string
 		wantErr bool
 	}{
 		{
@@ -1317,6 +816,214 @@ func Test_validateVolumes(t *testing.T) {
 				if err != nil && !tt.wantErr {
 					t.Errorf("'%s' got unexpected error: %s", tt.name, err.Error())
 				}
+			}
+		})
+	}
+}
+
+func Test_PersistentVolumeEnabled(t *testing.T) {
+	var tests = []struct {
+		dev  *Dev
+		name string
+		want bool
+	}{
+		{
+			name: "nil",
+			dev:  &Dev{},
+			want: true,
+		},
+		{
+			name: "enabled",
+			dev:  &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{Enabled: true}},
+			want: true,
+		},
+		{
+			name: "disabled",
+			dev:  &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{Enabled: false}},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.dev.PersistentVolumeEnabled()
+			if result != tt.want {
+				t.Errorf("'%s' did not get the expected result '%t' vs '%t'", tt.name, tt.want, result)
+			}
+		})
+	}
+}
+
+func Test_PersistentVolumeAccessMode(t *testing.T) {
+	var tests = []struct {
+		name string
+		dev  *Dev
+		want apiv1.PersistentVolumeAccessMode
+	}{
+		{
+			name: "nil",
+			dev:  &Dev{},
+			want: apiv1.ReadWriteOnce,
+		},
+		{
+			name: "empty",
+			dev:  &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{}},
+			want: apiv1.ReadWriteOnce,
+		},
+		{
+			name: "access-mode",
+			dev:  &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{AccessMode: apiv1.ReadWriteMany}},
+			want: apiv1.ReadWriteMany,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.dev.PersistentVolumeAccessMode()
+			if result != tt.want {
+				t.Errorf("'%s' did not get the expected result '%s' vs '%s'", tt.name, tt.want, result)
+			}
+		})
+	}
+}
+
+func Test_PersistentVolumeMode(t *testing.T) {
+	var tests = []struct {
+		name string
+		dev  *Dev
+		want apiv1.PersistentVolumeMode
+	}{
+		{
+			name: "nil",
+			dev:  &Dev{},
+			want: apiv1.PersistentVolumeFilesystem,
+		},
+		{
+			name: "empty",
+			dev:  &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{}},
+			want: apiv1.PersistentVolumeFilesystem,
+		},
+		{
+			name: "volume-mode",
+			dev:  &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{VolumeMode: apiv1.PersistentVolumeBlock}},
+			want: apiv1.PersistentVolumeBlock,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.dev.PersistentVolumeMode()
+			if result != tt.want {
+				t.Errorf("'%s' did not get the expected result '%s' vs '%s'", tt.name, tt.want, result)
+			}
+		})
+	}
+}
+
+func Test_PersistentVolumeAnnotations(t *testing.T) {
+	var tests = []struct {
+		dev  *Dev
+		want Annotations
+		name string
+	}{
+		{
+			name: "nil",
+			dev:  &Dev{},
+			want: nil,
+		},
+		{
+			name: "annotations",
+			dev:  &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{Annotations: Annotations{"a1": "v1"}}},
+			want: Annotations{"a1": "v1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.dev.PersistentVolumeAnnotations()
+			if !reflect.DeepEqual(result, tt.want) {
+				t.Errorf("'%s' did not get the expected result '%v' vs '%v'", tt.name, tt.want, result)
+			}
+		})
+	}
+}
+
+func Test_PersistentVolumeLabels(t *testing.T) {
+	var tests = []struct {
+		dev  *Dev
+		want Labels
+		name string
+	}{
+		{
+			name: "nil",
+			dev:  &Dev{},
+			want: nil,
+		},
+		{
+			name: "labels",
+			dev:  &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{Labels: Labels{"a1": "v1"}}},
+			want: Labels{"a1": "v1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.dev.PersistentVolumeLabels()
+			if !reflect.DeepEqual(result, tt.want) {
+				t.Errorf("'%s' did not get the expected result '%v' vs '%v'", tt.name, tt.want, result)
+			}
+		})
+	}
+}
+
+func Test_PersistentVolumeSize(t *testing.T) {
+	var tests = []struct {
+		name                            string
+		dev                             *Dev
+		devPersistentVolumeSizeEnvValue string
+		want                            string
+	}{
+		{
+			name: "PersistentVolumeInfo nil - default",
+			dev:  &Dev{},
+			want: defaultVolumeSize,
+		},
+		{
+			name: "PersistentVolumeInfo empty - default",
+			dev:  &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{}},
+			want: defaultVolumeSize,
+		},
+		{
+			name: "PersistentVolumeInfo exists - default",
+			dev:  &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{Size: "15Gi"}},
+			want: "15Gi",
+		},
+		{
+			name:                            "PersistentVolumeInfo nil - ENV",
+			dev:                             &Dev{},
+			devPersistentVolumeSizeEnvValue: "6Gi",
+			want:                            "6Gi",
+		},
+		{
+			name:                            "PersistentVolumeInfo empty - ENV",
+			devPersistentVolumeSizeEnvValue: "6Gi",
+			dev:                             &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{}},
+			want:                            "6Gi",
+		},
+		{
+			name:                            "PersistentVolumeInfo exists - ENV",
+			devPersistentVolumeSizeEnvValue: "6Gi",
+			dev:                             &Dev{PersistentVolumeInfo: &PersistentVolumeInfo{Size: "15Gi"}},
+			want:                            "15Gi",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(devPersistentVolumeSizeEnvVar, tt.devPersistentVolumeSizeEnvValue)
+			result := tt.dev.PersistentVolumeSize()
+			if result != tt.want {
+				t.Errorf("'%s' did not get the expected result '%s' vs '%s'", tt.name, tt.want, result)
 			}
 		})
 	}

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,11 +27,27 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 	kexec "k8s.io/kubectl/pkg/cmd/exec"
+	kterm "k8s.io/kubectl/pkg/util/term"
 )
 
+type terminalSizeQueueAdapter struct {
+	delegate kterm.TerminalSizeQueue
+}
+
+func (a *terminalSizeQueueAdapter) Next() *remotecommand.TerminalSize {
+	next := a.delegate.Next()
+	if next == nil {
+		return nil
+	}
+	return &remotecommand.TerminalSize{
+		Width:  next.Width,
+		Height: next.Height,
+	}
+}
+
 // Exec executes the command in the development container
-func Exec(ctx context.Context, c *kubernetes.Clientset, config *rest.Config, podNamespace, podName, container string, tty bool, stdin io.Reader, stdout, stderr io.Writer, command []string) error {
-	//dockerterm.StdStreams() configures the terminal on windows
+func Exec(ctx context.Context, c kubernetes.Interface, config *rest.Config, podNamespace, podName, container string, tty bool, stdin io.Reader, stdout, stderr io.Writer, command []string) error {
+	// dockerterm.StdStreams() configures the terminal on windows
 	dockerterm.StdStreams()
 
 	p := &kexec.ExecOptions{}
@@ -48,9 +64,11 @@ func Exec(ctx context.Context, c *kubernetes.Clientset, config *rest.Config, pod
 	var sizeQueue remotecommand.TerminalSizeQueue
 	if t.Raw {
 		// this call spawns a goroutine to monitor/update the terminal size
-		sizeQueue = t.MonitorSize(t.GetSize())
+		sizeQueue = &terminalSizeQueueAdapter{
+			delegate: t.MonitorSize(t.GetSize()),
+		}
 
-		// unset p.Err if it was previously set because both stdout and stderr go over p.Out when tty is
+		// unset p.ErrOut if it was previously set because both stdout and stderr go over p.Out when tty is
 		// true
 		p.ErrOut = nil
 	}
@@ -73,7 +91,7 @@ func Exec(ctx context.Context, c *kubernetes.Clientset, config *rest.Config, pod
 
 		done := make(chan error, 1)
 		go func() {
-			done <- p.Executor.Execute("POST", req.URL(), config, p.In, p.Out, p.ErrOut, t.Raw, sizeQueue)
+			done <- p.Executor.Execute(req.URL(), config, p.In, p.Out, p.ErrOut, t.Raw, sizeQueue)
 		}()
 
 		select {

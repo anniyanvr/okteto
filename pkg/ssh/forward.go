@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,17 +19,18 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
-	"github.com/okteto/okteto/pkg/errors"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 )
 
 type forward struct {
+	pool          *pool
 	localAddress  string
 	remoteAddress string
-	c             bool
 	lock          sync.Mutex
-	pool          *pool
+	c             bool
 }
 
 func (f *forward) connected() bool {
@@ -53,7 +54,7 @@ func (f *forward) setDisconnected() {
 func (f *forward) start(ctx context.Context) {
 	localListener, err := net.Listen("tcp", f.localAddress)
 	if err != nil {
-		log.Infof("%s -> failed to listen: %s", f.String(), err)
+		oktetoLog.Infof("%s -> failed to listen: %s", f.String(), err)
 		return
 	}
 
@@ -61,22 +62,23 @@ func (f *forward) start(ctx context.Context) {
 		<-ctx.Done()
 		f.setDisconnected()
 		if err := localListener.Close(); err != nil {
-			log.Infof("%s -> failed to close: %s", f.String(), err)
+			oktetoLog.Infof("%s -> failed to close: %s", f.String(), err)
 		}
-		log.Infof("%s -> done", f.String())
+		oktetoLog.Infof("%s -> done", f.String())
 	}()
 
 	f.setConnected()
 
+	tick := time.NewTicker(100 * time.Millisecond)
 	for {
-		log.Infof("%s -> listening for local connections", f.String())
 		localConn, err := localListener.Accept()
 		if err != nil {
 			if !f.connected() {
 				return
 			}
 
-			log.Infof("%s -> failed to accept connection: %v", f.String(), err)
+			oktetoLog.Infof("%s -> failed to accept connection: %v", f.String(), err)
+			<-tick.C
 			continue
 		}
 		go f.handle(localConn)
@@ -85,15 +87,22 @@ func (f *forward) start(ctx context.Context) {
 }
 
 func (f *forward) handle(local net.Conn) {
-	defer local.Close()
+	defer func() {
+		if err := local.Close(); err != nil {
+			oktetoLog.Debugf("Error closing local connection: %s", err)
+		}
+	}()
 
 	remote, err := f.pool.get(f.remoteAddress)
 	if err != nil {
-		log.Infof("%s -> failed to dial remote connection: %s", f.String(), err)
+		oktetoLog.Infof("%s -> failed to dial remote connection: %s", f.String(), err)
 		return
 	}
-
-	defer remote.Close()
+	defer func() {
+		if err := remote.Close(); err != nil {
+			oktetoLog.Debugf("Error closing remote connection: %s", err)
+		}
+	}()
 
 	quit := make(chan struct{}, 1)
 
@@ -110,8 +119,8 @@ func (f *forward) String() string {
 func (f *forward) transfer(from io.Writer, to io.Reader, quit chan struct{}) {
 	_, err := io.Copy(from, to)
 	if err != nil {
-		if !errors.IsClosedNetwork(err) {
-			log.Infof("%s -> data transfer failed: %v", f.String(), err)
+		if !oktetoErrors.IsClosedNetwork(err) {
+			oktetoLog.Infof("%s -> data transfer failed: %v", f.String(), err)
 		}
 	}
 

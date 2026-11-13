@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,25 +18,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/k8s/pods"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 	"k8s.io/client-go/kubernetes"
 )
 
-func waitForDevPodsTermination(ctx context.Context, c kubernetes.Interface, d *model.Dev, t int) {
-	interactive := map[string]string{labels.InteractiveDevLabel: d.Name}
-	detached := map[string]string{labels.DetachedDevLabel: d.Name}
+func waitForDevPodsTermination(ctx context.Context, c kubernetes.Interface, d *model.Dev, namespace string, t int) {
+	interactive := map[string]string{model.InteractiveDevLabel: d.Name}
+	detached := map[string]string{model.DetachedDevLabel: d.Name}
 
 	wg := &sync.WaitGroup{}
 
 	wg.Add(1)
-	go _waitForDevPodsTermination(ctx, c, d.Namespace, interactive, wg, t)
+	go _waitForDevPodsTermination(ctx, c, namespace, interactive, wg, t)
 
 	if len(d.Services) > 0 {
 		wg.Add(1)
-		go _waitForDevPodsTermination(ctx, c, d.Namespace, detached, wg, t)
+		go _waitForDevPodsTermination(ctx, c, namespace, detached, wg, t)
 	}
 
 	wg.Wait()
@@ -49,13 +48,13 @@ func _waitForDevPodsTermination(ctx context.Context, c kubernetes.Interface, nam
 	for i := 0; i < t; i++ {
 		ps, err := pods.ListBySelector(ctx, namespace, selector, c)
 		if err != nil {
-			log.Infof("failed to get dev pods with selector %s, exiting: %s", selector, err)
+			oktetoLog.Infof("failed to get dev pods with selector %s, exiting: %s", selector, err)
 			return
 		}
 
 		exit := true
 		for i := range ps {
-			log.Infof("waiting for %s/%s to terminate", ps[i].GetNamespace(), ps[i].GetName())
+			oktetoLog.Infof("waiting for %s/%s to terminate", ps[i].GetNamespace(), ps[i].GetName())
 			if pods.Exists(ctx, ps[i].GetName(), ps[i].GetNamespace(), c) {
 				exit = false
 			}

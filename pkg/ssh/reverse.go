@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,8 +18,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"time"
 
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 )
 
@@ -36,8 +38,8 @@ func (fm *ForwardManager) AddReverse(f model.Reverse) error {
 
 	fm.reverses[f.Local] = &reverse{
 		forward: forward{
-			localAddress:  fmt.Sprintf("%s:%d", fm.localInterface, f.Local),
-			remoteAddress: fmt.Sprintf("%s:%d", fm.remoteInterface, f.Remote),
+			localAddress:  net.JoinHostPort(fm.localInterface, strconv.Itoa(f.Local)),
+			remoteAddress: net.JoinHostPort(fm.remoteInterface, strconv.Itoa(f.Remote)),
 		},
 	}
 
@@ -47,21 +49,26 @@ func (fm *ForwardManager) AddReverse(f model.Reverse) error {
 func (r *reverse) start(ctx context.Context) {
 	remoteListener, err := r.pool.getListener(r.remoteAddress)
 	if err != nil {
-		log.Infof("%s -> failed to listen on remote address: %v", r.String(), err)
+		oktetoLog.Infof("%s -> failed to listen on remote address: %v", r.String(), err)
 		return
 	}
+	defer func() {
+		if err := remoteListener.Close(); err != nil {
+			oktetoLog.Debugf("Error closing remote listener '%s': %s", r.String(), err)
+		}
+	}()
 
-	defer remoteListener.Close()
 	go func() {
 		<-ctx.Done()
 		r.setDisconnected()
 		if err := remoteListener.Close(); err != nil {
-			log.Infof("%s -> failed to close: %s", r.String(), err)
+			oktetoLog.Infof("%s -> failed to close: %s", r.String(), err)
 		}
 
-		log.Infof("%s -> done", r.String())
+		oktetoLog.Infof("%s -> done", r.String())
 	}()
 
+	tick := time.NewTicker(500 * time.Millisecond)
 	for {
 		r.setConnected()
 		remoteConn, err := remoteListener.Accept()
@@ -70,7 +77,8 @@ func (r *reverse) start(ctx context.Context) {
 				return
 			}
 
-			log.Infof("%s -> failed to accept connection: %v", r.String(), err)
+			oktetoLog.Infof("%s -> failed to accept connection: %v", r.String(), err)
+			<-tick.C
 			continue
 		}
 
@@ -80,16 +88,24 @@ func (r *reverse) start(ctx context.Context) {
 }
 
 func (r *reverse) handle(ctx context.Context, remote net.Conn) {
-	defer remote.Close()
+	defer func() {
+		if err := remote.Close(); err != nil {
+			oktetoLog.Debugf("Error closing remote connection: %s", err)
+		}
+	}()
 
 	quit := make(chan struct{}, 1)
-	local, err := getConn(ctx, r.localAddress, 3)
+	local, err := getConn(ctx, r.localAddress, defaultRetries)
 	if err != nil {
-		log.Infof("%s -> failed to listen on local address: %v", r.String(), err)
+		oktetoLog.Infof("%s -> failed to connect to local address: %v", r.String(), err)
 		return
 	}
 
-	defer local.Close()
+	defer func() {
+		if err := local.Close(); err != nil {
+			oktetoLog.Debugf("Error closing local connection: %s", err)
+		}
+	}()
 
 	go r.transfer(remote, local, quit)
 	go r.transfer(local, remote, quit)
@@ -104,7 +120,7 @@ func (r *reverse) String() string {
 func (r *reverse) transfer(from io.Writer, to io.Reader, quit chan struct{}) {
 	_, err := io.Copy(from, to)
 	if err != nil {
-		log.Infof("%s -> data transfer failed: %v", r.String(), err)
+		oktetoLog.Infof("%s -> data transfer failed: %v", r.String(), err)
 	}
 
 	quit <- struct{}{}

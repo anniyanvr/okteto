@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,84 +16,117 @@ package login
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
-	"os"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/analytics"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
-	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/types"
 	"github.com/skratchdot/open-golang/open"
 )
 
-// WithEnvVarIfAvailable authenticates the user with OKTETO_TOKEN value
-func WithEnvVarIfAvailable(ctx context.Context) error {
-	oktetoToken := os.Getenv("OKTETO_TOKEN")
-	if oktetoToken == "" {
-		return nil
-	}
-	if u, err := okteto.GetToken(); err == nil {
-		if u.Token == oktetoToken {
-			return nil
+type Interface interface {
+	AuthenticateToOktetoCluster(context.Context, string, string) (*types.User, error)
+}
+
+type Controller struct {
+}
+
+func NewLoginController() *Controller {
+	return &Controller{}
+}
+
+func (*Controller) AuthenticateToOktetoCluster(ctx context.Context, oktetoURL, token string) (*types.User, error) {
+	if token == "" {
+		oktetoLog.Infof("authenticating with browser code")
+		user, err := WithBrowser(ctx, oktetoURL)
+		// If there is a TLS error, return the raw error
+		if oktetoErrors.IsX509(err) {
+			return nil, oktetoErrors.UserError{
+				E:    err,
+				Hint: oktetoErrors.ErrX509Hint,
+			}
 		}
+		if err != nil {
+			return nil, oktetoErrors.UserError{
+				E:    fmt.Errorf("couldn't authenticate to okteto context: %w", err),
+				Hint: "Try to set the context using the 'token' flag: https://www.okteto.com/docs/reference/okteto-cli/#context",
+			}
+		}
+		if user.New {
+			analytics.TrackSignup(true, user.ID)
+		}
+		oktetoLog.Infof("authenticated user %s", user.ID)
+
+		return user, nil
 	}
-	oktetoURL := os.Getenv("OKTETO_URL")
-	if oktetoURL == "" {
-		oktetoURL = okteto.CloudURL
-	}
-	if _, err := WithToken(ctx, oktetoURL, oktetoToken); err != nil {
-		return fmt.Errorf("error executing auto-login with 'OKTETO_TOKEN': %s", err)
-	}
-	return nil
+	return &types.User{Token: token}, nil
 }
 
-// WithToken authenticates the user with an API token
-func WithToken(ctx context.Context, url, token string) (*okteto.User, error) {
-	return okteto.AuthWithToken(ctx, url, token)
-}
-
-//WithBrowser authenticates the user with the brower
-func WithBrowser(ctx context.Context, oktetoURL string) (*okteto.User, error) {
+// WithBrowser authenticates the user with the browser
+func WithBrowser(ctx context.Context, oktetoURL string) (*types.User, error) {
 	h, err := StartWithBrowser(ctx, oktetoURL)
 	if err != nil {
-		log.Infof("couldn't start the login process: %s", err)
-		return nil, fmt.Errorf("couldn't start the login process, please try again")
+		return nil, fmt.Errorf("couldn't start the login process: %w", err)
 	}
 
-	authorizationURL := h.AuthorizationURL()
-	fmt.Println("Authentication will continue in your default browser")
+	authorizationURL, err := h.AuthorizationURL()
+	if err != nil {
+		return nil, err
+	}
+	oktetoLog.Println("Authentication will continue in your default browser")
 	if err := open.Start(authorizationURL); err != nil {
-		log.Errorf("Something went wrong opening your browser: %s\n", err)
+		if strings.Contains(err.Error(), "executable file not found in $PATH") {
+			return nil, oktetoErrors.UserError{
+				E:    fmt.Errorf("no browser could be found"),
+				Hint: "Use the '--token' flag to run this command in server mode. More information can be found here: https://www.okteto.com/docs/reference/okteto-cli/#context",
+			}
+		}
+		oktetoLog.Errorf("Something went wrong opening your browser: %s\n", err)
 	}
 
-	fmt.Printf("You can also open a browser and navigate to the following address:\n")
-	fmt.Println(authorizationURL)
+	oktetoLog.Printf("You can also open a browser and navigate to the following address:\n")
+	oktetoLog.Println(authorizationURL)
 
-	return EndWithBrowser(ctx, h)
+	return EndWithBrowser(h)
 }
 
 // StartWithBrowser starts the authentication of the user with the IDP via a browser
-func StartWithBrowser(ctx context.Context, url string) (*Handler, error) {
+func StartWithBrowser(ctx context.Context, u string) (*Handler, error) {
 	state, err := randToken()
 	if err != nil {
-		log.Infof("couldn't generate random token: %s", err)
+		oktetoLog.Infof("couldn't generate random token: %s", err)
 		return nil, fmt.Errorf("couldn't generate a random token, please try again")
 	}
 
 	port, err := model.GetAvailablePort(model.Localhost)
 
 	if err != nil {
-		log.Infof("couldn't access the network: %s", err)
+		oktetoLog.Infof("couldn't access the network: %s", err)
 		return nil, fmt.Errorf("couldn't access the network")
 	}
 
+	url, err := url.Parse(u)
+	if err != nil {
+		return nil, err
+	}
+	if url.Scheme == "" {
+		url.Scheme = "https"
+	}
+
 	handler := &Handler{
-		baseURL:  url,
+		baseURL:  url.String(),
 		port:     port,
-		ctx:      context.Background(),
+		ctx:      ctx,
 		state:    state,
 		errChan:  make(chan error, 2),
-		response: make(chan string, 2),
+		response: make(chan *types.User, 2),
 	}
 
 	return handler, nil
@@ -101,25 +134,32 @@ func StartWithBrowser(ctx context.Context, url string) (*Handler, error) {
 }
 
 // EndWithBrowser finishes the browser based auth
-func EndWithBrowser(ctx context.Context, h *Handler) (*okteto.User, error) {
+func EndWithBrowser(h *Handler) (*types.User, error) {
 	go func() {
-		http.Handle("/authorization-code/callback", h.handle())
-		h.errChan <- http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", h.port), nil)
+		sm := http.NewServeMux()
+		sm.Handle("/authorization-code/callback", h.handle())
+		server := &http.Server{
+			Addr:              net.JoinHostPort("127.0.0.1", strconv.Itoa(h.port)),
+			Handler:           sm,
+			ReadHeaderTimeout: 3 * time.Second,
+		}
+
+		h.errChan <- server.ListenAndServe()
 	}()
 
 	ticker := time.NewTicker(5 * time.Minute)
-	var code string
+	var user *types.User
 
 	select {
 	case <-ticker.C:
 		h.ctx.Done()
 		return nil, fmt.Errorf("authentication timeout")
-	case code = <-h.response:
+	case user = <-h.response:
 		break
 	case e := <-h.errChan:
 		h.ctx.Done()
 		return nil, e
 	}
 
-	return okteto.Auth(ctx, code, h.baseURL)
+	return user, nil
 }

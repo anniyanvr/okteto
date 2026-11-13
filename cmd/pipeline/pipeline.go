@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,16 +16,57 @@ package pipeline
 import (
 	"context"
 
+	"github.com/okteto/okteto/cmd/utils"
+	"github.com/okteto/okteto/pkg/analytics"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/types"
 	"github.com/spf13/cobra"
 )
 
-//Pipeline pipeline management commands
-func Pipeline(ctx context.Context) *cobra.Command {
+type DeployerInterface interface {
+	ExecuteDeployPipeline(ctx context.Context, opts *DeployOptions) error
+}
+type Interface interface {
+	DeployerInterface
+}
+
+type pipelineAnalyticsTracker interface {
+	TrackDeployPipelineTriggered(ctx context.Context, m analytics.DeployPipelineTriggeredMetadata)
+}
+
+// Command has all the pipeline subcommands
+type Command struct {
+	okClient          types.OktetoInterface
+	k8sClientProvider okteto.K8sClientProvider
+	analyticsTracker  pipelineAnalyticsTracker
+}
+
+// NewCommand creates a pipeline command
+func NewCommand(at pipelineAnalyticsTracker) (*Command, error) {
+	var okClient = &okteto.Client{}
+	if okteto.IsOkteto() {
+		c, err := okteto.NewOktetoClient()
+		if err != nil {
+			return nil, err
+		}
+		okClient = c
+	}
+	return &Command{
+		okClient:          okClient,
+		k8sClientProvider: okteto.NewK8sClientProvider(),
+		analyticsTracker:  at,
+	}, nil
+}
+
+// Pipeline pipeline management commands
+func Pipeline(ctx context.Context, at pipelineAnalyticsTracker) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "pipeline",
-		Short: "Pipeline management commands",
+		Short: "Development Environments management commands",
+		Args:  utils.NoArgsAccepted("https://www.okteto.com/docs/reference/okteto-cli/#pipeline"),
 	}
-	cmd.AddCommand(deploy(ctx))
-	cmd.AddCommand(destroy(ctx))
+	cmd.AddCommand(deploy(ctx, at))
+	cmd.AddCommand(destroy(ctx, at))
+	cmd.AddCommand(list(ctx, at))
 	return cmd
 }

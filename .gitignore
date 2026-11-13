@@ -2,10 +2,28 @@
 
 # IDEs
 .vscode
+.idea
+.atom
 
-# golang binary
+# VSCode Plugins
+.devcontainer
+
+# Golang binary
 cli
 .syncthing*
 bin/*
 coverage.txt
+coverage.html
 dist
+
+# don't add the binary created by running go build from the root of the repo
+/okteto
+
+# lint
+golangci-report.xml
+
+node_modules
+
+# Claude local config (personal, not shared)
+.claude/*.local*
+.claude/worktrees/

@@ -1,0 +1,146 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package connector
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/moby/buildkit/client"
+	"github.com/okteto/okteto/pkg/env"
+	"github.com/okteto/okteto/pkg/log/io"
+)
+
+const (
+	// maxWaitTime is the maximum time to wait for buildkit to be available
+	maxWaitTime = 10 * time.Minute
+
+	// retryTime is the time to wait between retries
+	retryTime = 5 * time.Second
+
+	// maxBuildkitWaitTimeEnvVar is the environment variable to set the max wait time for buildkit
+	maxBuildkitWaitTimeEnvVar = "OKTETO_BUILDKIT_WAIT_TIMEOUT"
+
+	// retryBuildkitIntervalEnvVar is the environment variable to set the retry time for buildkit
+	retryBuildkitIntervalEnvVar = "OKTETO_BUILDKIT_RETRY_INTERVAL"
+
+	// defaultReadinessTimeout is the default budget for the buildkit readiness health-check
+	// (the Info() call) used by the port-forward connector.
+	defaultReadinessTimeout = 6 * time.Second
+
+	// readinessRetryInterval is the interval between buildkit readiness health-check attempts.
+	readinessRetryInterval = 1 * time.Second
+
+	// readinessTimeoutEnvVar overrides defaultReadinessTimeout for the readiness health-check.
+	readinessTimeoutEnvVar = "OKTETO_BUILDKIT_READINESS_TIMEOUT"
+)
+
+// sleeper defines an interface for sleeping
+type sleeper interface {
+	Sleep(duration time.Duration)
+}
+
+// DefaultSleeper implements the Sleeper interface using time.Sleep
+type DefaultSleeper struct{}
+
+// Sleep sleeps for the specified duration
+func (s *DefaultSleeper) Sleep(duration time.Duration) {
+	time.Sleep(duration)
+}
+
+// Waiter encapsulates the logic to check if the BuildKit server is up and running
+type Waiter struct {
+	sleeper       sleeper
+	logger        *io.Controller
+	waitingTime   time.Duration
+	maxWaitTime   time.Duration
+	retryInterval time.Duration
+}
+
+type GetBuildkitClientFn func(ctx context.Context) (*client.Client, error)
+
+// NewBuildkitClientWaiter creates a new Waiter
+func NewBuildkitClientWaiter(logger *io.Controller) *Waiter {
+	return &Waiter{
+		maxWaitTime:   env.LoadTimeOrDefault(maxBuildkitWaitTimeEnvVar, maxWaitTime),
+		retryInterval: env.LoadTimeOrDefault(retryBuildkitIntervalEnvVar, retryTime),
+		sleeper:       &DefaultSleeper{},
+		logger:        logger,
+	}
+}
+
+// NewBuildkitClientReadinessWaiter creates a waiter for the buildkit readiness health-check
+// used by the port-forward connector. The timeout budget is configurable via
+// readinessTimeoutEnvVar and defaults to defaultReadinessTimeout.
+func NewBuildkitClientReadinessWaiter(logger *io.Controller) *Waiter {
+	maxWaitTime := env.LoadTimeOrDefault(readinessTimeoutEnvVar, defaultReadinessTimeout)
+	// A non-positive timeout would make the readiness check fail immediately, so treat it
+	// as invalid and fall back to the default.
+	if maxWaitTime <= 0 {
+		logger.Infof("'%s' must be a positive duration, falling back to %v\n", readinessTimeoutEnvVar, defaultReadinessTimeout)
+		maxWaitTime = defaultReadinessTimeout
+	}
+
+	return &Waiter{
+		maxWaitTime:   maxWaitTime,
+		retryInterval: readinessRetryInterval,
+		sleeper:       &DefaultSleeper{},
+		logger:        logger,
+	}
+}
+
+func (bw *Waiter) GetWaitingTime() time.Duration {
+	return bw.waitingTime
+}
+
+// WaitUntilIsUp waits for the BuildKit server to become available
+func (bw *Waiter) WaitUntilIsUp(ctx context.Context, getBuildkitClient GetBuildkitClientFn) error {
+	ctx, cancel := context.WithTimeout(ctx, bw.maxWaitTime)
+	defer cancel()
+
+	sp := bw.logger.Out().Spinner("Waiting for BuildKit service to be ready...")
+	defer sp.Stop()
+
+	startWaitingTime := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			bw.waitingTime = bw.maxWaitTime
+			return fmt.Errorf("buildkit service not available for %v", bw.maxWaitTime)
+		default:
+			c, err := getBuildkitClient(ctx)
+			if err != nil {
+				sp.Start()
+				bw.logger.Infof("Failed to connect to BuildKit service: %v\n", err)
+				bw.logger.Infof("Retrying in %v...\n", bw.retryInterval)
+				bw.sleeper.Sleep(bw.retryInterval)
+				continue
+			}
+			_, err = c.Info(ctx)
+			if err != nil {
+				sp.Start()
+				bw.logger.Infof("Failed to get BuildKit service info: %v\n", err)
+				bw.logger.Infof("Retrying in %v...\n", bw.retryInterval)
+				bw.sleeper.Sleep(bw.retryInterval)
+				continue
+			}
+			bw.waitingTime = time.Since(startWaitingTime)
+			bw.logger.Infof("Connected to BuildKit service.")
+		}
+		break
+	}
+
+	return nil
+}

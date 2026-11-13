@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,87 +14,104 @@
 package okteto
 
 import (
-	"io/ioutil"
+	"context"
+	"crypto/tls"
+	"net/http"
 	"os"
+	"reflect"
 	"testing"
 
-	"k8s.io/client-go/tools/clientcmd"
+	"github.com/okteto/okteto/pkg/constants"
+	"golang.org/x/oauth2"
 )
 
-func TestSetKubeConfig(t *testing.T) {
-	file, err := ioutil.TempFile("", "")
-	if err != nil {
-		t.Fatal(err.Error())
-	}
-	defer os.Remove(file.Name())
+type fakeGraphQLClient struct {
+	err            error
+	queryResult    interface{}
+	mutationResult interface{}
+}
 
-	c := &Credential{}
-	if err := SetKubeConfig(c, file.Name(), "", "123-123-123", "cloud-okteto-com", true); err != nil {
-		t.Fatal(err.Error())
+func (fc fakeGraphQLClient) Query(ctx context.Context, q interface{}, _ map[string]interface{}) error {
+	if fc.queryResult != nil {
+		entityType := reflect.TypeOf(q).Elem()
+		for i := 0; i < entityType.NumField(); i++ {
+			value := entityType.Field(i)
+			oldField := reflect.ValueOf(q).Elem().Field(i)
+			newField := reflect.ValueOf(fc.queryResult).Elem().FieldByName(value.Name)
+			oldField.Set(newField)
+		}
 	}
-
-	if err := SetKubeConfig(c, file.Name(), "ns", "123-123-123", "cloud-okteto-com", true); err != nil {
-		t.Fatal(err.Error())
+	return fc.err
+}
+func (fc fakeGraphQLClient) Mutate(ctx context.Context, m interface{}, _ map[string]interface{}) error {
+	if fc.mutationResult != nil {
+		if isAnInterface(m) {
+			m = reflect.ValueOf(m).Elem().Interface()
+		}
+		entityType := reflect.TypeOf(m).Elem()
+		for i := 0; i < entityType.NumField(); i++ {
+			value := entityType.Field(i)
+			oldField := reflect.ValueOf(m).Elem().Field(i)
+			newField := reflect.ValueOf(fc.mutationResult).Elem().FieldByName(value.Name)
+			oldField.Set(newField)
+		}
 	}
+	return fc.err
+}
 
-	if err := SetKubeConfig(c, file.Name(), "ns-2", "123-123-123", "cloud-okteto-com", true); err != nil {
-		t.Fatal(err.Error())
+func isAnInterface(m interface{}) bool {
+	return reflect.TypeOf(m).Kind() == reflect.Pointer && reflect.TypeOf(m).Elem().Kind() == reflect.Interface
+}
+
+type fakeGraphQLMultipleCallsClient struct {
+	errs           []error
+	queryResults   []interface{}
+	mutationResult []interface{}
+}
+
+func (fc *fakeGraphQLMultipleCallsClient) Query(ctx context.Context, q interface{}, vars map[string]interface{}) error {
+	var (
+		err   error
+		query interface{}
+	)
+	if len(fc.errs) != 0 {
+		err = fc.errs[0]
+		newErrs := fc.errs[1:]
+		fc.errs = newErrs
 	}
-
-	if err := SetKubeConfig(c, file.Name(), "", "123-123-124", "sf-okteto-com", true); err != nil {
-		t.Fatal(err.Error())
+	if len(fc.queryResults) != 0 {
+		query = fc.queryResults[0]
+		fc.queryResults = fc.queryResults[1:]
 	}
-
-	if err := SetKubeConfig(c, file.Name(), "ns-2", "123-123-124", "sf-okteto-com", true); err != nil {
-		t.Fatal(err.Error())
+	return fakeGraphQLClient{
+		err:         err,
+		queryResult: query,
+	}.Query(ctx, q, vars)
+}
+func (fc *fakeGraphQLMultipleCallsClient) Mutate(ctx context.Context, m interface{}, vars map[string]interface{}) error {
+	var (
+		err      error
+		mutation interface{}
+	)
+	if len(fc.errs) != 0 {
+		err = fc.errs[0]
+		fc.errs = fc.errs[1:]
 	}
-
-	cfg, err := clientcmd.LoadFromFile(file.Name())
-	if err != nil {
-		t.Fatal(err.Error())
+	if len(fc.mutationResult) != 0 {
+		mutation = fc.mutationResult[0]
+		fc.mutationResult = fc.mutationResult[1:]
 	}
-
-	if len(cfg.Clusters) != 2 {
-		t.Errorf("the config file didn't have two clusters: %+v", cfg.Clusters)
-	}
-
-	if len(cfg.AuthInfos) != 2 {
-		t.Errorf("the config file didn't have two users: %+v", cfg.AuthInfos)
-	}
-
-	if len(cfg.Contexts) != 2 {
-		t.Errorf("the config file didn't have five contexts: %+v", cfg.Contexts)
-	}
-
-	if cfg.CurrentContext != "sf-okteto-com" {
-		t.Errorf("current context was not sf-okteto-com, it was %s", cfg.CurrentContext)
-	}
-
-	// add duplicated
-
-	if err := SetKubeConfig(c, file.Name(), "ns-2", "123-123-124", "sf-okteto-com", true); err != nil {
-		t.Fatal(err.Error())
-	}
-
-	if err := SetKubeConfig(c, file.Name(), "ns-2", "123-123-123", "cloud-okteto-com", true); err != nil {
-		t.Fatal(err.Error())
-	}
-
-	cfg, err = clientcmd.LoadFromFile(file.Name())
-	if err != nil {
-		t.Fatal(err.Error())
-	}
-
-	if len(cfg.Contexts) != 2 {
-		t.Fatalf("the config file didn't have five contexts after adding the same twice: %+v", cfg.Contexts)
-	}
+	return fakeGraphQLClient{
+		err:            err,
+		mutationResult: mutation,
+	}.Mutate(ctx, m, vars)
 }
 
 func TestInDevContainer(t *testing.T) {
-	v := os.Getenv("OKTETO_NAMESPACE")
-	os.Setenv("OKTETO_NAMESPACE", "")
+	v := os.Getenv(constants.OktetoNameEnvVar)
+	t.Setenv(constants.OktetoNameEnvVar, "")
 	defer func() {
-		os.Setenv("OKTETO_NAMESPACE", v)
+		t.Setenv(constants.OktetoNameEnvVar, v)
 	}()
 
 	in := InDevContainer()
@@ -102,13 +119,13 @@ func TestInDevContainer(t *testing.T) {
 		t.Errorf("in dev container when there was no marker env var")
 	}
 
-	os.Setenv("OKTETO_NAMESPACE", "")
+	t.Setenv(constants.OktetoNameEnvVar, "")
 	in = InDevContainer()
 	if in {
 		t.Errorf("in dev container when there was an empty marker env var")
 	}
 
-	os.Setenv("OKTETO_NAMESPACE", "1")
+	t.Setenv(constants.OktetoNameEnvVar, "1")
 	in = InDevContainer()
 	if !in {
 		t.Errorf("not in dev container when there was a marker env var")
@@ -124,13 +141,13 @@ func Test_parseOktetoURL(t *testing.T) {
 	}{
 		{
 			name: "basic",
-			u:    "https://cloud.okteto.com",
-			want: "https://cloud.okteto.com/graphql",
+			u:    "https://okteto.example.com",
+			want: "https://okteto.example.com/graphql",
 		},
 		{
-			name: "no-schema",
-			u:    "cloud.okteto.com",
-			want: "https://cloud.okteto.com/graphql",
+			name: "no-scheme",
+			u:    "okteto.example.com",
+			want: "https://okteto.example.com/graphql",
 		},
 		{
 			name:    "empty",
@@ -147,6 +164,64 @@ func Test_parseOktetoURL(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("parseOktetoURL() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBackgroundContextWithHttpClient(t *testing.T) {
+	tests := []struct {
+		httpClient *http.Client
+		name       string
+		expected   bool
+	}{
+		{
+			name:       "default",
+			httpClient: &http.Client{},
+			expected:   false,
+		},
+		{
+			name: "insecure",
+			httpClient: &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{ // skipcq: GO-S1020
+						InsecureSkipVerify: true, // skipcq: GSC-G402
+					},
+				},
+			},
+			expected: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var ok bool
+
+			ctx := contextWithOauth2HttpClient(context.Background(), tt.httpClient)
+
+			client := ctx.Value(oauth2.HTTPClient)
+
+			var httpClient *http.Client
+
+			if httpClient, ok = client.(*http.Client); !ok {
+				t.Errorf("got %T, want %T", client, httpClient)
+				return
+			}
+
+			if !tt.expected && httpClient.Transport == nil {
+				return
+			}
+
+			var transport *http.Transport
+
+			if transport, ok = httpClient.Transport.(*http.Transport); !ok {
+				t.Errorf("got %T, want %T", httpClient.Transport, transport)
+				return
+			}
+
+			insecureSkipVerify := transport.TLSClientConfig.InsecureSkipVerify
+
+			if insecureSkipVerify != tt.expected {
+				t.Errorf("got %t, want %t", insecureSkipVerify, tt.expected)
 			}
 		})
 	}

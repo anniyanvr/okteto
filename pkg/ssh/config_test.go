@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,7 +16,6 @@ package ssh
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,13 +41,7 @@ func TestWriteToNewFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.RemoveAll(d)
-	path := filepath.Join(d, "config")
+	path := filepath.Join(t.TempDir(), "config")
 
 	if err := config.writeToFilepath(path); err != nil {
 		t.Fatal(err)
@@ -58,6 +51,11 @@ func TestWriteToNewFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	_, err = parse(f)
 	if err != nil {

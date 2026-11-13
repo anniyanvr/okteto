@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,16 +14,17 @@
 package cmd
 
 import (
+	"github.com/okteto/okteto/cmd/utils"
 	"github.com/okteto/okteto/pkg/analytics"
-	"github.com/okteto/okteto/pkg/config"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/spf13/cobra"
 )
 
-//Analytics turns analytics on/off
+// Analytics turns analytics on/off
 func Analytics() *cobra.Command {
 	var disable bool
 	cmd := &cobra.Command{
+		Args:  utils.NoArgsAccepted("https://okteto.com/docs/reference/okteto-cli/#analytics"),
 		Use:   "analytics",
 		Short: "Enable / Disable analytics",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -34,24 +35,24 @@ func Analytics() *cobra.Command {
 			return enableAnalytics()
 		},
 	}
-	cmd.Flags().BoolVarP(&disable, "disable", "d", false, "disable analytics")
+	cmd.Flags().BoolVarP(&disable, "disable", "d", false, "disable analytics collection")
 	return cmd
 }
 
 func disableAnalytics() error {
-	if err := analytics.Disable(config.VersionString); err != nil {
+	if err := analytics.Disable(); err != nil {
 		return err
 	}
 
-	log.Success("Analytics have been disabled")
+	oktetoLog.Success("Analytics have been disabled")
 	return nil
 }
 
 func enableAnalytics() error {
-	if err := analytics.Enable(config.VersionString); err != nil {
+	if err := analytics.Enable(); err != nil {
 		return err
 	}
 
-	log.Success("Analytics have been enabled")
+	oktetoLog.Success("Analytics have been enabled")
 	return nil
 }

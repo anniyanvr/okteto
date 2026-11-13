@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,56 +14,79 @@
 package model
 
 import (
+	"bytes"
 	"path"
 	"reflect"
 	"testing"
 
-	yaml "gopkg.in/yaml.v2"
+	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/env"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/log/io"
+	"github.com/stretchr/testify/assert"
+	"gopkg.in/yaml.v2"
 	apiv1 "k8s.io/api/core/v1"
-	resource "k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 func TestDevToTranslationRule(t *testing.T) {
-	manifest := []byte(`name: web
-namespace: n
-container: dev
-image: web:latest
-command: ["./run_web.sh"]
-imagePullPolicy: Never
-sync:
-  - .:/app
-  - sub:/path
-resources:
-  limits:
-    cpu: 2
-    memory: 1Gi
-    nvidia.com/gpu: 1
-    amd.com/gpu: 1
-services:
-  - name: worker
-    container: dev
-    image: worker:latest
-    imagePullPolicy: IfNotPresent
-    sync:
-      - worker:/src
-    healthchecks: true`)
+	manifestBytes := []byte(`dev:
+    web:
+        container: dev
+        image: web:latest
+        command: ["./run_web.sh"]
+        imagePullPolicy: Never
+        sync:
+        - .:/app
+        - sub:/path
+        resources:
+            limits:
+                cpu: 2
+                memory: 1Gi
+                nvidia.com/gpu: 1
+                amd.com/gpu: 1
+        nodeSelector:
+            disktype: ssd
+        priorityClassName: class
+        affinity:
+            podAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                      - web-server
+                  topologyKey: kubernetes.io/hostname
+        services:
+        - name: worker
+          container: dev
+          image: worker:latest
+          imagePullPolicy: IfNotPresent
+          sync:
+          - worker:/src`)
 
-	dev, err := Read(manifest)
+	manifest, err := Read(manifestBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	rule1 := dev.ToTranslationRule(dev, false)
+	dev := manifest.Dev["web"]
+
+	rule1 := dev.ToTranslationRule(dev, "n", "test-manifest", "username", false)
 	rule1OK := &TranslationRule{
-		Marker:            OktetoBinImageTag,
-		OktetoBinImageTag: OktetoBinImageTag,
+		Marker:            config.NewImageConfig(io.NewIOController()).GetCliImage(),
+		OktetoBinImageTag: config.NewImageConfig(io.NewIOController()).GetCliImage(),
 		Container:         "dev",
 		Image:             "web:latest",
 		ImagePullPolicy:   apiv1.PullNever,
 		Command:           []string{"/var/okteto/bin/start.sh"},
 		Args:              []string{"-r"},
 		Probes:            &Probes{},
-		Environment: []EnvVar{
+		Lifecycle:         &Lifecycle{},
+		Environment: env.Environment{
 			{
 				Name:  "OKTETO_NAMESPACE",
 				Value: "n",
@@ -72,11 +95,19 @@ services:
 				Name:  "OKTETO_NAME",
 				Value: "web",
 			},
+			{Name: "OKTETO_USERNAME", Value: "username"},
+			{Name: "HISTSIZE", Value: "10000000"},
+			{Name: "HISTFILESIZE", Value: "10000000"},
+			{Name: "HISTCONTROL", Value: "ignoreboth:erasedups"},
+			{Name: "HISTFILE", Value: "/var/okteto/bashrc/.bash_history"},
+			{Name: "BASHOPTS", Value: "histappend"},
+			{Name: "PROMPT_COMMAND", Value: "history -a ; history -c ; history -r"},
 		},
+		PriorityClassName: "class",
 		SecurityContext: &SecurityContext{
-			RunAsUser:  &rootUser,
-			RunAsGroup: &rootUser,
-			FSGroup:    &rootUser,
+			RunAsUser:  ptr.To(int64(0)),
+			RunAsGroup: ptr.To(int64(0)),
+			FSGroup:    ptr.To(int64(0)),
 		},
 		Resources: ResourceRequirements{
 			Limits: ResourceList{
@@ -88,11 +119,20 @@ services:
 			Requests: ResourceList{},
 		},
 		PersistentVolume: true,
+		MainVolumeName:   dev.GetVolumeName(),
+		VolumeAccessMode: dev.PersistentVolumeAccessMode(),
+		Namespace:        "n",
+		ManifestName:     "test-manifest",
 		Volumes: []VolumeMount{
 			{
 				Name:      dev.GetVolumeName(),
 				MountPath: OktetoSyncthingMountPath,
 				SubPath:   SyncthingSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/var/syncthing/data",
+				SubPath:   "syncthing-data",
 			},
 			{
 				Name:      dev.GetVolumeName(),
@@ -109,52 +149,321 @@ services:
 				MountPath: "/path",
 				SubPath:   path.Join(SourceCodeSubPath, "sub"),
 			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/var/okteto/bashrc",
+				SubPath:   "okteto-bash-history",
+			},
 		},
-		InitContainer: InitContainer{
-			Image: OktetoBinImageTag,
+		InitContainer: InitContainer{Image: config.NewImageConfig(io.NewIOController()).GetCliImage()},
+		NodeSelector: map[string]string{
+			"disktype": "ssd",
+		},
+		Affinity: &apiv1.Affinity{
+			PodAffinity: &apiv1.PodAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: []apiv1.PodAffinityTerm{
+					{
+						LabelSelector: &metav1.LabelSelector{
+							MatchExpressions: []metav1.LabelSelectorRequirement{
+								{
+									Key:      "role",
+									Operator: "In",
+									Values: []string{
+										"web-server",
+									},
+								},
+							},
+						},
+						TopologyKey: "kubernetes.io/hostname",
+					},
+				},
+			},
 		},
 	}
 
-	marshalled1, _ := yaml.Marshal(rule1)
-	marshalled1OK, _ := yaml.Marshal(rule1OK)
-	if string(marshalled1) != string(marshalled1OK) {
-		t.Fatalf("Wrong rule1 generation.\nActual %s, \nExpected %s", string(marshalled1), string(marshalled1OK))
-	}
+	marshalled1, err := yaml.Marshal(rule1)
+	assert.NoError(t, err)
+	marshalled1OK, err := yaml.Marshal(rule1OK)
+	assert.NoError(t, err)
+	assert.Equal(t, string(marshalled1), string(marshalled1OK))
 
 	dev2 := dev.Services[0]
-	rule2 := dev2.ToTranslationRule(dev, false)
+	rule2 := dev2.ToTranslationRule(dev, "n", "test-manifest", "username", false)
 	rule2OK := &TranslationRule{
 		Container:       "dev",
 		Image:           "worker:latest",
 		ImagePullPolicy: apiv1.PullIfNotPresent,
 		Command:         nil,
 		Args:            nil,
-		Healthchecks:    true,
-		Probes:          &Probes{Readiness: true, Liveness: true, Startup: true},
-		Environment:     make([]EnvVar, 0),
+		Healthchecks:    false,
+		Probes:          &Probes{},
+		Lifecycle:       &Lifecycle{},
 		SecurityContext: &SecurityContext{
-			RunAsUser:  &rootUser,
-			RunAsGroup: &rootUser,
-			FSGroup:    &rootUser,
+			RunAsUser:  ptr.To(int64(0)),
+			RunAsGroup: ptr.To(int64(0)),
+			FSGroup:    ptr.To(int64(0)),
 		},
-		Resources: ResourceRequirements{
-			Limits:   ResourceList{},
-			Requests: ResourceList{},
+		PriorityClassName: "class",
+		Affinity: &apiv1.Affinity{
+			PodAffinity: &apiv1.PodAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: []apiv1.PodAffinityTerm{},
+			},
 		},
+		Resources:        ResourceRequirements{},
 		PersistentVolume: true,
+		MainVolumeName:   dev.GetVolumeName(),
+		VolumeAccessMode: dev.PersistentVolumeAccessMode(),
+		Namespace:        "n",
+		ManifestName:     "test-manifest",
+		Environment: env.Environment{
+			{Name: "HISTSIZE", Value: "10000000"},
+			{Name: "HISTFILESIZE", Value: "10000000"},
+			{Name: "HISTCONTROL", Value: "ignoreboth:erasedups"},
+			{Name: "HISTFILE", Value: "/var/okteto/bashrc/.bash_history"},
+			{Name: "BASHOPTS", Value: "histappend"},
+			{Name: "PROMPT_COMMAND", Value: "history -a ; history -c ; history -r"},
+		},
 		Volumes: []VolumeMount{
 			{
 				Name:      dev.GetVolumeName(),
 				MountPath: "/src",
 				SubPath:   path.Join(SourceCodeSubPath, "worker"),
 			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/var/okteto/bashrc",
+				SubPath:   "okteto-bash-history",
+			},
+		},
+		Secrets: make([]Secret, 0),
+	}
+
+	marshalled2, err := yaml.Marshal(rule2)
+	assert.NoError(t, err)
+	marshalled2OK, err := yaml.Marshal(rule2OK)
+	assert.NoError(t, err)
+
+	if !assert.Equal(t, rule2, rule2OK) {
+		t.Fatalf("Wrong rule2 generation.\nActual %s, \nExpected %s", string(marshalled2), string(marshalled2OK))
+	}
+}
+
+func TestAffinitiesIfWriteMany(t *testing.T) {
+	manifestBytes := []byte(`dev:
+    web:
+        persistentVolume:
+            accessMode: ReadWriteMany
+        services:
+        - name: worker`)
+
+	manifest, err := Read(manifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dev := manifest.Dev["web"]
+	dev2 := dev.Services[0]
+	rule2 := dev2.ToTranslationRule(dev, "n", "test-manifest", "username", false)
+	assert.Nil(t, rule2.Affinity)
+}
+
+func TestDevToTranslationRuleInitContainer(t *testing.T) {
+	manifestBytes := []byte(`dev:
+    web:
+        sync:
+          - .:/app
+        initContainer:
+          image: image
+          resources:
+            requests:
+              cpu: 1
+              memory: 1Gi
+            limits:
+              cpu: 2
+              memory: 2Gi`)
+
+	manifest, err := Read(manifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dev := manifest.Dev["web"]
+
+	rule := dev.ToTranslationRule(dev, "n", "test-manifest", "username", false)
+	ruleOK := &TranslationRule{
+		Marker:            config.NewImageConfig(io.NewIOController()).GetCliImage(),
+		OktetoBinImageTag: "image",
+		ImagePullPolicy:   apiv1.PullAlways,
+		Command:           []string{"/var/okteto/bin/start.sh"},
+		Args:              []string{"-r"},
+		Probes:            &Probes{},
+		Lifecycle:         &Lifecycle{},
+		Environment: env.Environment{
+			{
+				Name:  "OKTETO_NAMESPACE",
+				Value: "n",
+			},
+			{
+				Name:  "OKTETO_NAME",
+				Value: "web",
+			},
+			{Name: "OKTETO_USERNAME", Value: "username"},
+			{Name: "HISTSIZE", Value: "10000000"},
+			{Name: "HISTFILESIZE", Value: "10000000"},
+			{Name: "HISTCONTROL", Value: "ignoreboth:erasedups"},
+			{Name: "HISTFILE", Value: "/var/okteto/bashrc/.bash_history"},
+			{Name: "BASHOPTS", Value: "histappend"},
+			{Name: "PROMPT_COMMAND", Value: "history -a ; history -c ; history -r"},
+		},
+		SecurityContext: &SecurityContext{
+			RunAsUser:  ptr.To(int64(0)),
+			RunAsGroup: ptr.To(int64(0)),
+			FSGroup:    ptr.To(int64(0)),
+		},
+		Resources:        ResourceRequirements{},
+		PersistentVolume: true,
+		MainVolumeName:   dev.GetVolumeName(),
+		VolumeAccessMode: dev.PersistentVolumeAccessMode(),
+		Namespace:        "n",
+		ManifestName:     "test-manifest",
+		Volumes: []VolumeMount{
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: OktetoSyncthingMountPath,
+				SubPath:   SyncthingSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/var/syncthing/data",
+				SubPath:   "syncthing-data",
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: RemoteMountPath,
+				SubPath:   RemoteSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/app",
+				SubPath:   SourceCodeSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/var/okteto/bashrc",
+				SubPath:   "okteto-bash-history",
+			},
+		},
+		InitContainer: InitContainer{
+			Image: "image",
+			Resources: ResourceRequirements{
+				Requests: map[apiv1.ResourceName]resource.Quantity{
+					apiv1.ResourceCPU:    resource.MustParse("1"),
+					apiv1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+				Limits: map[apiv1.ResourceName]resource.Quantity{
+					apiv1.ResourceCPU:    resource.MustParse("2"),
+					apiv1.ResourceMemory: resource.MustParse("2Gi"),
+				},
+			},
 		},
 	}
 
-	marshalled2, _ := yaml.Marshal(rule2)
-	marshalled2OK, _ := yaml.Marshal(rule2OK)
-	if string(marshalled2) != string(marshalled2OK) {
-		t.Fatalf("Wrong rule2 generation.\nActual %s, \nExpected %s", string(marshalled2), string(marshalled2OK))
+	marshalled, err := yaml.Marshal(rule)
+	assert.NoError(t, err)
+	marshalledOK, err := yaml.Marshal(ruleOK)
+	assert.NoError(t, err)
+	assert.Equal(t, string(marshalled), string(marshalledOK))
+}
+
+func TestDevToTranslationDebugEnabled(t *testing.T) {
+	oktetoLog.SetLevel("debug")
+	defer oktetoLog.SetLevel(oktetoLog.InfoLevel)
+	manifestBytes := []byte(`dev:
+    web:
+        image: dev-image
+        sync:
+          - .:/app`)
+
+	manifest, err := Read(manifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dev := manifest.Dev["web"]
+
+	rule := dev.ToTranslationRule(dev, "n", "test-manifest", "username", false)
+	ruleOK := &TranslationRule{
+		Marker:            config.NewImageConfig(io.NewIOController()).GetCliImage(),
+		OktetoBinImageTag: config.NewImageConfig(io.NewIOController()).GetCliImage(),
+		ImagePullPolicy:   apiv1.PullAlways,
+		Image:             "dev-image",
+		Command:           []string{"/var/okteto/bin/start.sh"},
+		Args:              []string{"-r", "-v"},
+		Probes:            &Probes{},
+		Lifecycle:         &Lifecycle{},
+		Environment: env.Environment{
+			{
+				Name:  "OKTETO_NAMESPACE",
+				Value: "n",
+			},
+			{
+				Name:  "OKTETO_NAME",
+				Value: "web",
+			},
+			{Name: "OKTETO_USERNAME", Value: "username"},
+			{Name: "HISTSIZE", Value: "10000000"},
+			{Name: "HISTFILESIZE", Value: "10000000"},
+			{Name: "HISTCONTROL", Value: "ignoreboth:erasedups"},
+			{Name: "HISTFILE", Value: "/var/okteto/bashrc/.bash_history"},
+			{Name: "BASHOPTS", Value: "histappend"},
+			{Name: "PROMPT_COMMAND", Value: "history -a ; history -c ; history -r"},
+		},
+		SecurityContext: &SecurityContext{
+			RunAsUser:  ptr.To(int64(0)),
+			RunAsGroup: ptr.To(int64(0)),
+			FSGroup:    ptr.To(int64(0)),
+		},
+		PersistentVolume: true,
+		MainVolumeName:   dev.GetVolumeName(),
+		VolumeAccessMode: dev.PersistentVolumeAccessMode(),
+		Namespace:        "n",
+		ManifestName:     "test-manifest",
+		Volumes: []VolumeMount{
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: OktetoSyncthingMountPath,
+				SubPath:   SyncthingSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/var/syncthing/data",
+				SubPath:   "syncthing-data",
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: RemoteMountPath,
+				SubPath:   RemoteSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/app",
+				SubPath:   SourceCodeSubPath,
+			},
+			{
+				Name:      dev.GetVolumeName(),
+				MountPath: "/var/okteto/bashrc",
+				SubPath:   "okteto-bash-history",
+			},
+		},
+		InitContainer: InitContainer{Image: config.NewImageConfig(io.NewIOController()).GetCliImage()},
+	}
+
+	marshalled, err := yaml.Marshal(rule)
+	assert.NoError(t, err)
+	marshalledOK, err := yaml.Marshal(ruleOK)
+	assert.NoError(t, err)
+	if !bytes.Equal(marshalled, marshalledOK) {
+		t.Fatalf("Wrong rule generation.\nActual %s, \nExpected %s", string(marshalled), string(marshalledOK))
 	}
 }
 
@@ -162,37 +471,170 @@ func TestSSHServerPortTranslationRule(t *testing.T) {
 	tests := []struct {
 		name     string
 		manifest *Dev
-		expected []EnvVar
+		expected env.Environment
 	}{
 		{
 			name: "default",
 			manifest: &Dev{
-				Image:         &BuildInfo{},
+				Image:         "",
 				SSHServerPort: oktetoDefaultSSHServerPort,
 			},
-			expected: []EnvVar{
-				{Name: "OKTETO_NAMESPACE", Value: ""},
+			expected: env.Environment{
+				{Name: "OKTETO_NAMESPACE", Value: "n"},
 				{Name: "OKTETO_NAME", Value: ""},
+				{Name: "OKTETO_USERNAME", Value: "username"},
+				{Name: "HISTSIZE", Value: "10000000"},
+				{Name: "HISTFILESIZE", Value: "10000000"},
+				{Name: "HISTCONTROL", Value: "ignoreboth:erasedups"},
+				{Name: "HISTFILE", Value: "/var/okteto/bashrc/.bash_history"},
+				{Name: "BASHOPTS", Value: "histappend"},
+				{Name: "PROMPT_COMMAND", Value: "history -a ; history -c ; history -r"},
 			},
 		},
 		{
 			name: "custom port",
 			manifest: &Dev{
-				Image:         &BuildInfo{},
+				Image:         "",
 				SSHServerPort: 22220,
 			},
-			expected: []EnvVar{
-				{Name: "OKTETO_NAMESPACE", Value: ""},
+			expected: env.Environment{
+				{Name: "OKTETO_NAMESPACE", Value: "n"},
 				{Name: "OKTETO_NAME", Value: ""},
+				{Name: "OKTETO_USERNAME", Value: "username"},
 				{Name: oktetoSSHServerPortVariable, Value: "22220"},
+				{Name: "HISTSIZE", Value: "10000000"},
+				{Name: "HISTFILESIZE", Value: "10000000"},
+				{Name: "HISTCONTROL", Value: "ignoreboth:erasedups"},
+				{Name: "HISTFILE", Value: "/var/okteto/bashrc/.bash_history"},
+				{Name: "BASHOPTS", Value: "histappend"},
+				{Name: "PROMPT_COMMAND", Value: "history -a ; history -c ; history -r"},
 			},
 		},
 	}
 	for _, test := range tests {
 		t.Logf("test: %s", test.name)
-		rule := test.manifest.ToTranslationRule(test.manifest, false)
+		rule := test.manifest.ToTranslationRule(test.manifest, "n", "test-manifest", "username", false)
 		if e, a := test.expected, rule.Environment; !reflect.DeepEqual(e, a) {
 			t.Errorf("expected environment:\n%#v\ngot:\n%#v", e, a)
 		}
 	}
+}
+
+func TestDevToTranslationRuleRunAsNonRoot(t *testing.T) {
+	var falseBoolean = false
+	var trueBoolean = true
+	var runAsUser int64 = 100
+	var runAsGroup int64 = 101
+	var fsGroup int64 = 102
+
+	tests := []struct {
+		translated SecurityContext
+		name       string
+		manifest   []byte
+	}{
+		{
+			name: "root-user-with-overrides",
+			manifest: []byte(`dev:
+    root-user-with-overrides:
+        image: worker:latest
+        securityContext:
+           runAsUser: 100
+           runAsGroup: 101
+           fsGroup: 102
+           runAsNonRoot: false`),
+			translated: SecurityContext{
+				RunAsUser:    &runAsUser,
+				RunAsGroup:   &runAsGroup,
+				FSGroup:      &fsGroup,
+				RunAsNonRoot: &falseBoolean,
+			},
+		},
+		{
+			name: "non-root-user-without-overrides",
+			manifest: []byte(`dev:
+    non-root-user-without-overrides:
+        image: worker:latest
+        securityContext:
+           runAsNonRoot: true`),
+			translated: SecurityContext{
+				RunAsNonRoot: &trueBoolean,
+			},
+		},
+		{
+			name: "root-user-with-defaults",
+			manifest: []byte(`dev:
+    root-user-with-defaults:
+        image: worker:latest
+        securityContext:
+           runAsNonRoot: false`),
+			translated: SecurityContext{
+				RunAsUser:    ptr.To(int64(0)),
+				RunAsGroup:   ptr.To(int64(0)),
+				FSGroup:      ptr.To(int64(0)),
+				RunAsNonRoot: &falseBoolean,
+			},
+		},
+		{
+			name: "non-root-user-with-overrides",
+			manifest: []byte(`dev:
+    non-root-user-with-overrides:
+        image: worker:latest
+        securityContext:
+           runAsUser: 100
+           runAsGroup: 101
+           fsGroup: 102
+           runAsNonRoot: true`),
+			translated: SecurityContext{
+				RunAsUser:    &runAsUser,
+				RunAsGroup:   &runAsGroup,
+				FSGroup:      &fsGroup,
+				RunAsNonRoot: &trueBoolean,
+			},
+		},
+		{
+			name: "no-security-context",
+			manifest: []byte(`dev:
+    no-security-context:
+        image: worker:latest`),
+			translated: SecurityContext{
+				RunAsUser:  ptr.To(int64(0)),
+				RunAsGroup: ptr.To(int64(0)),
+				FSGroup:    ptr.To(int64(0)),
+			},
+		},
+		{
+			name: "no-run-as-non-root",
+			manifest: []byte(`dev:
+    no-run-as-non-root:
+        image: worker:latest
+        securityContext:
+           runAsUser: 100
+           runAsGroup: 101
+           fsGroup: 102`),
+			translated: SecurityContext{
+				RunAsUser:  &runAsUser,
+				RunAsGroup: &runAsGroup,
+				FSGroup:    &fsGroup,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		manifest, err := Read(test.manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		dev := manifest.Dev[test.name]
+
+		rule := dev.ToTranslationRule(dev, "n", "test-manifest", "username", false)
+		marshalled, err := yaml.Marshal(rule.SecurityContext)
+		assert.NoError(t, err)
+		marshalledOK, err := yaml.Marshal(test.translated)
+		assert.NoError(t, err)
+		if !bytes.Equal(marshalled, marshalledOK) {
+			t.Fatalf("Wrong rule generation for %s.\nActual %s, \nExpected %s", dev.Name, string(marshalled), string(marshalledOK))
+		}
+	}
+
 }

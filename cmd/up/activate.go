@@ -1,32 +1,64 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package up
 
 import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/okteto/okteto/cmd/utils"
-	"github.com/okteto/okteto/pkg/analytics"
+	"github.com/okteto/okteto/pkg/cmd/pipeline"
 	"github.com/okteto/okteto/pkg/config"
-	"github.com/okteto/okteto/pkg/errors"
-	"github.com/okteto/okteto/pkg/k8s/deployments"
-	okLabels "github.com/okteto/okteto/pkg/k8s/labels"
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/env"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/k8s/apps"
 	"github.com/okteto/okteto/pkg/k8s/pods"
 	"github.com/okteto/okteto/pkg/k8s/secrets"
 	"github.com/okteto/okteto/pkg/k8s/services"
 	"github.com/okteto/okteto/pkg/k8s/volumes"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
-	"github.com/okteto/okteto/pkg/registry"
-	appsv1 "k8s.io/api/apps/v1"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/repository"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 )
 
-func (up *upContext) activate(autoDeploy, build bool) error {
-	log.Infof("activating development container retry=%t", up.isRetry)
+const (
+	// oldEnableDevBranchTrackingEnvVar enables or disables the dev branch tracking by the env var OKTETO_TRACK_DEV_BANCH_ENABLED.
+	// This was a typo but keeping it to reduce friction with customers that are already using it. It will go away eventually
+	oldEnableDevBranchTrackingEnvVar = "OKTETO_TRACK_DEV_BANCH_ENABLED"
 
-	if err := config.UpdateStateFile(up.Dev, config.Activating); err != nil {
+	// enableDevBranchTrackingEnvVar enables or disables the dev branch tracking by the env var OKTETO_TRACK_DEV_BRANCH_ENABLED
+	enableDevBranchTrackingEnvVar = "OKTETO_TRACK_DEV_BRANCH_ENABLED"
+
+	// devBranchTrackingIntervalEnvVar sets the tracking interval for branch tracking (if enabled) using OKTETO_TRACK_DEV_BRANCH_INTERVAL
+	devBranchTrackingIntervalEnvVar = "OKTETO_TRACK_DEV_BRANCH_INTERVAL"
+
+	defaultTrackingInterval = 5 * time.Minute
+)
+
+func (up *upContext) activate() error {
+
+	oktetoLog.Infof("activating development container retry=%t", up.isRetry)
+
+	if err := config.UpdateStateFile(up.Dev.Name, up.Namespace, config.Activating); err != nil {
 		return err
 	}
 
@@ -36,124 +68,165 @@ func (up *upContext) activate(autoDeploy, build bool) error {
 	up.ShutdownCompleted = make(chan bool, 1)
 	up.Sy = nil
 	up.Forwarder = nil
-	defer up.shutdown()
+	defer func() {
+		if !up.interruptReceived {
+			up.shutdown()
+		}
+	}()
 
 	up.Disconnect = make(chan error, 1)
 	up.CommandResult = make(chan error, 1)
 	up.cleaned = make(chan string, 1)
 	up.hardTerminate = make(chan error, 1)
 
-	d, create, err := up.getCurrentDeployment(ctx, autoDeploy)
+	k8sClient, _, err := up.K8sClientProvider.Provide(okteto.GetContext().Cfg)
+	if err != nil {
+		return err
+	}
+	app, create, err := utils.GetApp(ctx, up.Dev, okteto.GetContext().Namespace, k8sClient, up.isRetry)
 	if err != nil {
 		return err
 	}
 
-	if up.isRetry && !deployments.IsDevModeOn(d) {
-		log.Information("Development container has been deactivated")
+	if v, ok := app.ObjectMeta().Annotations[model.OktetoAutoCreateAnnotation]; up.Dev.Autocreate && (!ok || v != model.OktetoUpCmd) {
+		return oktetoErrors.UserError{
+			E:    fmt.Errorf("app '%s' already exists", up.Dev.Name),
+			Hint: "use a different name in your okteto.yaml, or remove the autocreate property",
+		}
+	}
+
+	if up.isRetry && !apps.IsDevModeOn(app) {
+		if up.Dev.IsHybridModeEnabled() {
+			up.shutdownHybridMode()
+		}
+		oktetoLog.Information("Development container has been deactivated")
 		return nil
 	}
 
-	if deployments.IsDevModeOn(d) && deployments.HasBeenChanged(d) {
-		return errors.UserError{
-			E: fmt.Errorf("Deployment '%s' has been modified while your development container was active", d.Name),
-			Hint: `Follow these steps:
-	  1. Execute 'okteto down'
-	  2. Apply your manifest changes again: 'kubectl apply'
-	  3. Execute 'okteto up' again
-    More information is available here: https://okteto.com/docs/reference/known-issues/index.html#kubectl-apply-changes-are-undone-by-okteto-up`,
-		}
-	}
-
-	if _, err := registry.GetImageTagWithDigest(ctx, up.Dev.Namespace, up.Dev.Image.Name); err == errors.ErrNotFound {
-		log.Infof("image '%s' not found, building it: %s", up.Dev.Image.Name, err.Error())
-		build = true
-	}
-
-	if !up.isRetry && build {
-		if err := up.buildDevImage(ctx, d, create); err != nil {
-			return fmt.Errorf("error building dev image: %s", err)
-		}
-	}
-
-	go up.initializeSyncthing()
-
-	if err := up.setDevContainer(d); err != nil {
+	if err := app.RestoreOriginal(); err != nil {
 		return err
 	}
 
-	if err := up.devMode(ctx, d, create); err != nil {
-		if errors.IsTransient(err) {
+	if err := apps.ValidateMountPaths(app.PodSpec(), up.Dev); err != nil {
+		return err
+	}
+
+	go func() {
+		if err := up.initializeSyncthing(); err != nil {
+			oktetoLog.Infof("could not initialize syncthing: %s", err)
+		}
+	}()
+	if err := up.setDevContainer(app); err != nil {
+		return err
+	}
+
+	var lastPodUID types.UID
+	if up.Pod != nil {
+		// if up.Pod exists save the UID before devMode to compare when retry
+		lastPodUID = up.Pod.UID
+	}
+
+	if err := up.waitUntilAppIsAwaken(ctx, app); err != nil {
+		oktetoLog.Infof("error waiting for the original %s to wake up: %s", app.Kind(), err.Error())
+		return err
+	}
+
+	if err := up.devMode(ctx, app, create); err != nil {
+		if up.isTransient(err) {
 			return err
 		}
-		return fmt.Errorf("couldn't activate your development container\n    %s", err.Error())
+		if _, ok := err.(oktetoErrors.UserError); ok {
+			return err
+		}
+		return fmt.Errorf("couldn't activate your development container\n    %w", err)
+	}
+
+	if up.isRetry {
+		if lastPodUID != up.Pod.UID {
+			up.analyticsMeta.ReconnectDevPodRecreated()
+		} else {
+			up.analyticsMeta.ReconnectDefault()
+		}
 	}
 
 	up.isRetry = true
 
 	if err := up.forwards(ctx); err != nil {
-		if err == errors.ErrSSHConnectError {
+		if err == oktetoErrors.ErrSSHConnectError {
 			err := up.checkOktetoStartError(ctx, "Failed to connect to your development container")
-			if err == errors.ErrLostSyncthing {
-				if err := pods.Destroy(ctx, up.Pod.Name, up.Dev.Namespace, up.Client); err != nil {
-					return fmt.Errorf("error recreating development container: %s", err.Error())
+			if err == oktetoErrors.ErrLostSyncthing {
+				if err := pods.Destroy(ctx, up.Pod.Name, up.Namespace, k8sClient); err != nil {
+					return fmt.Errorf("error recreating development container: %w", err)
 				}
 			}
 			return err
 		}
-		return fmt.Errorf("couldn't connect to your development container: %s", err.Error())
+		return fmt.Errorf("couldn't connect to your development container: %w", err)
 	}
 	go up.cleanCommand(ctx)
 
 	if err := up.sync(ctx); err != nil {
 		if up.shouldRetry(ctx, err) {
-			return errors.ErrLostSyncthing
+			return oktetoErrors.ErrLostSyncthing
 		}
 		return err
 	}
 
-	up.success = true
-	if up.isRetry {
-		analytics.TrackReconnect(true, up.isSwap)
+	dd := newDevDeployer(up.Translations, k8sClient)
+	// if servicesUpWait is set, we need to deploy the dev services because they won't be deployed with the main dev
+	if dd.servicesUpWait {
+		if err := dd.deployDevServices(ctx); err != nil {
+			return err
+		}
 	}
+
+	// success means all context is ready to run the activation
+	up.success = true
 
 	go func() {
 		output := <-up.cleaned
-		log.Debugf("clean command output: %s", output)
+		oktetoLog.Debugf("clean command output: %s", output)
 
 		outByCommand := strings.Split(strings.TrimSpace(output), "\n")
-		if len(outByCommand) >= 2 {
-			version, watches := outByCommand[0], outByCommand[1]
+		var watches string
+		minOutCmdParts := 2
+		if len(outByCommand) >= minOutCmdParts {
+			watches = outByCommand[0]
 
 			if isWatchesConfigurationTooLow(watches) {
-				folder := config.GetNamespaceHome(up.Dev.Namespace)
+				folder := config.GetNamespaceHome(up.Namespace)
 				if utils.GetWarningState(folder, ".remotewatcher") == "" {
-					log.Yellow("The value of /proc/sys/fs/inotify/max_user_watches in your cluster nodes is too low.")
-					log.Yellow("This can affect file synchronization performance.")
-					log.Yellow("Visit https://okteto.com/docs/reference/known-issues/index.html for more information.")
+					oktetoLog.Yellow("The value of /proc/sys/fs/inotify/max_user_watches in your cluster nodes is too low.")
+					oktetoLog.Yellow("This can affect file synchronization performance.")
+					oktetoLog.Yellow("Visit https://okteto.com/docs/reference/known-issues/ for more information.")
 					if err := utils.SetWarningState(folder, ".remotewatcher", "true"); err != nil {
-						log.Infof("failed to set warning remotewatcher state: %s", err.Error())
+						oktetoLog.Infof("failed to set warning remotewatcher state: %s", err.Error())
 					}
 				}
 			}
 
-			if version != model.OktetoBinImageTag {
-				log.Yellow("The Okteto CLI version %s uses the init container image %s.", config.VersionString, model.OktetoBinImageTag)
-				log.Yellow("Please consider upgrading your init container image %s with the content of %s", up.Dev.InitContainer.Image, model.OktetoBinImageTag)
-				log.Infof("Using init image %s instead of default init image (%s)", up.Dev.InitContainer.Image, model.OktetoBinImageTag)
-			}
 		}
-		printDisplayContext(up.Dev)
-		up.CommandResult <- up.runCommand(ctx)
+		printDisplayContext(up)
+		durationActivateUp := time.Since(up.StartTime)
+		up.analyticsMeta.ActivateDuration(durationActivateUp)
+
+		go TrackLatestBranchOnDevContainer(ctx, up.Namespace, up.Manifest, up.Options.ManifestPathFlag, up.K8sClientProvider)
+
+		startRunCommand := time.Now()
+		up.CommandResult <- up.RunCommand(ctx, up.Dev.Command.Values)
+		up.analyticsMeta.ExecDuration(time.Since(startRunCommand))
+
 	}()
-	prevError := up.waitUntilExitOrInterrupt()
+
+	prevError := up.waitUntilExitOrInterruptOrApply(ctx)
 
 	if up.shouldRetry(ctx, prevError) {
 		if !up.Dev.PersistentVolumeEnabled() {
-			if err := pods.Destroy(ctx, up.Pod.Name, up.Dev.Namespace, up.Client); err != nil {
+			if err := pods.Destroy(ctx, up.Pod.Name, up.Namespace, k8sClient); err != nil {
 				return err
 			}
 		}
-		return errors.ErrLostSyncthing
+		return oktetoErrors.ErrLostSyncthing
 	}
 
 	return prevError
@@ -163,44 +236,60 @@ func (up *upContext) shouldRetry(ctx context.Context, err error) bool {
 	switch err {
 	case nil:
 		return false
-	case errors.ErrLostSyncthing:
+	case oktetoErrors.ErrLostSyncthing:
 		return true
-	case errors.ErrCommandFailed:
+	case oktetoErrors.ErrCommandFailed:
 		return !up.Sy.Ping(ctx, false)
+	case oktetoErrors.ErrApplyToApp:
+		return true
 	}
 
 	return false
 }
 
-func (up *upContext) devMode(ctx context.Context, d *appsv1.Deployment, create bool) error {
-	if err := up.createDevContainer(ctx, d, create); err != nil {
+func (up *upContext) devMode(ctx context.Context, app apps.App, create bool) error {
+	startCreateDev := time.Now()
+	if err := up.createDevContainer(ctx, app, create); err != nil {
 		return err
 	}
-	return up.waitUntilDevelopmentContainerIsRunning(ctx)
+
+	err := up.waitUntilDevelopmentContainerIsRunning(ctx, app)
+	up.analyticsMeta.DevContainerCreation(time.Since(startCreateDev))
+	return err
 }
 
-func (up *upContext) createDevContainer(ctx context.Context, d *appsv1.Deployment, create bool) error {
-	spinner := utils.NewSpinner("Activating your development container...")
-	spinner.Start()
-	defer spinner.Stop()
+func (up *upContext) createDevContainer(ctx context.Context, app apps.App, create bool) error {
+	msg := "Preparing development environment..."
+	if !up.Dev.IsHybridModeEnabled() {
+		msg = "Activating your development container..."
+	}
+	oktetoLog.Spinner(msg)
+	oktetoLog.StartSpinner()
+	defer oktetoLog.StopSpinner()
 
-	if err := config.UpdateStateFile(up.Dev, config.Starting); err != nil {
+	if err := config.UpdateStateFile(up.Dev.Name, up.Namespace, config.Starting); err != nil {
+		return err
+	}
+
+	k8sClient, _, err := up.K8sClientProvider.Provide(okteto.GetContext().Cfg)
+	if err != nil {
 		return err
 	}
 
 	if up.Dev.PersistentVolumeEnabled() {
-		if err := volumes.Create(ctx, up.Dev, up.Client); err != nil {
+		if err := volumes.CreateForDev(ctx, up.Dev, up.Options.ManifestPath, up.Namespace, k8sClient); err != nil {
 			return err
 		}
 	}
 
 	resetOnDevContainerStart := up.resetSyncthing || !up.Dev.PersistentVolumeEnabled()
-	trList, err := deployments.GetTranslations(ctx, up.Dev, d, resetOnDevContainerStart, up.Client)
+	trMap, err := apps.GetTranslations(ctx, up.Namespace, up.Manifest.Name, up.Dev, app, resetOnDevContainerStart, k8sClient)
 	if err != nil {
 		return err
 	}
+	up.Translations = trMap
 
-	if err := deployments.TranslateDevMode(trList, up.Client, up.isOktetoNamespace); err != nil {
+	if err := apps.TranslateDevMode(trMap); err != nil {
 		return err
 	}
 
@@ -209,66 +298,64 @@ func (up *upContext) createDevContainer(ctx context.Context, d *appsv1.Deploymen
 		return initSyncErr
 	}
 
-	log.Info("create deployment secrets")
-	if err := secrets.Create(ctx, up.Dev, up.Client, up.Sy); err != nil {
+	oktetoLog.Info("create development container secrets")
+	if err := secrets.Create(ctx, up.Dev, up.Namespace, k8sClient, up.Sy); err != nil {
 		return err
 	}
 
-	for name := range trList {
-		if name == d.Name {
-			if err := deployments.Deploy(ctx, trList[name].Deployment, create, up.Client); err != nil {
-				return err
-			}
-		} else {
-			if err := deployments.Deploy(ctx, trList[name].Deployment, false, up.Client); err != nil {
-				return err
-			}
-		}
-
-		if trList[name].Deployment.Annotations[okLabels.DeploymentAnnotation] == "" {
-			continue
-		}
-
-		if err := deployments.UpdateOktetoRevision(ctx, trList[name].Deployment, up.Client, up.Dev.Timeout); err != nil {
+	dd := newDevDeployer(trMap, k8sClient)
+	if err := dd.deployMainDev(ctx); err != nil {
+		return err
+	}
+	// if servicesUpWait is not set, we need to deploy the dev services because they will be deployed with the main dev
+	if !dd.servicesUpWait {
+		if err := dd.deployDevServices(ctx); err != nil {
 			return err
 		}
-
 	}
 
 	if create {
-		if err := services.CreateDev(ctx, up.Dev, up.Client); err != nil {
+		if err := services.CreateDev(ctx, up.Dev, up.Namespace, k8sClient); err != nil {
 			return err
 		}
 	}
 
-	pod, err := pods.GetDevPodInLoop(ctx, up.Dev, up.Client, create)
+	pod, err := apps.GetRunningPodInLoop(ctx, up.Dev, dd.mainTranslation.DevApp, k8sClient)
 	if err != nil {
 		return err
 	}
 
 	up.Pod = pod
+
 	return nil
 }
 
-func (up *upContext) waitUntilDevelopmentContainerIsRunning(ctx context.Context) error {
-	msg := "Pulling images..."
-	if up.Dev.PersistentVolumeEnabled() {
-		msg = "Attaching persistent volume..."
-		if err := config.UpdateStateFile(up.Dev, config.Attaching); err != nil {
-			log.Infof("error updating state: %s", err.Error())
+func (up *upContext) waitUntilDevelopmentContainerIsRunning(ctx context.Context, app apps.App) error {
+	msg := "Preparing development environment..."
+	if !up.Dev.IsHybridModeEnabled() {
+		msg = "Pulling images..."
+		if up.Dev.PersistentVolumeEnabled() {
+			msg = "Attaching persistent volume..."
+			if err := config.UpdateStateFile(up.Dev.Name, up.Namespace, config.Attaching); err != nil {
+				oktetoLog.Infof("error updating state: %s", err.Error())
+			}
 		}
 	}
+	oktetoLog.Spinner(msg)
+	oktetoLog.StartSpinner()
+	defer oktetoLog.StopSpinner()
 
-	spinner := utils.NewSpinner(msg)
-	spinner.Start()
-	defer spinner.Stop()
+	k8sClient, _, err := up.K8sClientProvider.Provide(okteto.GetContext().Cfg)
+	if err != nil {
+		return err
+	}
 
 	optsWatchPod := metav1.ListOptions{
 		Watch:         true,
 		FieldSelector: fmt.Sprintf("metadata.name=%s", up.Pod.Name),
 	}
 
-	watcherPod, err := up.Client.CoreV1().Pods(up.Dev.Namespace).Watch(ctx, optsWatchPod)
+	watcherPod, err := k8sClient.CoreV1().Pods(up.Namespace).Watch(ctx, optsWatchPod)
 	if err != nil {
 		return err
 	}
@@ -278,65 +365,263 @@ func (up *upContext) waitUntilDevelopmentContainerIsRunning(ctx context.Context)
 		FieldSelector: fmt.Sprintf("involvedObject.kind=Pod,involvedObject.name=%s", up.Pod.Name),
 	}
 
-	watcherEvents, err := up.Client.CoreV1().Events(up.Dev.Namespace).Watch(ctx, optsWatchEvents)
+	watcherEvents, err := k8sClient.CoreV1().Events(up.Namespace).Watch(ctx, optsWatchEvents)
 	if err != nil {
 		return err
 	}
 
+	killing := false
+	to := time.Now().Add(up.Dev.Timeout.Resources)
+	ticker := time.NewTicker(10 * time.Second)
+	var failedSchedulingEvent *apiv1.Event
 	for {
+		if failedSchedulingEvent != nil && time.Now().After(to) {
+			// this provides 2 min for "FailedScheduling" to resolve by themselves
+			if strings.Contains(failedSchedulingEvent.Message, "Insufficient cpu") || strings.Contains(failedSchedulingEvent.Message, "Insufficient memory") {
+				return oktetoErrors.UserError{E: fmt.Errorf("insufficient resources"),
+					Hint: "Increase cluster resources or timeout of resources. More information is available here: https://okteto.com/docs/reference/okteto-manifest/#timeout-time-optional"}
+			}
+			return fmt.Errorf("%s", failedSchedulingEvent.Message)
+		}
 		select {
+		case <-ticker.C:
+			oktetoLog.Info("ticker event in 'waitUntilDevelopmentContainerIsRunning' loop...")
+			continue
 		case event := <-watcherEvents.ResultChan():
-			e, ok := event.Object.(*apiv1.Event)
-			if !ok {
-				watcherEvents, err = up.Client.CoreV1().Events(up.Dev.Namespace).Watch(ctx, optsWatchEvents)
-				if err != nil {
-					return err
-				}
+			if killing {
 				continue
 			}
-
+			e, ok := event.Object.(*apiv1.Event)
+			if !ok {
+				oktetoLog.Infof("failed to cast event")
+				watcherEvents, err = k8sClient.CoreV1().Events(up.Namespace).Watch(ctx, optsWatchEvents)
+				if err != nil {
+					oktetoLog.Infof("error watching events: %s", err.Error())
+					return err
+				}
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			podEvent, ok := event.Object.(*apiv1.Event)
+			if !ok {
+				continue
+			}
+			if up.Pod.UID != podEvent.InvolvedObject.UID {
+				continue
+			}
 			optsWatchEvents.ResourceVersion = e.ResourceVersion
+			oktetoLog.Infof("pod event: %s:%s:%s", e.Reason, e.Type, e.Message)
 			switch e.Reason {
-			case "Failed", "FailedScheduling", "FailedCreatePodSandBox", "ErrImageNeverPull", "InspectFailed", "FailedCreatePodContainer":
+			case "FailedScheduling":
+				if failedSchedulingEvent == nil {
+					failedSchedulingEvent = e
+					to = time.Now().Add(up.Dev.Timeout.Resources)
+				}
+				continue
+			case "TriggeredScaleUp":
+				failedSchedulingEvent = nil
+				oktetoLog.Spinner("Waiting for the cluster to scale up...")
+				continue
+			case "Failed", "FailedCreatePodSandBox", "ErrImageNeverPull", "InspectFailed", "FailedCreatePodContainer":
 				if strings.Contains(e.Message, "pod has unbound immediate PersistentVolumeClaims") {
 					continue
 				}
-				return fmt.Errorf(e.Message)
+				if strings.Contains(e.Message, "is in the cache, so can't be assumed") {
+					continue
+				}
+				if strings.Contains(e.Message, "failed to create subPath directory") {
+					return oktetoErrors.UserError{
+						E: fmt.Errorf("there is no space left in persistent volume"),
+						Hint: fmt.Sprintf(`Okteto volume is full.
+    Increase your persistent volume size, run '%s' and try 'okteto up' again.
+    More information about configuring your persistent volume at https://okteto.com/docs/reference/okteto-manifest/#persistentvolume-object-optional`, utils.GetDownCommand(up.Options.ManifestPathFlag)),
+					}
+				}
+				if e.Type == "Warning" && strings.Contains(e.Message, "container veth name") && strings.Contains(e.Message, "already exists") {
+					oktetoLog.Infof("pod event: %s:%s:%s", e.Reason, e.Type, e.Message)
+					continue
+				}
+				return fmt.Errorf("%s", e.Message)
 			case "SuccessfulAttachVolume":
-				spinner.Stop()
-				log.Success("Persistent volume successfully attached")
-				spinner.Update("Pulling images...")
-				spinner.Start()
+				failedSchedulingEvent = nil
+				oktetoLog.Success("Persistent volume successfully attached")
+				oktetoLog.Spinner("Pulling images...")
 			case "Killing":
-				return errors.ErrDevPodDeleted
+				if app.Kind() == okteto.StatefulSet {
+					killing = true
+					continue
+				}
+				return oktetoErrors.ErrDevPodDeleted
+			case "Started":
+				failedSchedulingEvent = nil
+				if e.Message == "Started container "+apps.OktetoInitVolumeContainerName {
+					oktetoLog.Spinner("Initializing persistent volume content...")
+				}
 			case "Pulling":
-				message := strings.Replace(e.Message, "Pulling", "pulling", 1)
-				spinner.Update(fmt.Sprintf("%s...", message))
-				if err := config.UpdateStateFile(up.Dev, config.Pulling); err != nil {
-					log.Infof("error updating state: %s", err.Error())
+				failedSchedulingEvent = nil
+				message := getPullingMessage(e.Message, up.Namespace)
+				oktetoLog.Spinner(fmt.Sprintf("%s...", message))
+				if err := config.UpdateStateFile(up.Dev.Name, up.Namespace, config.Pulling); err != nil {
+					oktetoLog.Infof("error updating state: %s", err.Error())
 				}
 			}
 		case event := <-watcherPod.ResultChan():
 			pod, ok := event.Object.(*apiv1.Pod)
 			if !ok {
-				watcherPod, err = up.Client.CoreV1().Pods(up.Dev.Namespace).Watch(ctx, optsWatchPod)
+				oktetoLog.Infof("failed to cast pod event")
+				watcherPod, err = k8sClient.CoreV1().Pods(up.Namespace).Watch(ctx, optsWatchPod)
 				if err != nil {
+					oktetoLog.Infof("error watching pod events: %s", err.Error())
 					return err
 				}
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			log.Infof("dev pod %s is now %s", pod.Name, pod.Status.Phase)
+			if pod.UID != up.Pod.UID {
+				continue
+			}
+
+			// Native sidecars can restart independently once the pod is running.
+			if pod.Status.Phase != apiv1.PodRunning {
+				for _, status := range pod.Status.InitContainerStatuses {
+					if terminated := status.State.Terminated; terminated != nil && terminated.ExitCode != 0 {
+						return fmt.Errorf("init container %s failed: %s (exit code %d): %s", status.Name, terminated.Reason, terminated.ExitCode, terminated.Message)
+					}
+					if waiting := status.State.Waiting; waiting != nil && waiting.Reason == "CrashLoopBackOff" {
+						return fmt.Errorf("init container %s failed: %s: %s", status.Name, waiting.Reason, waiting.Message)
+					}
+				}
+			}
+
+			oktetoLog.Infof("dev pod %s is now %s", pod.Name, pod.Status.Phase)
 			if pod.Status.Phase == apiv1.PodRunning {
-				spinner.Stop()
-				log.Success("Images successfully pulled")
+				if !up.Dev.IsHybridModeEnabled() {
+					oktetoLog.Success("Images successfully pulled")
+				}
 				return nil
 			}
 			if pod.DeletionTimestamp != nil {
-				return errors.ErrDevPodDeleted
+				return oktetoErrors.ErrDevPodDeleted
 			}
 		case <-ctx.Done():
-			log.Debug("call to waitUntilDevelopmentContainerIsRunning cancelled")
+			oktetoLog.Debug("call to waitUntilDevelopmentContainerIsRunning cancelled")
 			return ctx.Err()
 		}
+	}
+}
+
+func getPullingMessage(message, namespace string) string {
+	registry := okteto.GetContext().Registry
+	if registry == "" {
+		return message
+	}
+	toReplace := fmt.Sprintf("%s/%s", registry, namespace)
+	return strings.Replace(message, toReplace, constants.DevRegistry, 1)
+}
+
+// waitUntilAppIsAwaken waits until the app is awake checking if the annotation dev.okteto.com/state-before-sleeping is present in the app resource
+func (up *upContext) waitUntilAppIsAwaken(ctx context.Context, app apps.App) error {
+	// If it is auto create, we don't need to wait for the app to wake up
+	if up.Dev.Autocreate {
+		return nil
+	}
+
+	k8sClient, _, err := up.K8sClientProvider.Provide(okteto.GetContext().Cfg)
+	if err != nil {
+		return err
+	}
+
+	appToCheck := app
+	// If the app is already in dev mode, we need to check the cloned app to see if it is awake
+	if apps.IsDevModeOn(app) {
+		var err error
+		appToCheck, err = app.GetDevClone(ctx, k8sClient)
+		if err != nil {
+			return err
+		}
+	}
+
+	if _, ok := appToCheck.ObjectMeta().Annotations[model.StateBeforeSleepingAnnontation]; !ok {
+		return nil
+	}
+
+	timeout := 5 * time.Minute
+	to := time.NewTicker(timeout)
+	ticker := time.NewTicker(2 * time.Second)
+	defer to.Stop()
+	defer ticker.Stop()
+	oktetoLog.Spinner(fmt.Sprintf("Dev environment '%s' is sleeping. Waiting for it to wake up...", appToCheck.ObjectMeta().Name))
+	oktetoLog.StartSpinner()
+	defer oktetoLog.StopSpinner()
+	for {
+		select {
+		case <-to.C:
+			// In case of timeout, we just print a warning to avoid failing the command
+			oktetoLog.Warning("Dev environment '%s' didn't wake up after %s", appToCheck.ObjectMeta().Name, timeout.String())
+			return nil
+		case <-ticker.C:
+			if err := appToCheck.Refresh(ctx, k8sClient); err != nil {
+				return err
+			}
+
+			// If the app is not sleeping anymore, we are done
+			if _, ok := appToCheck.ObjectMeta().Annotations[model.StateBeforeSleepingAnnontation]; !ok {
+				return nil
+			}
+		}
+	}
+}
+
+// TrackLatestBranchOnDevContainer tracks the latest branch on the dev container
+func TrackLatestBranchOnDevContainer(ctx context.Context, namespace string, manifest *model.Manifest, manifestPathFlag string, clientProvider okteto.K8sClientProvider) {
+	if !env.LoadBoolean(oldEnableDevBranchTrackingEnvVar) && !env.LoadBoolean(enableDevBranchTrackingEnvVar) {
+		oktetoLog.Infof("branch tracking is disabled")
+		return
+	}
+
+	// if the manifest deploy is empty we can't update the configmap because it doesn't exist
+	if manifest.Deploy == nil {
+		oktetoLog.Infof("no deploy section found in the manifest")
+		return
+	}
+
+	gitRepo, err := repository.FindTopLevelGitDir(manifestPathFlag)
+	if err != nil {
+		oktetoLog.Infof("error finding git repository: %s", err.Error())
+		return
+	}
+	r := repository.NewRepository(gitRepo)
+
+	devBranchTrackingInterval := env.LoadTimeOrDefault(devBranchTrackingIntervalEnvVar, defaultTrackingInterval)
+	c, _, err := clientProvider.Provide(okteto.GetContext().Cfg)
+	if err != nil {
+		oktetoLog.Infof("error getting k8s client: %s", err.Error())
+		return
+	}
+
+	ticker := time.NewTicker(devBranchTrackingInterval)
+	defer ticker.Stop()
+
+	updateBranch(ctx, r, manifest.Name, namespace, c)
+	for {
+		select {
+		case <-ticker.C:
+			updateBranch(ctx, r, manifest.Name, namespace, c)
+		case <-ctx.Done():
+			oktetoLog.Debug("TrackLatestBranchOnDevContainer done")
+			return
+		}
+	}
+}
+
+func updateBranch(ctx context.Context, r repository.Repository, name, namespace string, c kubernetes.Interface) {
+	branch, err := r.GetCurrentBranch()
+	if err != nil {
+		oktetoLog.Infof("error getting current branch: %s", err.Error())
+		return
+	}
+	err = pipeline.UpdateLatestUpBranch(ctx, name, namespace, branch, c)
+	if err != nil {
+		oktetoLog.Infof("error updating latest branch: %s", err.Error())
 	}
 }

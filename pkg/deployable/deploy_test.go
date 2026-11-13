@@ -1,0 +1,803 @@
+// Copyright 2024 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package deployable
+
+import (
+	"context"
+	"os"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/okteto/okteto/cmd/utils/executor"
+	"github.com/okteto/okteto/internal/test"
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/divert"
+	"github.com/okteto/okteto/pkg/externalresource"
+	"github.com/okteto/okteto/pkg/log/io"
+	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/spf13/afero"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/rest"
+)
+
+type fakeCmapHandler struct {
+	errUpdatingWithEnvs error
+	errAddingPhase      error
+	updatedEnvs         []string
+}
+
+func (f *fakeCmapHandler) UpdateEnvsFromCommands(_ context.Context, _ string, _ string, envs []string) error {
+	f.updatedEnvs = envs
+	return f.errUpdatingWithEnvs
+}
+
+func (f *fakeCmapHandler) AddPhaseDuration(context.Context, string, string, string, time.Duration) error {
+	return f.errAddingPhase
+}
+
+type fakeKubeconfigHandler struct {
+	mock.Mock
+}
+
+func (f *fakeKubeconfigHandler) Read() (*rest.Config, error) {
+	args := f.Called()
+	return args.Get(0).(*rest.Config), args.Error(1)
+
+}
+func (f *fakeKubeconfigHandler) Modify(port int, sessionToken, destKubeconfigFile string) error {
+	args := f.Called(port, sessionToken, destKubeconfigFile)
+	return args.Error(0)
+}
+
+type fakeProxy struct {
+	mock.Mock
+}
+
+func (f *fakeProxy) Start() {
+	f.Called()
+}
+
+func (f *fakeProxy) Shutdown(ctx context.Context) error {
+	args := f.Called(ctx)
+	return args.Error(0)
+}
+
+func (f *fakeProxy) GetPort() int {
+	args := f.Called()
+	return args.Int(0)
+}
+
+func (f *fakeProxy) GetToken() string {
+	args := f.Called()
+	return args.String(0)
+}
+
+func (f *fakeProxy) SetName(name string) {
+	f.Called(name)
+}
+
+func (f *fakeProxy) SetDivert(driver divert.Driver) {
+	f.Called(driver)
+}
+func (f *fakeProxy) InitTranslator() {}
+
+type fakeExecutor struct {
+	mock.Mock
+}
+
+func (f *fakeExecutor) Execute(command model.DeployCommand, env []string) error {
+	args := f.Called(command, env)
+	return args.Error(0)
+}
+
+func (f *fakeExecutor) CleanUp(err error) {
+	f.Called(err)
+}
+
+type fakeExternalResource struct {
+	mock.Mock
+}
+
+func (f *fakeExternalResource) Deploy(ctx context.Context, name, ns string, externalInfo *externalresource.ExternalResource) error {
+	args := f.Called(ctx, name, ns, externalInfo)
+	return args.Error(0)
+}
+
+func TestDeployNotRemovingEnvFile(t *testing.T) {
+	setFakeOktetoContext(t)
+
+	fs := afero.NewMemMapFs()
+
+	_, err := fs.Create(".env")
+	require.NoError(t, err)
+	params := DeployParameters{}
+	r := DeployRunner{
+		ConfigMapHandler: &fakeCmapHandler{},
+		Fs:               fs,
+	}
+	err = r.runCommandsSection(context.Background(), params)
+	assert.NoError(t, err)
+	_, err = fs.Stat(".env")
+	require.NoError(t, err)
+
+}
+
+func TestRunDeployWithErrorGettingClient(t *testing.T) {
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {
+				Namespace: "test",
+				IsOkteto:  true,
+			},
+		},
+		CurrentContext: "test",
+	}
+	k8sProvider := test.NewFakeK8sProvider()
+	k8sProvider.ErrProvide = assert.AnError
+
+	r := DeployRunner{
+		K8sClientProvider: k8sProvider,
+	}
+
+	err := r.RunDeploy(context.Background(), DeployParameters{})
+
+	require.ErrorIs(t, err, assert.AnError)
+}
+
+func TestRunDeployWithErrorModifyingKubeconfig(t *testing.T) {
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {
+				Namespace: "test",
+				IsOkteto:  true,
+			},
+		},
+		CurrentContext: "test",
+	}
+	k8sProvider := test.NewFakeK8sProvider()
+	proxy := &fakeProxy{}
+	kubeconfigHandler := &fakeKubeconfigHandler{}
+
+	proxy.On("GetPort").Return(80)
+	proxy.On("GetToken").Return("fake-token")
+
+	kubeconfigHandler.On("Modify", 80, "fake-token", "temp-kubeconfig").Return(assert.AnError)
+
+	r := DeployRunner{
+		K8sClientProvider:  k8sProvider,
+		Proxy:              proxy,
+		Kubeconfig:         kubeconfigHandler,
+		TempKubeconfigFile: "temp-kubeconfig",
+	}
+
+	err := r.RunDeploy(context.Background(), DeployParameters{})
+
+	require.ErrorIs(t, err, assert.AnError)
+
+	proxy.AssertExpectations(t)
+	kubeconfigHandler.AssertExpectations(t)
+}
+
+func TestRunDeployWithEmptyDeployable(t *testing.T) {
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {
+				Namespace: "test",
+				IsOkteto:  true,
+			},
+		},
+		CurrentContext: "test",
+	}
+	k8sProvider := test.NewFakeK8sProvider()
+	proxy := &fakeProxy{}
+	kubeconfigHandler := &fakeKubeconfigHandler{}
+
+	proxy.On("GetPort").Return(80)
+	proxy.On("GetToken").Return("fake-token")
+	proxy.On("SetName", "test-a").Return().Once()
+	proxy.On("Start").Return().Once()
+	proxy.On("Shutdown", mock.Anything).Return(nil).Once()
+	proxy.On("SetDivert", mock.Anything).Return().Once()
+
+	kubeconfigHandler.On("Modify", 80, "fake-token", "temp-kubeconfig").Return(nil)
+
+	r := DeployRunner{
+		K8sClientProvider:  k8sProvider,
+		Proxy:              proxy,
+		Kubeconfig:         kubeconfigHandler,
+		TempKubeconfigFile: "temp-kubeconfig",
+		Fs:                 afero.NewMemMapFs(),
+		ConfigMapHandler:   &fakeCmapHandler{},
+		IOCtrl:             io.NewIOController(),
+	}
+
+	params := DeployParameters{
+		Name:      "test a",
+		Namespace: "test",
+		Variables: []string{
+			"A=value1",
+		},
+		Deployable: Entity{
+			Divert: &model.DivertDeploy{
+				Driver: constants.OktetoDivertGatewayAPIDriver,
+			},
+		},
+	}
+	err := r.RunDeploy(context.Background(), params)
+
+	require.NoError(t, err)
+
+	proxy.AssertExpectations(t)
+	kubeconfigHandler.AssertExpectations(t)
+}
+
+func TestRunCommandsSectionWithCommands(t *testing.T) {
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {
+				Namespace: "test",
+				IsOkteto:  true,
+				Gateway: &okteto.GatewayMetadata{
+					Name:      "dev-gateway",
+					Namespace: "gateway-ns",
+				},
+			},
+		},
+		CurrentContext: "test",
+	}
+	executor := &fakeExecutor{}
+	r := DeployRunner{
+		TempKubeconfigFile: "temp-kubeconfig",
+		Fs:                 afero.NewMemMapFs(),
+		ConfigMapHandler:   &fakeCmapHandler{},
+		Executor:           executor,
+	}
+
+	params := DeployParameters{
+		Variables: []string{
+			"A=value1",
+			"B=value2",
+		},
+		Deployable: Entity{
+			Commands: []model.DeployCommand{
+				{
+					Name:    "test command",
+					Command: "echo",
+				},
+				{
+					Name:    "test command 2",
+					Command: "echo 2",
+				},
+			},
+		},
+	}
+
+	expectedCommand1 := model.DeployCommand{
+		Name:    "test command",
+		Command: "echo",
+	}
+	expectedCommand2 := model.DeployCommand{
+		Name:    "test command 2",
+		Command: "echo 2",
+	}
+	expectedVariables := []string{
+		"A=value1",
+		"B=value2",
+		"OKTETO_DEV_GATEWAY_NAME=dev-gateway",
+		"OKTETO_DEV_GATEWAY_NAMESPACE=gateway-ns",
+	}
+	executor.On("Execute", expectedCommand1, expectedVariables).Return(nil).Once()
+	executor.On("Execute", expectedCommand2, expectedVariables).Return(nil).Once()
+
+	err := r.runCommandsSection(context.Background(), params)
+
+	require.NoError(t, err)
+	executor.AssertExpectations(t)
+}
+
+func TestRunCommandsSectionPersistedVariables(t *testing.T) {
+	setFakeOktetoContext(t)
+	executor := &fakeExecutor{}
+	cmapHandler := &fakeCmapHandler{}
+	r := DeployRunner{
+		Fs:               afero.NewMemMapFs(),
+		ConfigMapHandler: cmapHandler,
+		Executor:         executor,
+	}
+	command := model.DeployCommand{Name: "test command", Command: "echo"}
+	params := DeployParameters{
+		Variables: []string{
+			"USER_VAR=value",
+			"PLATFORM_CLIENT_ID=client",
+			"PLATFORM_TOKEN_FILE=/tmp/okteto-platform-1/PLATFORM_TOKEN_FILE",
+			// Same name as a platform variable, e.g. set again by a previous step
+			"PLATFORM_CLIENT_ID=other",
+		},
+		platformVariables: []string{
+			"PLATFORM_CLIENT_ID=client",
+			"PLATFORM_TOKEN_FILE=/tmp/okteto-platform-1/PLATFORM_TOKEN_FILE",
+		},
+		Deployable: Entity{Commands: []model.DeployCommand{command}},
+	}
+	// The commands still get the platform variables
+	executor.On("Execute", command, mock.MatchedBy(func(env []string) bool {
+		return slices.Contains(env, "PLATFORM_CLIENT_ID=client") &&
+			slices.Contains(env, "PLATFORM_TOKEN_FILE=/tmp/okteto-platform-1/PLATFORM_TOKEN_FILE")
+	})).Return(nil).Once()
+
+	err := r.runCommandsSection(context.Background(), params)
+
+	require.NoError(t, err)
+	executor.AssertExpectations(t)
+	assert.Equal(t, []string{"USER_VAR=value"}, cmapHandler.updatedEnvs)
+}
+
+func TestWithoutVariables(t *testing.T) {
+	vars := []string{"A=1", "B=2", "B=3", "C=4", "NO_VALUE"}
+
+	got := withoutVariables(vars, []string{"B=2", "C=4", "D=5"})
+
+	assert.Equal(t, []string{"A=1", "NO_VALUE"}, got)
+	assert.Equal(t, []string{"A=1", "B=2", "B=3", "C=4", "NO_VALUE"}, vars, "the input must not be modified")
+}
+
+func TestRunCommandsSectionWithErrorInCommands(t *testing.T) {
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {
+				Namespace: "test",
+				IsOkteto:  true,
+			},
+		},
+		CurrentContext: "test",
+	}
+	executor := &fakeExecutor{}
+	r := DeployRunner{
+		TempKubeconfigFile: "temp-kubeconfig",
+		Fs:                 afero.NewMemMapFs(),
+		ConfigMapHandler:   &fakeCmapHandler{},
+		Executor:           executor,
+	}
+
+	params := DeployParameters{
+		Variables: []string{
+			"A=value1",
+			"B=value2",
+		},
+		Deployable: Entity{
+			Commands: []model.DeployCommand{
+				{
+					Name:    "test command",
+					Command: "echo",
+				},
+				{
+					Name:    "test command 2",
+					Command: "echo 2",
+				},
+			},
+		},
+	}
+
+	expectedCommand1 := model.DeployCommand{
+		Name:    "test command",
+		Command: "echo",
+	}
+	expectedCommand2 := model.DeployCommand{
+		Name:    "test command 2",
+		Command: "echo 2",
+	}
+	expectedVariables := []string{
+		"A=value1",
+		"B=value2",
+	}
+	executor.On("Execute", expectedCommand1, expectedVariables).Return(assert.AnError).Once()
+
+	err := r.runCommandsSection(context.Background(), params)
+
+	require.Error(t, err)
+	executor.AssertNotCalled(t, "Execute", expectedCommand2, expectedVariables)
+	executor.AssertExpectations(t)
+}
+
+func TestRunCommandsSectionWithExternal(t *testing.T) {
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {
+				Namespace: "test",
+				IsOkteto:  true,
+			},
+		},
+		CurrentContext: "test",
+	}
+	k8sProvider := test.NewFakeK8sProvider()
+	executor := &fakeExecutor{}
+	externalResource := &fakeExternalResource{}
+	r := DeployRunner{
+		TempKubeconfigFile: "temp-kubeconfig",
+		Fs:                 afero.NewMemMapFs(),
+		ConfigMapHandler:   &fakeCmapHandler{},
+		Executor:           executor,
+		K8sClientProvider:  k8sProvider,
+		GetExternalControl: func(_ *rest.Config) ExternalResourceInterface {
+			return externalResource
+		},
+	}
+
+	params := DeployParameters{
+		Namespace: "test1",
+		Deployable: Entity{
+			External: externalresource.Section{
+				"db": {
+					Icon: "icon",
+					Endpoints: []*externalresource.ExternalEndpoint{
+						{
+							Name: "name",
+							Url:  "url",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	expectedExternalInfo := &externalresource.ExternalResource{
+		Icon: "icon",
+		Endpoints: []*externalresource.ExternalEndpoint{
+			{
+				Name: "name",
+				Url:  "url",
+			},
+		},
+	}
+	externalResource.On("Deploy", mock.Anything, "db", "test1", expectedExternalInfo).Return(nil).Once()
+
+	err := r.runCommandsSection(context.Background(), params)
+
+	require.NoError(t, err)
+	executor.AssertNotCalled(t, "Execute", mock.Anything, mock.Anything)
+	executor.AssertExpectations(t)
+	externalResource.AssertExpectations(t)
+}
+
+func TestRunCommandsSectionWithErrorDeployingExternal(t *testing.T) {
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {
+				Namespace: "test",
+				IsOkteto:  true,
+			},
+		},
+		CurrentContext: "test",
+	}
+	k8sProvider := test.NewFakeK8sProvider()
+	executor := &fakeExecutor{}
+	externalResource := &fakeExternalResource{}
+	r := DeployRunner{
+		TempKubeconfigFile: "temp-kubeconfig",
+		Fs:                 afero.NewMemMapFs(),
+		ConfigMapHandler:   &fakeCmapHandler{},
+		Executor:           executor,
+		K8sClientProvider:  k8sProvider,
+		GetExternalControl: func(_ *rest.Config) ExternalResourceInterface {
+			return externalResource
+		},
+	}
+
+	params := DeployParameters{
+		Namespace: "test1",
+		Deployable: Entity{
+			External: externalresource.Section{
+				"db": {
+					Icon: "icon",
+					Endpoints: []*externalresource.ExternalEndpoint{
+						{
+							Name: "name",
+							Url:  "url",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	expectedExternalInfo := &externalresource.ExternalResource{
+		Icon: "icon",
+		Endpoints: []*externalresource.ExternalEndpoint{
+			{
+				Name: "name",
+				Url:  "url",
+			},
+		},
+	}
+	externalResource.On("Deploy", mock.Anything, "db", "test1", expectedExternalInfo).Return(assert.AnError).Once()
+
+	err := r.runCommandsSection(context.Background(), params)
+
+	require.Error(t, err)
+	executor.AssertNotCalled(t, "Execute", mock.Anything, mock.Anything)
+	executor.AssertExpectations(t)
+	externalResource.AssertExpectations(t)
+}
+
+func TestDeployExternalWithErrorGettingClient(t *testing.T) {
+	okteto.CurrentStore = &okteto.ContextStore{
+		Contexts: map[string]*okteto.Context{
+			"test": {
+				Namespace: "test",
+				IsOkteto:  true,
+			},
+		},
+		CurrentContext: "test",
+	}
+	k8sProvider := test.NewFakeK8sProvider()
+	k8sProvider.ErrProvide = assert.AnError
+
+	r := DeployRunner{
+		K8sClientProvider: k8sProvider,
+	}
+
+	params := DeployParameters{
+		Namespace: "test1",
+		Deployable: Entity{
+			External: externalresource.Section{
+				"db": {
+					Icon: "icon",
+					Endpoints: []*externalresource.ExternalEndpoint{
+						{
+							Name: "name",
+							Url:  "url",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	err := r.deployExternals(context.Background(), params, map[string]string{})
+
+	require.ErrorIs(t, err, assert.AnError)
+}
+
+func TestDeployRunnerCleanUp(t *testing.T) {
+	executor := &fakeExecutor{}
+	proxy := &fakeProxy{}
+	r := DeployRunner{
+		Executor:           executor,
+		Proxy:              proxy,
+		TempKubeconfigFile: "temp-kubeconfig",
+	}
+
+	proxy.On("Shutdown", mock.Anything).Return(nil).Once()
+	executor.On("CleanUp", assert.AnError).Return().Once()
+
+	r.CleanUp(context.Background(), assert.AnError)
+
+	proxy.AssertExpectations(t)
+	executor.AssertExpectations(t)
+}
+
+func TestEntityIsEmpty(t *testing.T) {
+	tests := []struct {
+		name string
+		e    Entity
+		want bool
+	}{
+		{
+			name: "All nil",
+			e: Entity{
+				External: nil,
+				Divert:   nil,
+				Commands: nil,
+			},
+			want: true,
+		},
+		{
+			name: "All empty",
+			e: Entity{
+				External: externalresource.Section{},
+				Divert:   &model.DivertDeploy{},
+				Commands: []model.DeployCommand{},
+			},
+			want: true,
+		},
+		{
+			name: "Non-empty Commands",
+			e: Entity{
+				External: nil,
+				Divert:   nil,
+				Commands: []model.DeployCommand{
+					{
+						Name:    "test",
+						Command: "echo",
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "Non-empty Divert",
+			e: Entity{
+				External: nil,
+				Divert:   &model.DivertDeploy{Driver: "gateway-api"},
+				Commands: nil,
+			},
+			want: false,
+		},
+		{
+			name: "Non-empty External",
+			e: Entity{
+				External: externalresource.Section{
+					"test": {
+						Icon: "icon",
+					},
+				},
+				Divert:   nil,
+				Commands: nil,
+			},
+			want: false,
+		},
+		{
+			name: "Multiple non-empty fields",
+			e: Entity{
+				External: externalresource.Section{
+					"test": {
+						Icon: "icon",
+					},
+				},
+				Divert:   &model.DivertDeploy{Driver: "gateway-api"},
+				Commands: nil,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.e.IsEmpty()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// newCatalogTestDeployRunner returns a runner whose commands run with e
+func newCatalogTestDeployRunner(e executor.ManifestExecutor, cmapHandler *fakeCmapHandler) DeployRunner {
+	proxy := &fakeProxy{}
+	proxy.On("GetPort").Return(80)
+	proxy.On("GetToken").Return("fake-token")
+	proxy.On("SetName", mock.Anything).Return()
+	proxy.On("Start").Return()
+	proxy.On("Shutdown", mock.Anything).Return(nil)
+	kubeconfigHandler := &fakeKubeconfigHandler{}
+	kubeconfigHandler.On("Modify", 80, "fake-token", "temp-kubeconfig").Return(nil)
+
+	return DeployRunner{
+		K8sClientProvider:  test.NewFakeK8sProvider(),
+		Proxy:              proxy,
+		Kubeconfig:         kubeconfigHandler,
+		TempKubeconfigFile: "temp-kubeconfig",
+		Fs:                 afero.NewMemMapFs(),
+		ConfigMapHandler:   cmapHandler,
+		Executor:           e,
+		IOCtrl:             io.NewIOController(),
+	}
+}
+
+func TestRunDeployAddsCatalogSecretVariablesOnlyToTheCommands(t *testing.T) {
+	setFakeOktetoContext(t)
+	exec := &fakeDestroyExecutor{}
+	cmapHandler := &fakeCmapHandler{}
+	r := newCatalogTestDeployRunner(exec, cmapHandler)
+
+	err := r.RunDeploy(context.Background(), DeployParameters{
+		Name:                   "test",
+		Namespace:              "test",
+		Variables:              []string{"CATALOG_TEST_TOKEN=from-var", "USER_VAR=value"},
+		CatalogSecretVariables: []string{"CATALOG_TEST_TOKEN=secret-value"},
+		Deployable: Entity{
+			Commands: []model.DeployCommand{{Name: "deploy", Command: "deploy"}},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, exec.envs, 1)
+	fromVar := slices.Index(exec.envs[0], "CATALOG_TEST_TOKEN=from-var")
+	secret := slices.Index(exec.envs[0], "CATALOG_TEST_TOKEN=secret-value")
+	require.NotEqual(t, -1, fromVar)
+	require.Greater(t, secret, fromVar, "the secret has to win over the variables")
+	assert.Contains(t, cmapHandler.updatedEnvs, "USER_VAR=value")
+	assert.NotContains(t, cmapHandler.updatedEnvs, "CATALOG_TEST_TOKEN=secret-value")
+	assert.Empty(t, os.Getenv("CATALOG_TEST_TOKEN"))
+}
+
+func TestRunDeployMasksShortCatalogSecretValues(t *testing.T) {
+	setFakeOktetoContext(t)
+	out := captureLogOutput(t)
+	r := newCatalogTestDeployRunner(printingExecutor{output: "pin: 1234"}, &fakeCmapHandler{})
+
+	err := r.RunDeploy(context.Background(), DeployParameters{
+		Name:                   "test",
+		Namespace:              "test",
+		CatalogSecretVariables: []string{"PIN=1234"},
+		Deployable: Entity{
+			Commands: []model.DeployCommand{{Name: "print", Command: "print"}},
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "pin: ***")
+	assert.NotContains(t, out.String(), "1234")
+}
+
+func TestRunDeployMasksTheShortLinesOfMultilineCatalogSecretValues(t *testing.T) {
+	setFakeOktetoContext(t)
+	out := captureLogOutput(t)
+	r := newCatalogTestDeployRunner(linePrintingExecutor{lines: []string{"pin: 1234", "5678"}}, &fakeCmapHandler{})
+
+	err := r.RunDeploy(context.Background(), DeployParameters{
+		Name:                   "test",
+		Namespace:              "test",
+		CatalogSecretVariables: []string{"PIN=1234\n5678"},
+		Deployable: Entity{
+			Commands: []model.DeployCommand{{Name: "print", Command: "print"}},
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "pin: ***")
+	assert.NotContains(t, out.String(), "1234")
+	assert.NotContains(t, out.String(), "5678")
+}
+
+func TestRunDeployDoesNotMaskTheLinesWithoutLettersOrDigitsOfCatalogSecretValues(t *testing.T) {
+	setFakeOktetoContext(t)
+	out := captureLogOutput(t)
+	r := newCatalogTestDeployRunner(linePrintingExecutor{lines: []string{"config: {}"}}, &fakeCmapHandler{})
+
+	err := r.RunDeploy(context.Background(), DeployParameters{
+		Name:                   "test",
+		Namespace:              "test",
+		CatalogSecretVariables: []string{"CONFIG={\npin\n}"},
+		Deployable: Entity{
+			Commands: []model.DeployCommand{{Name: "print", Command: "print"}},
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "config: {}")
+}
+
+func TestRunCommandsSectionDoesNotPersistCatalogSecretVariables(t *testing.T) {
+	setFakeOktetoContext(t)
+	exec := &fakeDestroyExecutor{}
+	cmapHandler := &fakeCmapHandler{}
+	r := DeployRunner{
+		Fs:               afero.NewMemMapFs(),
+		ConfigMapHandler: cmapHandler,
+		Executor:         exec,
+	}
+
+	err := r.runCommandsSection(context.Background(), DeployParameters{
+		Variables:              []string{"USER_VAR=value", "API_TOKEN=secret-value"},
+		CatalogSecretVariables: []string{"API_TOKEN=secret-value"},
+		Deployable:             Entity{Commands: []model.DeployCommand{{Name: "deploy", Command: "deploy"}}},
+	})
+
+	require.NoError(t, err)
+	assert.Contains(t, exec.envs[0], "API_TOKEN=secret-value")
+	assert.Equal(t, []string{"USER_VAR=value"}, cmapHandler.updatedEnvs)
+}

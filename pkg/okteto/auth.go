@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,22 +15,16 @@ package okteto
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
-	"io/ioutil"
-	"os"
-	"path/filepath"
+	"errors"
 
-	"github.com/machinebox/graphql"
-	"github.com/okteto/okteto/pkg/config"
-	"github.com/okteto/okteto/pkg/errors"
-	"github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/constants"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/types"
+	"github.com/shurcooL/graphql"
 )
 
-const (
-	tokenFile = ".token.json"
-)
+const cliSource = "cli"
 
 // Token contains the auth token and the URL it belongs to
 type Token struct {
@@ -43,288 +37,112 @@ type Token struct {
 	MachineID string `json:"MachineID"`
 }
 
-// User contains the auth information of the logged in user
-type User struct {
-	Name        string
-	Email       string
-	ExternalID  string
-	Token       string
-	ID          string
-	New         bool
-	Buildkit    string
-	Registry    string
-	Certificate string
+type authenticationErr struct {
+	E error
 }
 
-type u struct {
-	Auth User
+func (*authenticationErr) Error() string {
+	return "authentication error, please try again"
+}
+func (e *authenticationErr) Unwrap() error {
+	return e.E
 }
 
-type q struct {
-	User User
+func newAuthenticationErr(err error) *authenticationErr {
+	return &authenticationErr{
+		E: err,
+	}
 }
 
-var currentToken *Token
+var errGitHubNotVerifiedEmail = errors.New("your GitHub account doesn't have a verified primary email address. Please check your GitHub account email settings and try again")
 
-// AuthWithToken authenticates in okteto with the provided token
-func AuthWithToken(ctx context.Context, url, token string) (*User, error) {
-	client, err := getClient(url)
-	if err != nil {
-		return nil, err
-	}
+type authMutationStruct struct {
+	Response userMutation `graphql:"auth(code: $code, source: $source)"`
+}
 
-	user, err := queryUser(ctx, client, token)
-	if err != nil {
-		log.Infof("failed to query the user with the existing token: %s", err)
-		return nil, fmt.Errorf("invalid API token")
-	}
-
-	if err := saveAuthData(&user.User, url); err != nil {
-		log.Infof("failed to save the login data: %s", err)
-		return nil, fmt.Errorf("failed to save the login data locally")
-	}
-
-	return &user.User, nil
+type userMutation struct {
+	Id              graphql.String
+	Name            graphql.String
+	Namespace       graphql.String
+	Email           graphql.String
+	ExternalID      graphql.String `graphql:"externalID"`
+	Token           graphql.String
+	Registry        graphql.String
+	Buildkit        graphql.String
+	Certificate     graphql.String
+	GlobalNamespace graphql.String `graphql:"globalNamespace"`
+	New             graphql.Boolean
+	Analytics       graphql.Boolean `graphql:"telemetryEnabled"`
 }
 
 // Auth authenticates in okteto with an OAuth code
-func Auth(ctx context.Context, code, url string) (*User, error) {
-	client, err := getClient(url)
+func (c *Client) Auth(ctx context.Context, code string) (*types.User, error) {
+	user, err := c.authUser(ctx, code)
 	if err != nil {
-		return nil, err
-	}
-
-	user, err := authUser(ctx, client, code)
-	if err != nil {
-		log.Infof("authentication error: %s", err)
-		return nil, fmt.Errorf("authentication error, please try again")
-	}
-
-	if err := saveAuthData(&user.Auth, url); err != nil {
-		log.Infof("failed to save the auth data: %s", err)
-		return nil, fmt.Errorf("failed to save your auth info locally, please try again")
-	}
-
-	return &user.Auth, nil
-
-}
-
-func saveAuthData(user *User, url string) error {
-	if user.ExternalID == "" || user.Token == "" {
-		return fmt.Errorf("empty response")
-	}
-
-	if err := saveToken(user.ID, user.ExternalID, user.Token, url, user.Registry, user.Buildkit); err != nil {
-		return err
-	}
-
-	d, err := base64.StdEncoding.DecodeString(user.Certificate)
-	if err != nil {
-		return fmt.Errorf("certificate decoding error: %w", err)
-	}
-
-	return ioutil.WriteFile(GetCertificatePath(), d, 0600)
-}
-
-func queryUser(ctx context.Context, client *graphql.Client, token string) (*q, error) {
-	var user q
-	q := `query {
-		user {
-			id,name,email,externalID,token,new,registry,buildkit,certificate
-		}}`
-
-	req := getRequest(q, token)
-
-	if err := client.Run(ctx, req, &user); err != nil {
-		return nil, err
-	}
-
-	return &user, nil
-}
-
-func authUser(ctx context.Context, client *graphql.Client, code string) (*u, error) {
-	var user u
-	q := fmt.Sprintf(`mutation {
-		auth(code: "%s", source: "cli") {
-			id,name,email,externalID,token,new,registry,buildkit,certificate
-		}}`, code)
-
-	req := graphql.NewRequest(q)
-	if err := client.Run(ctx, req, &user); err != nil {
-		return nil, err
-	}
-
-	return &user, nil
-}
-
-//GetToken returns the token of the authenticated user
-func GetToken() (*Token, error) {
-	if currentToken == nil {
-		p := getTokenPath()
-
-		b, err := ioutil.ReadFile(p)
-		if err != nil {
+		oktetoLog.Infof("authentication error: %s", err)
+		if oktetoErrors.IsErrGitHubNotVerifiedEmail(err) {
+			return nil, errGitHubNotVerifiedEmail
+		}
+		// This error is sent at the mutation with Metadata. Our current client for GraphQL does not support this kind of error,
+		// so the information regarding metadata is lost here. Message is still communicated, so we can check the error
+		// https://github.com/okteto/okteto/issues/2926
+		if IsErrGithubMissingBusinessEmail(err) {
 			return nil, err
 		}
 
-		currentToken = &Token{}
-		if err := json.Unmarshal(b, currentToken); err != nil {
+		// If there is a TLS error, return the raw error
+		if err != nil && oktetoErrors.IsX509(err) {
 			return nil, err
 		}
-	}
 
-	return currentToken, nil
-}
-
-//IsAuthenticated returns if the user is authenticated
-func IsAuthenticated() bool {
-	t, err := GetToken()
-	if err != nil {
-		log.Infof("error getting okteto token: %s", err)
-		return false
-	}
-	return t.Token != ""
-}
-
-// GetUserID returns the userID of the authenticated user
-func GetUserID() string {
-	t, err := GetToken()
-	if err != nil {
-		return ""
-	}
-
-	return t.ID
-}
-
-// GetUsername returns the username of the authenticated user
-func GetUsername() string {
-	t, err := GetToken()
-	if err != nil {
-		return ""
-	}
-
-	return t.Username
-}
-
-// GetMachineID returns the userID of the authenticated user
-func GetMachineID() string {
-	t, err := GetToken()
-	if err != nil {
-		return ""
-	}
-
-	return t.MachineID
-}
-
-// GetURL returns the URL of the authenticated user
-func GetURL() string {
-	t, err := GetToken()
-	if err != nil {
-		return "na"
-	}
-
-	return t.URL
-}
-
-// GetRegistry returns the URL of the registry
-func GetRegistry() (string, error) {
-	t, err := GetToken()
-	if err != nil {
-		return "", errors.ErrNotLogged
-	}
-	if t.Registry == "" {
-		if GetURL() == CloudURL {
-			return CloudRegistryURL, nil
+		if isAPILicenseError(err) {
+			return nil, err
 		}
-		return "", errors.ErrNotLogged
+
+		err := newAuthenticationErr(err)
+		return nil, err
 	}
-	return t.Registry, nil
+
+	return user, nil
 }
 
-// GetBuildKit returns the URL of the okteto buildkit
-func GetBuildKit() (string, error) {
-	t, err := GetToken()
+func (c *Client) authUser(ctx context.Context, code string) (*types.User, error) {
+	var mutation authMutationStruct
+
+	queryVariables := map[string]interface{}{
+		"code":   graphql.String(code),
+		"source": graphql.String(cliSource),
+	}
+
+	err := mutate(ctx, &mutation, queryVariables, c.client)
 	if err != nil {
-		return "", errors.ErrNotLogged
+		return nil, err
 	}
-	if t.Buildkit == "" {
-		if GetURL() == CloudURL {
-			return CloudBuildKitURL, nil
-		}
-		return "", errors.ErrNotLogged
+
+	globalNamespace := getGlobalNamespace(string(mutation.Response.GlobalNamespace))
+	analytics := bool(mutation.Response.Analytics)
+
+	user := &types.User{
+		ID:              string(mutation.Response.Id),
+		Name:            string(mutation.Response.Name),
+		Namespace:       string(mutation.Response.Namespace),
+		Email:           string(mutation.Response.Email),
+		ExternalID:      string(mutation.Response.ExternalID),
+		Token:           string(mutation.Response.Token),
+		New:             bool(mutation.Response.New),
+		Registry:        string(mutation.Response.Registry),
+		Buildkit:        string(mutation.Response.Buildkit),
+		Certificate:     string(mutation.Response.Certificate),
+		GlobalNamespace: globalNamespace,
+		Analytics:       analytics,
 	}
-	return t.Buildkit, nil
+
+	return user, nil
 }
 
-// GetCertificatePath returns the path  to the certificate of the okteto buildkit
-func GetCertificatePath() string {
-	return filepath.Join(config.GetOktetoHome(), ".ca.crt")
-}
-
-func saveToken(id, username, token, url, registry, buildkit string) error {
-	t, err := GetToken()
-	if err != nil {
-		log.Infof("bad token, re-initializing: %s", err)
-		t = &Token{}
+func getGlobalNamespace(g string) string {
+	if g == "" {
+		return constants.DefaultGlobalNamespace
 	}
-
-	t.ID = id
-	t.Username = username
-	t.Token = token
-	t.URL = url
-	t.Buildkit = buildkit
-	t.Registry = registry
-	return save(t)
-}
-
-// SaveMachineID updates the token file with the machineID value
-func SaveMachineID(machineID string) error {
-	t, err := GetToken()
-	if err != nil {
-		log.Infof("bad token, re-initializing: %s", err)
-		t = &Token{}
-	}
-
-	t.MachineID = machineID
-	return save(t)
-}
-
-// SaveID updates the token file with the userID value
-func SaveID(userID string) error {
-	t, err := GetToken()
-	if err != nil {
-		log.Infof("bad token, re-initializing: %s", err)
-		t = &Token{}
-	}
-
-	t.ID = userID
-	return save(t)
-}
-
-func save(t *Token) error {
-	marshalled, err := json.Marshal(t)
-	if err != nil {
-		log.Infof("failed to marshal token: %s", err)
-		return fmt.Errorf("Failed to generate your auth token")
-	}
-
-	p := getTokenPath()
-
-	if _, err := os.Stat(p); err == nil {
-		err = os.Chmod(p, 0600)
-		if err != nil {
-			return fmt.Errorf("couldn't change token permissions: %s", err)
-		}
-	}
-
-	if err := ioutil.WriteFile(p, marshalled, 0600); err != nil {
-		return fmt.Errorf("couldn't save authentication token: %s", err)
-	}
-
-	currentToken = nil
-	return nil
-}
-
-func getTokenPath() string {
-	return filepath.Join(config.GetOktetoHome(), tokenFile)
+	return g
 }

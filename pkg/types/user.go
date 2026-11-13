@@ -1,0 +1,78 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package types
+
+// User contains the auth information of the logged in user
+type User struct {
+	Name            string
+	Namespace       string
+	Email           string
+	ExternalID      string
+	Token           string
+	ID              string
+	Buildkit        string
+	Registry        string
+	Certificate     string
+	GlobalNamespace string
+	Analytics       bool
+	New             bool
+}
+
+// ExecutionFile is a file the platform asks the cli to write before running
+// the deploy, destroy and test commands. The path of the written file is
+// exposed to the commands in the env var named EnvVar.
+type ExecutionFile struct {
+	EnvVar  string
+	Content string
+}
+
+// Reasons why a catalog secret variable can't be resolved
+const (
+	CatalogSecretNotFoundReason    = "secret_not_found"
+	CatalogSecretNotLabeledReason  = "secret_not_labeled"
+	CatalogSecretKeyNotFoundReason = "key_not_found"
+)
+
+// CatalogSecretVariables are the catalog secret variables of a development environment: the values of the ones that
+// can be resolved, and the ones that can't
+type CatalogSecretVariables struct {
+	Variables  []CatalogSecretVariable           `json:"variables"`
+	Unresolved []UnresolvedCatalogSecretVariable `json:"unresolved"`
+}
+
+// CatalogSecretVariable is a catalog secret variable with its value
+type CatalogSecretVariable struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// UnresolvedCatalogSecretVariable is a catalog secret variable whose Secret or key doesn't exist, or whose Secret
+// isn't labelled to be read by catalog items
+type UnresolvedCatalogSecretVariable struct {
+	Variable     string              `json:"variable"`
+	Reason       string              `json:"reason"`
+	SecretKeyRef CatalogSecretKeyRef `json:"secretKeyRef"`
+}
+
+// CatalogSecretKeyRef is the key of the Secret a catalog secret variable refers to
+type CatalogSecretKeyRef struct {
+	Name string `json:"name"`
+	Key  string `json:"key"`
+}
+
+// KnownHostsConfig contains the SSH known hosts configuration
+type KnownHostsConfig struct {
+	Content string
+	Enabled bool
+}

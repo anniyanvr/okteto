@@ -1,0 +1,2291 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package model
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/okteto/okteto/pkg/build"
+	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/deps"
+	"github.com/okteto/okteto/pkg/discovery"
+	"github.com/okteto/okteto/pkg/env"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/externalresource"
+	"github.com/okteto/okteto/pkg/log/io"
+	"github.com/okteto/okteto/pkg/model/forward"
+	"github.com/spf13/afero"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
+)
+
+func TestManifestExpandDevEnvs(t *testing.T) {
+	tests := []struct {
+		manifest         *Manifest
+		expectedManifest *Manifest
+		envs             map[string]string
+		name             string
+	}{
+		{
+			name: "autocreate without image but build section defined",
+			envs: map[string]string{
+				"OKTETO_BUILD_TEST_IMAGE": "test",
+			},
+			manifest: &Manifest{
+				Build: build.ManifestBuild{
+					"test": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"test": &Dev{
+						Autocreate: true,
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"test": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"test": &Dev{
+						Autocreate: true,
+						Image:      "test",
+					},
+				},
+			},
+		},
+		{
+			name:             "nothing to expand",
+			manifest:         &Manifest{},
+			expectedManifest: &Manifest{},
+		},
+
+		{
+			name: "autocreate with image and build section defined",
+			envs: map[string]string{
+				"build":   "test",
+				"myImage": "test-2",
+			},
+			manifest: &Manifest{
+				Build: build.ManifestBuild{
+					"test": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"test": &Dev{
+						Autocreate: true,
+						Image:      "${myImage}",
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"test": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"test": &Dev{
+						Autocreate: true,
+						Image:      "test-2",
+					},
+				},
+			},
+		},
+		{
+			name: "autocreate with image",
+			envs: map[string]string{
+				"build": "test",
+			},
+			manifest: &Manifest{
+				Dev: ManifestDevs{
+					"test": &Dev{
+						Autocreate: true,
+						Image:      "${build}",
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Dev: ManifestDevs{
+					"test": &Dev{
+						Autocreate: true,
+						Image:      "test",
+					},
+				},
+			},
+		},
+		{
+			name: "expand image",
+			envs: map[string]string{
+				"build": "test",
+			},
+			manifest:         &Manifest{},
+			expectedManifest: &Manifest{},
+		},
+		{
+			name: "expand image for remote deploy",
+			envs: map[string]string{
+				"myImage": "test",
+			},
+			manifest: &Manifest{
+				Deploy: &DeployInfo{
+					Image: "${myImage}",
+				},
+			},
+			expectedManifest: &Manifest{
+				Deploy: &DeployInfo{
+					Image: "test",
+				},
+			},
+		},
+		{
+			name: "does not expand vars in destroy command",
+			envs: map[string]string{
+				"TEST_VAR": "test",
+			},
+			manifest: &Manifest{
+				Destroy: &DestroyInfo{
+					Image: "",
+					Commands: []DeployCommand{
+						{
+							Name: "test",
+							Command: `TEST_VAR="do-not-expand-me"
+echo $TEST_VAR`,
+						},
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Destroy: &DestroyInfo{
+					Image: "",
+					Commands: []DeployCommand{
+						{
+							Name: "test",
+							Command: `TEST_VAR="do-not-expand-me"
+echo $TEST_VAR`,
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.envs {
+				t.Setenv(k, v)
+			}
+
+			err := tt.manifest.ExpandEnvVars()
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectedManifest, tt.manifest)
+		})
+	}
+}
+func TestManifestExpandEnvs(t *testing.T) {
+	tests := []struct {
+		envs            map[string]string
+		name            string
+		expectedCommand string
+		manifest        []byte
+		expectedErr     bool
+	}{
+		{
+			name: "does not expand envs on command",
+			envs: map[string]string{
+				"OKTETO_GIT_COMMIT": "dev",
+			},
+			manifest: []byte(`icon: https://apps.okteto.com/movies/icon.png
+deploy:
+  - okteto build -t okteto.dev/api:${OKTETO_GIT_COMMIT} api
+  - okteto build -t okteto.dev/frontend:${OKTETO_GIT_COMMIT} frontend
+  - helm upgrade --install movies chart --set tag=${OKTETO_GIT_COMMIT}
+`),
+			expectedCommand: "okteto build -t okteto.dev/api:${OKTETO_GIT_COMMIT} api",
+		},
+		{
+			name: "does not expand envs on command without env var set",
+			envs: map[string]string{},
+			manifest: []byte(`icon: https://apps.okteto.com/movies/icon.png
+deploy:
+  - okteto build -t okteto.dev/api:${OKTETO_GIT_COMMIT:=dev} api
+  - okteto build -t okteto.dev/frontend:${OKTETO_GIT_COMMIT} frontend
+  - helm upgrade --install movies chart --set tag=${OKTETO_GIT_COMMIT}
+`),
+			expectedCommand: "okteto build -t okteto.dev/api:${OKTETO_GIT_COMMIT:=dev} api",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.envs {
+				t.Setenv(k, v)
+			}
+			m, err := Read(tt.manifest)
+			assert.NoError(t, err)
+
+			err = m.ExpandEnvVars()
+			if tt.expectedErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expectedCommand, m.Deploy.Commands[0].Command)
+			}
+
+		})
+	}
+}
+
+func Test_validateDivert(t *testing.T) {
+	tests := []struct {
+		expectedErr error
+		name        string
+		divert      DivertDeploy
+	}{
+		{
+			name: "divert-ok-with-port",
+			divert: DivertDeploy{
+				Driver:               constants.OktetoDivertGatewayAPIDriver,
+				Namespace:            "namespace",
+				DeprecatedService:    "service",
+				DeprecatedPort:       8080,
+				DeprecatedDeployment: "deployment",
+			},
+			expectedErr: nil,
+		},
+		{
+			name: "divert-ok-without-service",
+			divert: DivertDeploy{
+				Driver:               constants.OktetoDivertGatewayAPIDriver,
+				Namespace:            "namespace",
+				DeprecatedService:    "",
+				DeprecatedPort:       8080,
+				DeprecatedDeployment: "deployment",
+			},
+			expectedErr: nil,
+		},
+		{
+			name: "divert-ok-without-deployment",
+			divert: DivertDeploy{
+				Driver:               constants.OktetoDivertGatewayAPIDriver,
+				Namespace:            "namespace",
+				DeprecatedService:    "service",
+				DeprecatedPort:       8080,
+				DeprecatedDeployment: "",
+			},
+			expectedErr: nil,
+		},
+		{
+			name: "divert-ok-without-port",
+			divert: DivertDeploy{
+				Driver:               constants.OktetoDivertGatewayAPIDriver,
+				Namespace:            "namespace",
+				DeprecatedService:    "service",
+				DeprecatedDeployment: "deployment",
+			},
+			expectedErr: nil,
+		},
+		{
+			name: "divert-ko-without-namespace",
+			divert: DivertDeploy{
+				Driver:               constants.OktetoDivertGatewayAPIDriver,
+				Namespace:            "",
+				DeprecatedService:    "service",
+				DeprecatedPort:       8080,
+				DeprecatedDeployment: "deployment",
+			},
+			expectedErr: fmt.Errorf("the field 'deploy.divert.namespace' is mandatory"),
+		},
+		{
+			name: "divert-ko-gateway-api-with-virtual-services",
+			divert: DivertDeploy{
+				Driver:          constants.OktetoDivertGatewayAPIDriver,
+				Namespace:       "namespace",
+				VirtualServices: []DivertVirtualService{{Name: "vs", Namespace: "namespace"}},
+			},
+			expectedErr: fmt.Errorf("the field 'deploy.divert.virtualServices' is not supported with the gateway-api driver"),
+		},
+		{
+			name: "divert-ko-gateway-api-with-hosts",
+			divert: DivertDeploy{
+				Driver:    constants.OktetoDivertGatewayAPIDriver,
+				Namespace: "namespace",
+				Hosts:     []DivertHost{{VirtualService: "vs", Namespace: "namespace"}},
+			},
+			expectedErr: fmt.Errorf("the field 'deploy.divert.hosts' is not supported with the gateway-api driver"),
+		},
+		{
+			name: "divert-ko-with-nginx-driver",
+			divert: DivertDeploy{
+				Driver:    "nginx",
+				Namespace: "namespace",
+			},
+			expectedErr: fmt.Errorf("the divert driver 'nginx' isn't supported"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &Manifest{
+				Deploy: &DeployInfo{
+					Divert: &tt.divert,
+				},
+			}
+			assert.Equal(t, m.validateDivert(), tt.expectedErr)
+		})
+	}
+}
+
+func Test_validateManifestBuild(t *testing.T) {
+	tests := []struct {
+		buildSection build.ManifestBuild
+		name         string
+		expectedErr  bool
+	}{
+		{
+			name: "nil build section",
+			buildSection: build.ManifestBuild{
+				"a": &build.Info{},
+				"b": nil,
+				"c": &build.Info{},
+			},
+			expectedErr: true,
+		},
+		{
+			name: "no cycle - no connections",
+			buildSection: build.ManifestBuild{
+				"a": &build.Info{},
+				"b": &build.Info{},
+				"c": &build.Info{},
+			},
+			expectedErr: false,
+		},
+		{
+			name: "no cycle - connections",
+			buildSection: build.ManifestBuild{
+				"a": &build.Info{
+					DependsOn: []string{"b"},
+				},
+				"b": &build.Info{
+					DependsOn: []string{"c"},
+				},
+				"c": &build.Info{},
+			},
+			expectedErr: false,
+		},
+		{
+			name: "cycle - same node dependency",
+			buildSection: build.ManifestBuild{
+				"a": &build.Info{
+					DependsOn: []string{"a"},
+				},
+				"b": &build.Info{
+					DependsOn: []string{},
+				},
+				"c": &build.Info{},
+			},
+			expectedErr: true,
+		},
+		{
+			name: "cycle - direct cycle",
+			buildSection: build.ManifestBuild{
+				"a": &build.Info{
+					DependsOn: []string{"b"},
+				},
+				"b": &build.Info{
+					DependsOn: []string{"a"},
+				},
+				"c": &build.Info{},
+			},
+			expectedErr: true,
+		},
+		{
+			name: "cycle - indirect cycle",
+			buildSection: build.ManifestBuild{
+				"a": &build.Info{
+					DependsOn: []string{"b"},
+				},
+				"b": &build.Info{
+					DependsOn: []string{"c"},
+				},
+				"c": &build.Info{
+					DependsOn: []string{"a"},
+				},
+			},
+			expectedErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &Manifest{
+				Build: tt.buildSection,
+			}
+			assert.Equal(t, tt.expectedErr, m.validate() != nil)
+		})
+	}
+}
+
+func TestInferFromStack(t *testing.T) {
+	dirtest := filepath.Clean("/stack/dir/")
+	if runtime.GOOS == "windows" {
+		dirtest = filepath.Clean("C:/stack/dir/")
+	}
+	devInterface := Localhost
+	stack := &Stack{
+		Services: map[string]*Service{
+			"test": {
+				Build: &build.Info{
+					Context:    filepath.Join(dirtest, "test"),
+					Dockerfile: "Dockerfile",
+				},
+				Ports: []Port{
+					{
+						HostPort:      8080,
+						ContainerPort: 8080,
+					},
+				},
+			},
+		},
+	}
+	tests := []struct {
+		currentManifest  *Manifest
+		expectedManifest *Manifest
+		name             string
+	}{
+		{
+			name: "infer from stack empty dev",
+			currentManifest: &Manifest{
+				Dev:   ManifestDevs{},
+				Build: build.ManifestBuild{},
+				Deploy: &DeployInfo{
+					Image: constants.OktetoPipelineRunnerImage,
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Build: &build.Info{
+										Context:    filepath.Join(dirtest, "test"),
+										Dockerfile: filepath.Join(filepath.Join(dirtest, "test"), "Dockerfile"),
+									},
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"test": &build.Info{
+						Context:    filepath.Join(dirtest, "test"),
+						Dockerfile: "Dockerfile",
+					},
+				},
+				Dev: ManifestDevs{},
+				Deploy: &DeployInfo{
+					Image: constants.OktetoPipelineRunnerImage,
+					ComposeSection: &ComposeSectionInfo{
+						Stack: stack,
+					},
+				},
+				Destroy: &DestroyInfo{},
+			},
+		},
+		{
+			name: "infer from stack not overriding build",
+			currentManifest: &Manifest{
+				Dev: ManifestDevs{},
+				Build: build.ManifestBuild{
+					"test": &build.Info{
+						Context:    "test-1",
+						Dockerfile: filepath.Join("test-1", "Dockerfile"),
+					},
+				},
+				Deploy: &DeployInfo{
+					Image: constants.OktetoPipelineRunnerImage,
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Build: &build.Info{
+										Context:    filepath.Join(dirtest, "test"),
+										Dockerfile: filepath.Join(filepath.Join(dirtest, "test"), "Dockerfile"),
+									},
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"test": &build.Info{
+						Context:    "test-1",
+						Dockerfile: filepath.Join("test-1", "Dockerfile"),
+					},
+				},
+				Dev:     ManifestDevs{},
+				Destroy: &DestroyInfo{},
+				Deploy: &DeployInfo{
+					Image: constants.OktetoPipelineRunnerImage,
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Build: &build.Info{
+										Context:    filepath.Join(dirtest, "test"),
+										Dockerfile: "Dockerfile",
+									},
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "infer from stack not overriding dev",
+			currentManifest: &Manifest{
+				Dev: ManifestDevs{
+					"test": &Dev{
+						Name: "one",
+					},
+				},
+				Build: build.ManifestBuild{},
+				Deploy: &DeployInfo{
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Build: &build.Info{
+										Context:    filepath.Join(dirtest, "test"),
+										Dockerfile: "Dockerfile",
+									},
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"test": &build.Info{
+						Context:    filepath.Join(dirtest, "test"),
+						Dockerfile: "Dockerfile",
+					},
+				},
+				Destroy: &DestroyInfo{},
+				Dev: ManifestDevs{
+					"test": &Dev{
+						Name: "one",
+						Metadata: &Metadata{
+							Labels:      Labels{},
+							Annotations: Annotations{},
+						},
+						Selector:        Selector{},
+						Image:           "",
+						ImagePullPolicy: apiv1.PullAlways,
+						InitContainer:   InitContainer{Image: config.NewImageConfig(io.NewIOController()).GetCliImage()},
+						Probes:          &Probes{},
+						Lifecycle:       &Lifecycle{},
+						Workdir:         "/okteto",
+						SecurityContext: &SecurityContext{
+							RunAsUser:  ptr.To(int64(0)),
+							RunAsGroup: ptr.To(int64(0)),
+							FSGroup:    ptr.To(int64(0)),
+						},
+						SSHServerPort: 2222,
+						Volumes:       []Volume{},
+						Timeout: Timeout{
+							Default:   60 * time.Second,
+							Resources: 120 * time.Second,
+						},
+						Command: Command{
+							Values: []string{"sh"},
+						},
+						Interface: devInterface,
+						Sync: Sync{
+							RescanInterval: 300,
+							Folders: []SyncFolder{
+								{
+									LocalPath:  ".",
+									RemotePath: "/okteto",
+								},
+							},
+						},
+						Mode: constants.OktetoSyncModeFieldValue,
+					},
+				},
+				Deploy: &DeployInfo{
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Build: &build.Info{
+										Context:    filepath.Join(dirtest, "test"),
+										Dockerfile: "Dockerfile",
+									},
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "infer from stack with build and image field",
+			currentManifest: &Manifest{
+				Dev:   ManifestDevs{},
+				Build: build.ManifestBuild{},
+				Deploy: &DeployInfo{
+					Image: constants.OktetoPipelineRunnerImage,
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Build: &build.Info{
+										Context:    "test",
+										Dockerfile: filepath.Join(filepath.Join(dirtest, "test"), "Dockerfile"),
+									},
+									Image: "okteto.dev/test:my-tag",
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"test": &build.Info{
+						Context:    "test",
+						Dockerfile: filepath.Join(filepath.Join(dirtest, "test"), "Dockerfile"),
+						Image:      "okteto.dev/test:my-tag",
+					},
+				},
+				Dev:     ManifestDevs{},
+				Destroy: &DestroyInfo{},
+				Deploy: &DeployInfo{
+					Image: constants.OktetoPipelineRunnerImage,
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Build: &build.Info{
+										Context:    "test",
+										Dockerfile: filepath.Join(filepath.Join(dirtest, "test"), "Dockerfile"),
+										Image:      "okteto.dev/test:my-tag",
+									},
+									Image: "okteto.dev/test:my-tag",
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "infer from stack with build section and service with image and volume mount",
+			currentManifest: &Manifest{
+				Dev: ManifestDevs{},
+				Build: build.ManifestBuild{
+					"test": &build.Info{
+						Context:    "test-1",
+						Dockerfile: filepath.Join("test-1", "Dockerfile"),
+					},
+				},
+				Deploy: &DeployInfo{
+					Image: constants.OktetoPipelineRunnerImage,
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Image: "okteto.dev/test:my-tag",
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+									VolumeMounts: []build.VolumeMounts{
+										{
+											LocalPath:  "./nginx.conf",
+											RemotePath: "/etc/nginx/nginx.conf",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"test": &build.Info{
+						Context:    "test-1",
+						Dockerfile: filepath.Join("test-1", "Dockerfile"),
+					},
+				},
+				Dev:     ManifestDevs{},
+				Destroy: &DestroyInfo{},
+				Deploy: &DeployInfo{
+					Image: constants.OktetoPipelineRunnerImage,
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Image: "okteto.dev/test:my-tag",
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+									VolumeMounts: []build.VolumeMounts{
+										{
+											LocalPath:  "./nginx.conf",
+											RemotePath: "/etc/nginx/nginx.conf",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "infer from stack empty build section and empty image",
+			currentManifest: &Manifest{
+				Deploy: &DeployInfo{
+					Image: constants.OktetoPipelineRunnerImage,
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Build: nil,
+									Image: "",
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Destroy: &DestroyInfo{},
+				Deploy: &DeployInfo{
+					Image: constants.OktetoPipelineRunnerImage,
+					ComposeSection: &ComposeSectionInfo{
+						Stack: &Stack{
+							Services: map[string]*Service{
+								"test": {
+									Image: "",
+									Ports: []Port{
+										{
+											HostPort:      8080,
+											ContainerPort: 8080,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tt.currentManifest.InferFromStack(filepath.Clean(dirtest))
+			if result != nil {
+				for _, d := range result.Dev {
+					d.parentSyncFolder = ""
+				}
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectedManifest, result)
+		})
+	}
+}
+
+func TestInferFromStackWithVolumeMounts(t *testing.T) {
+	dirtest := filepath.Clean("/stack/dir/")
+	fs := afero.NewMemMapFs()
+
+	oktetoHome, err := filepath.Abs("./tmp/tests")
+	require.NoError(t, err)
+	err = fs.MkdirAll(oktetoHome, 0700)
+	require.NoError(t, err)
+
+	// Set the Okteto home to control where the dockerfile will be created
+	t.Setenv(constants.OktetoFolderEnvVar, oktetoHome)
+
+	expectedContext, err := filepath.Abs(".")
+	require.NoError(t, err)
+
+	currentManifest := &Manifest{
+		Fs:    fs,
+		Dev:   ManifestDevs{},
+		Build: build.ManifestBuild{},
+		Deploy: &DeployInfo{
+			Image: constants.OktetoPipelineRunnerImage,
+			ComposeSection: &ComposeSectionInfo{
+				Stack: &Stack{
+					Services: map[string]*Service{
+						"test": {
+							Image: "okteto.dev/test:my-tag",
+							VolumeMounts: []build.VolumeMounts{
+								{
+									LocalPath:  "./nginx.conf",
+									RemotePath: "/etc/nginx/nginx.conf",
+								},
+							},
+							Ports: []Port{
+								{
+									HostPort:      8080,
+									ContainerPort: 8080,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	expectedVolumesToInclude := []build.VolumeMounts{
+		{
+			LocalPath:  "./nginx.conf",
+			RemotePath: "/etc/nginx/nginx.conf",
+		},
+	}
+
+	result, err := currentManifest.InferFromStack(filepath.Clean(dirtest))
+	require.NoError(t, err)
+
+	testBuildSection := result.Build["test"]
+	require.Equal(t, expectedContext, testBuildSection.Context)
+	require.True(t, strings.HasPrefix(testBuildSection.Dockerfile, filepath.Join(oktetoHome, ".dockerfile", "buildkit-")))
+	require.Empty(t, testBuildSection.Image)
+	require.ElementsMatch(t, expectedVolumesToInclude, testBuildSection.VolumesToInclude)
+
+	serviceSection := result.Deploy.ComposeSection.Stack.Services["test"]
+	require.Equal(t, expectedContext, serviceSection.Build.Context)
+	require.True(t, strings.HasPrefix(serviceSection.Build.Dockerfile, filepath.Join(oktetoHome, ".dockerfile", "buildkit-")))
+	require.Empty(t, serviceSection.Build.Image)
+	require.ElementsMatch(t, expectedVolumesToInclude, serviceSection.Build.VolumesToInclude)
+
+	dockerfileContent, err := afero.ReadFile(fs, testBuildSection.Dockerfile)
+	require.NoError(t, err)
+
+	// Ensure Dockerfile was generated as it is expected in this scenario
+	expected := "FROM okteto.dev/test:my-tag\nCOPY ./nginx.conf /etc/nginx/nginx.conf\n"
+	require.Equal(t, expected, string(dockerfileContent))
+}
+
+func TestSetBuildDefaults(t *testing.T) {
+	tests := []struct {
+		name         string
+		currentInfo  build.Info
+		expectedInfo build.Info
+	}{
+		{
+			name:        "all empty",
+			currentInfo: build.Info{},
+			expectedInfo: build.Info{
+				Context:    ".",
+				Dockerfile: "Dockerfile",
+			},
+		},
+		{
+			name: "context empty",
+			currentInfo: build.Info{
+				Dockerfile: "Dockerfile",
+			},
+			expectedInfo: build.Info{
+				Context:    ".",
+				Dockerfile: "Dockerfile",
+			},
+		},
+		{
+			name: "dockerfile empty",
+			currentInfo: build.Info{
+				Context: "buildName",
+			},
+			expectedInfo: build.Info{
+				Context:    "buildName",
+				Dockerfile: "Dockerfile",
+			},
+		},
+		{
+			name: "context and Dockerfile filled",
+			currentInfo: build.Info{
+				Context:    "buildName",
+				Dockerfile: "Dockerfile",
+			},
+			expectedInfo: build.Info{
+				Context:    "buildName",
+				Dockerfile: "Dockerfile",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+
+		t.Run(tt.name, func(t *testing.T) {
+
+			tt.currentInfo.SetBuildDefaults()
+
+			assert.Equal(t, tt.expectedInfo, tt.currentInfo)
+		})
+	}
+}
+
+func Test_getManifestFromFile(t *testing.T) {
+	tests := []struct {
+		expectedErr   error
+		name          string
+		manifestBytes []byte
+		composeBytes  []byte
+	}{
+		{
+			name:          "manifestPath to a valid compose file",
+			manifestBytes: nil,
+			composeBytes: []byte(`services:
+    test:
+        image: test`),
+		},
+		{
+			name:          "manifestPath to an invalid compose file with empty service",
+			manifestBytes: nil,
+			composeBytes: []byte(`services:
+    test:
+`),
+			expectedErr: oktetoErrors.ErrServiceEmpty,
+		},
+		{
+			name:          "manifestPath to empty okteto manifest, no compose file",
+			manifestBytes: []byte(``),
+			composeBytes:  nil,
+			expectedErr:   oktetoErrors.ErrEmptyManifest,
+		},
+		{
+			name:          "manifestPath to invalid okteto manifest, no compose file",
+			manifestBytes: []byte(`asdasa: asda`),
+			composeBytes:  nil,
+			expectedErr:   oktetoErrors.ErrInvalidManifest,
+		},
+		{
+			name: "manifestPath to valid v2 okteto manifest",
+			manifestBytes: []byte(`dev:
+    api:
+        sync:
+        - .:/usr`),
+			composeBytes: nil,
+		},
+		{
+			name: "manifestPath to valid v1 okteto manifest",
+			manifestBytes: []byte(`name: test
+sync:
+  - .:/usr`),
+			expectedErr:  fmt.Errorf("your Okteto Manifest is not valid, please check the following errors:"),
+			composeBytes: nil,
+		},
+		{
+			name:          "manifestPath to non-existent okteto manifest, no compose file",
+			manifestBytes: nil,
+			composeBytes:  nil,
+			expectedErr:   discovery.ErrOktetoManifestNotFound,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			file := ""
+			if tt.manifestBytes != nil {
+				file = filepath.Join(dir, "okteto.yml")
+				assert.NoError(t, os.WriteFile(filepath.Join(dir, "okteto.yml"), tt.manifestBytes, 0600))
+			}
+			if tt.composeBytes != nil {
+				if file == "" {
+					file = filepath.Join(dir, "docker-compose.yml")
+				}
+				assert.NoError(t, os.WriteFile(filepath.Join(dir, "docker-compose.yml"), tt.composeBytes, 0600))
+			}
+			_, err := getManifestFromFile(dir, file, afero.NewMemMapFs())
+
+			if tt.expectedErr != nil {
+				assert.ErrorContains(t, err, tt.expectedErr.Error())
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// Test_getManifestFromFile_composeFilenameReturnsComposeError exercises the
+// branch added in pkg/model/manifest.go that returns the compose/stack error
+// (instead of the okteto manifest error) when both parsers fail and the file
+// has a recognised compose filename.
+func Test_getManifestFromFile_composeFilenameReturnsComposeError(t *testing.T) {
+	// "asdasa: asda" is invalid for both the okteto manifest parser and the
+	// compose/stack parser, but it is not an empty file, depends-on error, or
+	// empty-service error, so none of the early-return guards fire.
+	invalidContent := []byte("asdasa: asda")
+
+	dir := t.TempDir()
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	require.NoError(t, os.WriteFile(composeFile, invalidContent, 0600))
+
+	_, err := getManifestFromFile(dir, composeFile, afero.NewMemMapFs())
+
+	require.Error(t, err)
+	// The returned error must come from the compose/stack parser.
+	require.ErrorContains(t, err, "invalid compose manifest")
+	// It must NOT be the okteto manifest error, which is what would be returned
+	// for a non-compose-named file in the same situation.
+	require.False(t, errors.Is(err, oktetoErrors.ErrInvalidManifest),
+		"expected compose/stack error to be returned, not okteto manifest error")
+}
+
+func TestHasDev(t *testing.T) {
+	tests := []struct {
+		name       string
+		devSection ManifestDevs
+		devName    string
+		out        bool
+	}{
+		{
+			name: "devName is on dev section",
+			devSection: ManifestDevs{
+				"autocreate": &Dev{},
+			},
+			devName: "autocreate",
+			out:     true,
+		},
+		{
+			name: "devName is not on dev section",
+			devSection: ManifestDevs{
+				"autocreate": &Dev{},
+			},
+			devName: "not-autocreate",
+			out:     false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.devSection.HasDev(tt.devName)
+			assert.Equal(t, tt.out, result)
+		})
+	}
+}
+
+func Test_SanitizeSvcNames(t *testing.T) {
+	tests := []struct {
+		expectedErr      error
+		manifest         *Manifest
+		expectedManifest *Manifest
+		name             string
+	}{
+		{
+			name: "keys-have-uppercase",
+			manifest: &Manifest{
+				Build: build.ManifestBuild{
+					"Frontend": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"Frontend": &Dev{},
+				},
+				GlobalForward: []forward.GlobalForward{
+					{
+						ServiceName: "Frontend",
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"frontend": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"frontend": &Dev{
+						Name: "frontend",
+					},
+				},
+				GlobalForward: []forward.GlobalForward{
+					{
+						ServiceName: "frontend",
+					},
+				},
+			},
+		},
+		{
+			name: "keys-have-spaces",
+			manifest: &Manifest{
+				Build: build.ManifestBuild{
+					" my build service": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"my dev service": &Dev{},
+				},
+				GlobalForward: []forward.GlobalForward{
+					{
+						ServiceName: "my global forward ",
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"my-build-service": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"my-dev-service": &Dev{
+						Name: "my-dev-service",
+					},
+				},
+				GlobalForward: []forward.GlobalForward{
+					{
+						ServiceName: "my-global-forward",
+					},
+				},
+			},
+		},
+		{
+			name: "keys-have-underscore",
+			manifest: &Manifest{
+				Build: build.ManifestBuild{
+					"my_build_service": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"my_dev_service": &Dev{},
+				},
+				GlobalForward: []forward.GlobalForward{
+					{
+						ServiceName: "my_global_forward",
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"my-build-service": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"my-dev-service": &Dev{
+						Name: "my-dev-service",
+					},
+				},
+				GlobalForward: []forward.GlobalForward{
+					{
+						ServiceName: "my-global-forward",
+					},
+				},
+			},
+		},
+		{
+			name: "keys-have-mix",
+			manifest: &Manifest{
+				Build: build.ManifestBuild{
+					"  my_Build service": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"my_DEV_service ": &Dev{},
+				},
+				GlobalForward: []forward.GlobalForward{
+					{
+						ServiceName: "my glOBal_forward",
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"my-build-service": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"my-dev-service": &Dev{
+						Name: "my-dev-service",
+					},
+				},
+				GlobalForward: []forward.GlobalForward{
+					{
+						ServiceName: "my-global-forward",
+					},
+				},
+			},
+		},
+		{
+			name: "keys-have-trailing-spaces",
+			manifest: &Manifest{
+				Build: build.ManifestBuild{
+					"  my-build ": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					" my-dev  ": &Dev{},
+				},
+				GlobalForward: []forward.GlobalForward{
+					{
+						ServiceName: "   my-global   ",
+					},
+				},
+			},
+			expectedManifest: &Manifest{
+				Build: build.ManifestBuild{
+					"my-build": &build.Info{},
+				},
+				Dev: ManifestDevs{
+					"my-dev": &Dev{
+						Name: "my-dev",
+					},
+				},
+				GlobalForward: []forward.GlobalForward{
+					{
+						ServiceName: "my-global",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.manifest.SanitizeSvcNames()
+			assert.ErrorIs(t, err, tt.expectedErr)
+			assert.Equal(t, tt.expectedManifest, tt.manifest)
+		})
+	}
+}
+
+func Test_Manifest_HasDeploySection(t *testing.T) {
+	tests := []struct {
+		manifest *Manifest
+		name     string
+		expected bool
+	}{
+		{
+			name:     "nil manifest",
+			expected: false,
+		},
+		{
+			name:     " m.Deploy is nil",
+			manifest: &Manifest{},
+			expected: false,
+		},
+		{
+			name: " m.Deploy.Commands is nil",
+			manifest: &Manifest{
+				Deploy: &DeployInfo{},
+			},
+			expected: false,
+		},
+		{
+			name: " Commands is empty",
+			manifest: &Manifest{
+				Deploy: &DeployInfo{
+					Commands: []DeployCommand{},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: " m.Deploy.Commands has items",
+			manifest: &Manifest{
+				Deploy: &DeployInfo{
+					Commands: []DeployCommand{
+						{
+							Name:    "test",
+							Command: "echo test",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: " ComposeSection is nil",
+			manifest: &Manifest{
+				Deploy: &DeployInfo{},
+			},
+			expected: false,
+		},
+		{
+			name: " ComposeSection.ComposesInfo is nil",
+			manifest: &Manifest{
+				Deploy: &DeployInfo{
+					ComposeSection: &ComposeSectionInfo{},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: " m.Deploy.ComposeSection.ComposesInfo has items",
+			manifest: &Manifest{
+				Deploy: &DeployInfo{
+					ComposeSection: &ComposeSectionInfo{
+						ComposesInfo: ComposeInfoList{
+							{
+								File:             "docker-compose.yml",
+								ServicesToDeploy: ServicesToDeploy{"test"},
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.manifest.HasDeploySection()
+			assert.Equal(t, tt.expected, got)
+		})
+
+	}
+}
+
+func Test_Manifest_HasDependenciesSection(t *testing.T) {
+	tests := []struct {
+		manifest *Manifest
+		name     string
+		expected bool
+	}{
+		{
+			name:     "nil manifest",
+			expected: false,
+		},
+		{
+			name:     "m.Dependencies is nil",
+			manifest: &Manifest{},
+			expected: false,
+		},
+		{
+			name: "m.Dependencies has items",
+			manifest: &Manifest{
+				Dependencies: deps.ManifestSection{
+					"test": &deps.Dependency{},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.manifest.HasDependenciesSection()
+			assert.Equal(t, tt.expected, got)
+		})
+
+	}
+}
+
+func Test_Manifest_HasBuildSection(t *testing.T) {
+	tests := []struct {
+		manifest *Manifest
+		name     string
+		expected bool
+	}{
+		{
+			name:     "nil manifest",
+			expected: false,
+		},
+		{
+			name:     "m.Build is nil",
+			manifest: &Manifest{},
+			expected: false,
+		},
+		{
+			name: "m.Build has items",
+			manifest: &Manifest{
+				Build: build.ManifestBuild{
+					"test": &build.Info{},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.manifest.HasBuildSection()
+			assert.Equal(t, tt.expected, got)
+		})
+
+	}
+}
+
+func Test_getInferredManifestWhenNoManifestExist(t *testing.T) {
+	wd := t.TempDir()
+	result, err := GetInferredManifest(wd, afero.NewMemMapFs())
+	assert.Empty(t, result)
+	assert.ErrorIs(t, err, oktetoErrors.ErrCouldNotInferAnyManifest)
+}
+
+func TestSecretValidate(t *testing.T) {
+	file, err := os.CreateTemp("", "okteto-secret-test-validate")
+	assert.NoError(t, err)
+	defer os.Remove(file.Name())
+
+	tmpDir := t.TempDir()
+	defer os.Remove(tmpDir)
+
+	var tests = []struct {
+		s           *Secret
+		expectedErr error
+		name        string
+	}{
+		{
+			name:        "missing local path",
+			s:           &Secret{LocalPath: "", RemotePath: "test"},
+			expectedErr: fmt.Errorf("secrets must follow the syntax 'LOCAL_PATH:REMOTE_PATH:MODE'"),
+		},
+		{
+			name:        "missing remote path",
+			s:           &Secret{LocalPath: "test", RemotePath: ""},
+			expectedErr: fmt.Errorf("secrets must follow the syntax 'LOCAL_PATH:REMOTE_PATH:MODE'"),
+		},
+		{
+			name:        "missing both",
+			s:           &Secret{LocalPath: "", RemotePath: ""},
+			expectedErr: fmt.Errorf("secrets must follow the syntax 'LOCAL_PATH:REMOTE_PATH:MODE'"),
+		},
+		{
+			name:        "local path must be file not directory",
+			s:           &Secret{LocalPath: tmpDir, RemotePath: "./remote"},
+			expectedErr: fmt.Errorf("secret '%s' is not a regular file", tmpDir),
+		},
+		{
+			name:        "remote path must use absolute paths",
+			s:           &Secret{LocalPath: file.Name(), RemotePath: "./remote"},
+			expectedErr: fmt.Errorf("secret remote path './remote' must be an absolute path"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.s.validate()
+			assert.Equal(t, tt.expectedErr, err)
+		})
+	}
+}
+
+func TestRead(t *testing.T) {
+	tests := []struct {
+		expected    *Manifest
+		name        string
+		manifest    []byte
+		expectedErr bool
+	}{
+		{
+			name:     "nil bytes return valid initialized v1 manifest",
+			manifest: nil,
+			expected: &Manifest{
+				Name:         "",
+				Icon:         "",
+				ManifestPath: "",
+				Test:         ManifestTests{},
+				Deploy: &DeployInfo{
+					Endpoints: nil,
+					Image:     "",
+					Commands:  nil,
+				},
+				Dev: ManifestDevs{},
+				Destroy: &DestroyInfo{
+					Image:    "",
+					Commands: nil,
+				},
+				Build:         build.ManifestBuild{},
+				Dependencies:  deps.ManifestSection{},
+				GlobalForward: []forward.GlobalForward{},
+				External:      externalresource.Section{},
+				Type:          OktetoManifestType,
+				Manifest:      nil,
+				Fs:            afero.NewOsFs(),
+			},
+		},
+		{
+			name:     "empty bytes return valid initialized v1 manifest",
+			manifest: []byte(""),
+			expected: &Manifest{
+				Name:         "",
+				Icon:         "",
+				ManifestPath: "",
+				Test:         ManifestTests{},
+				Deploy: &DeployInfo{
+					Endpoints: nil,
+					Image:     "",
+					Commands:  nil,
+				},
+				Dev: ManifestDevs{},
+				Destroy: &DestroyInfo{
+					Image:    "",
+					Commands: nil,
+				},
+				Build:         build.ManifestBuild{},
+				Dependencies:  deps.ManifestSection{},
+				GlobalForward: []forward.GlobalForward{},
+				External:      externalresource.Section{},
+				Type:          OktetoManifestType,
+				Manifest:      []uint8{},
+				Fs:            afero.NewOsFs(),
+			},
+		},
+		{
+			name:        "invalid YAML format",
+			manifest:    []byte("{invalid yaml}"),
+			expected:    nil,
+			expectedErr: true,
+		},
+		{
+			name: "failed validation due to cyclic dependencies",
+			manifest: []byte(`build:
+  test1:
+    context: ./test1
+    depends_on: test2
+  test2:
+    context: ./test2
+    depends_on: test2`),
+			expected:    nil,
+			expectedErr: true,
+		},
+		{
+			name: "success parsing dev",
+			manifest: []byte(`dev:
+  test:
+    image: test-image`),
+			expected: &Manifest{
+				Name:          "",
+				Icon:          "",
+				ManifestPath:  "",
+				Deploy:        &DeployInfo{},
+				Test:          ManifestTests{},
+				GlobalForward: []forward.GlobalForward{},
+				Dev: ManifestDevs{
+					"test": &Dev{
+						Name: "test",
+						Metadata: &Metadata{
+							Labels:      Labels{},
+							Annotations: Annotations{},
+						},
+						Selector:        Selector{},
+						Image:           "test-image",
+						ImagePullPolicy: apiv1.PullAlways,
+						InitContainer:   InitContainer{Image: config.NewImageConfig(io.NewIOController()).GetCliImage()},
+						Probes:          &Probes{},
+						Lifecycle:       &Lifecycle{},
+						Workdir:         "/okteto",
+						SecurityContext: &SecurityContext{
+							RunAsUser:  ptr.To(int64(0)),
+							RunAsGroup: ptr.To(int64(0)),
+							FSGroup:    ptr.To(int64(0)),
+						},
+						SSHServerPort: 2222,
+						Volumes:       []Volume{},
+						Timeout: Timeout{
+							Default:   60 * time.Second,
+							Resources: 120 * time.Second,
+						},
+						Command: Command{
+							Values: []string{"sh"},
+						},
+						Interface: Localhost,
+						Sync: Sync{
+							RescanInterval: 300,
+							Folders: []SyncFolder{
+								{
+									LocalPath:  ".",
+									RemotePath: "/okteto",
+								},
+							},
+						},
+						PersistentVolumeInfo: &PersistentVolumeInfo{
+							Enabled: true,
+						},
+						Mode:        constants.OktetoSyncModeFieldValue,
+						Services:    []*Dev{},
+						Forward:     []forward.Forward{},
+						Environment: env.Environment{},
+						Secrets:     []Secret{},
+					},
+				},
+				Destroy: &DestroyInfo{
+					Image:    "",
+					Commands: nil,
+				},
+				Build:        build.ManifestBuild{},
+				Dependencies: deps.ManifestSection{},
+				External:     externalresource.Section{},
+				Type:         OktetoManifestType,
+				Manifest: []byte(`dev:
+  test:
+    image: test-image`),
+				Fs: afero.NewOsFs(),
+			},
+			expectedErr: false,
+		},
+		{
+			name: "empty build service returns an error",
+			manifest: []byte(`build:
+  frontend:
+  backend:
+    context: ./backend`),
+			expected:    nil,
+			expectedErr: true,
+		},
+		{
+			// Because we call setDefaults before validate, this test case helps remember that the order in which
+			// We call setDefaults before calling validate must be respected or a refactor is required. If we call
+			// validate before setDefaults, this test case fails with an error because driver is empty.
+			name: "success - divert driver set before validation",
+			manifest: []byte(`deploy:
+  divert:
+    namespace: staging
+    service: service-b`),
+			expected: &Manifest{
+				Name:          "",
+				Icon:          "",
+				ManifestPath:  "",
+				Test:          ManifestTests{},
+				GlobalForward: []forward.GlobalForward{},
+				Deploy: &DeployInfo{
+					ComposeSection: nil,
+					Endpoints:      nil,
+					Divert: &DivertDeploy{
+						Driver:               "gateway-api",
+						Namespace:            "staging",
+						DeprecatedService:    "service-b",
+						DeprecatedDeployment: "",
+						VirtualServices:      nil,
+						Hosts:                nil,
+						DeprecatedPort:       0,
+					},
+					Image:    "",
+					Commands: nil,
+				},
+				Dev: ManifestDevs{},
+				Destroy: &DestroyInfo{
+					Image:    "",
+					Commands: nil,
+				},
+				Build:        build.ManifestBuild{},
+				Dependencies: deps.ManifestSection{},
+				External:     externalresource.Section{},
+				Type:         OktetoManifestType,
+				Fs:           afero.NewOsFs(),
+				Manifest: []byte(`deploy:
+  divert:
+    namespace: staging
+    service: service-b`),
+			},
+			expectedErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manifest, err := Read(tt.manifest)
+			if tt.expectedErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.expected, manifest)
+		})
+	}
+}
+
+func TestPathExistsAndDir(t *testing.T) {
+	fs := afero.NewOsFs()
+	path, err := afero.TempDir(fs, "", "")
+	require.NoError(t, err)
+	require.Equal(t, pathExistsAndDir(path), true)
+}
+
+func TestPathExistsAndDirError(t *testing.T) {
+	tests := []struct {
+		name       string
+		createFile bool
+		expected   bool
+	}{
+		{
+			name:       "error: path doesn't exist",
+			createFile: false,
+			expected:   false,
+		},
+		{
+			name:       "error: path is not a dir",
+			createFile: true,
+			expected:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var path string
+			if tt.createFile {
+				fs := afero.NewMemMapFs()
+				file, err := afero.TempFile(fs, "", "")
+				require.NoError(t, err)
+				path = file.Name()
+			}
+			require.Equal(t, pathExistsAndDir(path), tt.expected)
+
+		})
+	}
+}
+
+func TestGetBuildContextForComposeWithVolumeMounts(t *testing.T) {
+	currentDir, err := filepath.Abs(".")
+	require.NoError(t, err)
+	var tests = []struct {
+		name     string
+		manifest *Manifest
+		expected string
+	}{
+		{
+			name: "build context with manifest path",
+			manifest: &Manifest{
+				ManifestPath: filepath.Join("tmp", "test", "okteto.yml"),
+			},
+			expected: filepath.Join("tmp", "test"),
+		},
+		{
+			name: "build context with manifest path and .okteto directory",
+			manifest: &Manifest{
+				ManifestPath: filepath.Join("tmp", "test", ".okteto", "okteto.yml"),
+			},
+			expected: filepath.Join("tmp", "test"),
+		},
+		{
+			name: "build context with manifest path and compose information",
+			manifest: &Manifest{
+				ManifestPath: filepath.Join("tmp", "test", "okteto.yml"),
+				Deploy: &DeployInfo{
+					ComposeSection: &ComposeSectionInfo{
+						ComposesInfo: ComposeInfoList{
+							{
+								File: filepath.Join("tmp", "test", "unit", "docker-compose.yml"),
+							},
+							{
+								File: filepath.Join("tmp", "test", "docker-compose.yml"),
+							},
+						},
+					},
+				},
+			},
+			expected: filepath.Join("tmp", "test"),
+		},
+		{
+			name: "build context with manifest path with .okteto directory and compose information",
+			manifest: &Manifest{
+				ManifestPath: filepath.Join("tmp", "test", ".okteto", "okteto.yml"),
+				Deploy: &DeployInfo{
+					ComposeSection: &ComposeSectionInfo{
+						ComposesInfo: ComposeInfoList{
+							{
+								File: filepath.Join("tmp", "test", "unit", "docker-compose.yml"),
+							},
+							{
+								File: filepath.Join("tmp", "test", "docker-compose.yml"),
+							},
+						},
+					},
+				},
+			},
+			expected: filepath.Join("tmp", "test"),
+		},
+		{
+			name: "build context without manifest path and with compose information",
+			manifest: &Manifest{
+				Deploy: &DeployInfo{
+					ComposeSection: &ComposeSectionInfo{
+						ComposesInfo: ComposeInfoList{
+							{
+								File: filepath.Join("tmp", "test", "unit", "docker-compose.yml"),
+							},
+							{
+								File: filepath.Join("tmp", "test", "docker-compose.yml"),
+							},
+						},
+					},
+				},
+			},
+			expected: filepath.Join("tmp", "test", "unit"),
+		},
+		{
+			name: "build context without manifest path and with compose information with .okteto directory",
+			manifest: &Manifest{
+				Deploy: &DeployInfo{
+					ComposeSection: &ComposeSectionInfo{
+						ComposesInfo: ComposeInfoList{
+							{
+								File: filepath.Join("tmp", "test", "unit", ".okteto", "docker-compose.yml"),
+							},
+							{
+								File: filepath.Join("tmp", "test", "docker-compose.yml"),
+							},
+						},
+					},
+				},
+			},
+			expected: filepath.Join("tmp", "test", "unit"),
+		},
+		{
+			name:     "build context without manifest path and compose information",
+			manifest: &Manifest{},
+			expected: currentDir,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := getBuildContextForComposeWithVolumeMounts(tt.manifest)
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+func TestDeployInfo_IsEmpty(t *testing.T) {
+	tests := []struct {
+		deployInfo DeployInfo
+		isEmpty    bool
+	}{
+		{
+			deployInfo: DeployInfo{
+				Commands: []DeployCommand{
+					{
+						Name:    "Deploy",
+						Command: "echo 'Replace this line with the proper 'helm' or 'kubectl' commands to deploy your development environment'",
+					},
+				},
+			},
+			isEmpty: false,
+		},
+		{
+			deployInfo: DeployInfo{
+				ComposeSection: &ComposeSectionInfo{
+					Stack: &Stack{},
+				},
+			},
+			isEmpty: false,
+		},
+		{
+			deployInfo: DeployInfo{
+				Divert: &DivertDeploy{},
+			},
+			isEmpty: false,
+		},
+		{
+			deployInfo: DeployInfo{
+				Endpoints: EndpointSpec{},
+			},
+			isEmpty: false,
+		},
+		{
+			deployInfo: DeployInfo{},
+			isEmpty:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		isEmpty := tt.deployInfo.IsEmpty()
+		if isEmpty != tt.isEmpty {
+			t.Errorf("expected IsEmpty() to be %v, but got %v", tt.isEmpty, isEmpty)
+		}
+	}
+}
+func TestManifestTests_IsEmpty(t *testing.T) {
+	tests := []struct {
+		tests   ManifestTests
+		isEmpty bool
+	}{
+		{
+			tests:   ManifestTests{},
+			isEmpty: true,
+		},
+		{
+			tests: ManifestTests{
+				"test1": &Test{},
+				"test2": &Test{},
+			},
+			isEmpty: false,
+		},
+	}
+
+	for _, tt := range tests {
+		isEmpty := tt.tests.IsEmpty()
+		if isEmpty != tt.isEmpty {
+			t.Errorf("expected IsEmpty to be %v, but got %v", tt.isEmpty, isEmpty)
+		}
+	}
+}
+
+func TestDestroyInfo_IsEmpty(t *testing.T) {
+	tests := []struct {
+		destroyInfo DestroyInfo
+		isEmpty     bool
+	}{
+		{
+			destroyInfo: DestroyInfo{},
+			isEmpty:     true,
+		},
+		{
+			destroyInfo: DestroyInfo{
+				Image: "image",
+			},
+			isEmpty: false,
+		},
+		{
+			destroyInfo: DestroyInfo{
+				Commands: []DeployCommand{
+					{
+						Name:    "Destroy",
+						Command: "echo 'Replace this line with the proper 'helm' or 'kubectl' commands to destroy your development environment'",
+					},
+				},
+			},
+			isEmpty: false,
+		},
+	}
+
+	for _, tt := range tests {
+		isEmpty := tt.destroyInfo.IsEmpty()
+		if isEmpty != tt.isEmpty {
+			t.Errorf("expected IsEmpty to be %v, but got %v", tt.isEmpty, isEmpty)
+		}
+	}
+}
+
+func TestManifest_IsEmpty(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest Manifest
+		isErr    bool
+	}{
+		{
+			name:     "empty manifest",
+			manifest: Manifest{},
+			isErr:    false,
+		},
+		{
+			name: "manifest with test",
+			manifest: Manifest{
+				Test: ManifestTests{
+					"test1": &Test{},
+					"test2": &Test{},
+				},
+			},
+			isErr: true,
+		},
+		{
+			name: "manifest with deploy",
+			manifest: Manifest{
+				Deploy: &DeployInfo{
+					Commands: []DeployCommand{
+						{
+							Name:    "Deploy",
+							Command: "echo 'Replace this line with the proper 'helm' or 'kubectl' commands to deploy your development environment'",
+						},
+					},
+				},
+			},
+			isErr: true,
+		},
+		{
+			name: "manifest with destroy",
+			manifest: Manifest{
+				Destroy: &DestroyInfo{
+					Commands: []DeployCommand{
+						{
+							Name:    "Destroy",
+							Command: "echo 'Replace this line with the proper 'helm' or 'kubectl' commands to destroy your development environment'",
+						},
+					},
+				},
+			},
+			isErr: true,
+		},
+		{
+			name: "manifest with external",
+			manifest: Manifest{
+				External: externalresource.Section{
+					"external1": &externalresource.ExternalResource{},
+				},
+			},
+			isErr: true,
+		},
+		{
+			name: "manifest with dependencies",
+			manifest: Manifest{
+				Dependencies: deps.ManifestSection{
+					"dep1": &deps.Dependency{},
+					"dep2": &deps.Dependency{},
+				},
+			},
+			isErr: true,
+		},
+		{
+			name: "manifest with build",
+			manifest: Manifest{
+				Build: build.ManifestBuild{
+					"service1": &build.Info{},
+					"service2": &build.Info{},
+				},
+			},
+			isErr: true,
+		},
+		{
+			name: "manifest with name",
+			manifest: Manifest{
+				Name: "manifest",
+			},
+			isErr: true,
+		},
+		{
+			name: "manifest with icon",
+			manifest: Manifest{
+				Icon: "icon",
+			},
+			isErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.manifest.ValidateForCLIOnly()
+			if tt.isErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestDivertDeployIsEmpty(t *testing.T) {
+	tests := []struct {
+		d    *DivertDeploy
+		name string
+		want bool
+	}{
+		{
+			name: "nil DivertDeploy",
+			d:    nil,
+			want: true,
+		},
+		{
+			name: "Empty DivertDeploy",
+			d:    &DivertDeploy{},
+			want: true,
+		},
+		{
+			name: "Non-empty Driver",
+			d: &DivertDeploy{
+				Driver: "gateway-api",
+			},
+			want: false,
+		},
+		{
+			name: "Non-empty Namespace",
+			d: &DivertDeploy{
+				Namespace: "default",
+			},
+			want: false,
+		},
+		{
+			name: "Non-empty VirtualServices",
+			d: &DivertDeploy{
+				VirtualServices: []DivertVirtualService{
+					{
+						Name: "vs1",
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "Non-empty Hosts",
+			d: &DivertDeploy{
+				Hosts: []DivertHost{
+					{
+						VirtualService: "vs1",
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "Non-empty DeprecatedService",
+			d: &DivertDeploy{
+				DeprecatedService: "old-service",
+			},
+			want: false,
+		},
+		{
+			name: "Non-empty DeprecatedDeployment",
+			d: &DivertDeploy{
+				DeprecatedDeployment: "old-deployment",
+			},
+			want: false,
+		},
+		{
+			name: "Non-zero DeprecatedPort",
+			d: &DivertDeploy{
+				DeprecatedPort: 8080,
+			},
+			want: false,
+		},
+		{
+			name: "Multiple non-empty fields",
+			d: &DivertDeploy{
+				Driver:    "driver",
+				Namespace: "namespace",
+				VirtualServices: []DivertVirtualService{
+					{
+						Name: "vs1",
+					},
+				},
+				Hosts: []DivertHost{
+					{
+						VirtualService: "vs1",
+					},
+				},
+				DeprecatedService:    "ds",
+				DeprecatedDeployment: "dd",
+				DeprecatedPort:       9090,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.d.IsEmpty()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestRead_RejectsInvalidDependenciesGraph(t *testing.T) {
+	manifest := []byte(`
+dependencies:
+  a:
+    repository: https://github.com/okteto/a
+    depends_on: b
+  b:
+    repository: https://github.com/okteto/b
+    depends_on: a
+deploy:
+  - echo "must not run"`)
+
+	_, err := Read(manifest)
+
+	require.EqualError(t, err, "manifest validation failed: cyclic dependency found between dependencies a and b")
+}
+
+func TestRead_AcceptsDependenciesGraph(t *testing.T) {
+	manifest := []byte(`
+dependencies:
+  backend:
+    repository: https://github.com/okteto/backend
+    depends_on: [database]
+  database:
+    repository: https://github.com/okteto/database
+deploy:
+  - echo "deploy"`)
+
+	m, err := Read(manifest)
+
+	require.NoError(t, err)
+	require.Equal(t, deps.DependsOn{"database"}, m.Dependencies["backend"].DependsOn)
+}
+
+func TestRead_TranslatesLegacyNginxDivertDriver(t *testing.T) {
+	manifest := []byte(`
+deploy:
+  divert:
+    driver: nginx
+    namespace: staging`)
+
+	m, err := Read(manifest)
+
+	require.NoError(t, err)
+	require.Equal(t, constants.OktetoDivertGatewayAPIDriver, m.Deploy.Divert.Driver)
+}
+
+func TestRead_LegacyNginxDivertDriverUsesGatewayAPIValidation(t *testing.T) {
+	manifest := []byte(`
+deploy:
+  divert:
+    driver: nginx
+    namespace: staging
+    virtualServices:
+      - name: vs
+        namespace: staging`)
+
+	_, err := Read(manifest)
+
+	require.EqualError(t, err, "the field 'deploy.divert.virtualServices' is not supported with the gateway-api driver")
+}

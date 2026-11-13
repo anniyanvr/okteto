@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,44 +15,57 @@ package up
 
 import (
 	"bufio"
-	"crypto/md5"
+	"crypto/sha512"
+	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
-	initCMD "github.com/okteto/okteto/cmd/init"
 	"github.com/okteto/okteto/cmd/utils"
 	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/env"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/filesystem"
 	"github.com/okteto/okteto/pkg/linguist"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 )
 
-func addStignoreSecrets(dev *model.Dev) error {
+func addStignoreSecrets(dev *model.Dev, namespace string) error {
 	output := ""
 	for i, folder := range dev.Sync.Folders {
 		stignorePath := filepath.Join(folder.LocalPath, ".stignore")
-		if !model.FileExists(stignorePath) {
+		if !filesystem.FileExists(stignorePath) {
 			continue
 		}
 		infile, err := os.Open(stignorePath)
 		if err != nil {
-			return err
+			return oktetoErrors.UserError{
+				E:    err,
+				Hint: "Update the 'sync' field of your okteto manifest to point to a valid directory path",
+			}
 		}
-		defer infile.Close()
+		defer func() {
+			if err := infile.Close(); err != nil {
+				oktetoLog.Debugf("Error closing file %s: %s", stignorePath, err)
+			}
+		}()
 		reader := bufio.NewReader(infile)
 
-		stignoreName := fmt.Sprintf("stignore-%d", i+1)
-		transformedStignorePath := filepath.Join(config.GetDeploymentHome(dev.Namespace, dev.Name), stignoreName)
-		outfile, err := os.OpenFile(transformedStignorePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		stignoreName := fmt.Sprintf(".stignore-%d", i+1)
+		transformedStignorePath := filepath.Join(config.GetAppHome(namespace, dev.Name), stignoreName)
+		outfile, err := os.OpenFile(transformedStignorePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			return err
 		}
-		defer outfile.Close()
+		defer func() {
+			if err := outfile.Close(); err != nil {
+				oktetoLog.Infof("Error closing file %s: %s", transformedStignorePath, err)
+			}
+		}()
 
 		writer := bufio.NewWriter(outfile)
 		defer writer.Flush()
@@ -67,17 +80,19 @@ func addStignoreSecrets(dev *model.Dev) error {
 			}
 
 			line := strings.TrimSpace(string(bytes))
-			if line == "" {
-				continue
-			}
-			if strings.Contains(line, "(?d)") {
-				continue
-			}
-			if strings.HasPrefix(line, "#") {
+			// ignore local lines that are empty, comments or includes more files
+			// TODO: support remote #include https://github.com/okteto/okteto/issues/2832
+			if strings.Compare(line, "") == 0 || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "#") {
 				continue
 			}
 
-			_, err = writer.WriteString(fmt.Sprintf("(?d)%s\n", line))
+			// transform line by adding (?d) unless the line starts with ! or already has (?d)
+			if !strings.HasPrefix(line, "!") && !strings.Contains(line, "(?d)") {
+				line = fmt.Sprintf("(?d)%s", line)
+			}
+
+			// write new line at remote .stignore
+			_, err = writer.WriteString(fmt.Sprintf("%s\n", line))
 			if err != nil {
 				return err
 			}
@@ -93,82 +108,127 @@ func addStignoreSecrets(dev *model.Dev) error {
 			},
 		)
 	}
-	dev.Annotations[model.OktetoStignoreAnnotation] = fmt.Sprintf("%x", md5.Sum([]byte(output)))
+	dev.Metadata.Annotations[model.OktetoStignoreAnnotation] = fmt.Sprintf("%x", sha512.Sum512([]byte(output)))
+	return nil
+}
+
+func addSyncFieldHash(dev *model.Dev) error {
+	output, err := json.Marshal(dev.Sync)
+	if err != nil {
+		return err
+	}
+	dev.Metadata.Annotations[model.OktetoSyncAnnotation] = fmt.Sprintf("%x", sha512.Sum512(output))
 	return nil
 }
 
 func checkStignoreConfiguration(dev *model.Dev) error {
+	if dev.IsHybridModeEnabled() {
+		return nil
+	}
+
 	for _, folder := range dev.Sync.Folders {
 		stignorePath := filepath.Join(folder.LocalPath, ".stignore")
 		gitPath := filepath.Join(folder.LocalPath, ".git")
-		if !model.FileExists(stignorePath) {
-			if err := askIfCreateStignoreDefaults(folder.LocalPath, stignorePath, gitPath); err != nil {
+		if !filesystem.FileExists(stignorePath) {
+			if err := askIfCreateStignoreDefaults(folder.LocalPath, stignorePath); err != nil {
 				return err
 			}
 			continue
 		}
 
-		log.Infof("'.stignore' exists in folder '%s'", folder.LocalPath)
-		if !model.FileExists(gitPath) {
+		oktetoLog.Infof("'.stignore' exists in folder '%s'", folder.LocalPath)
+		if !filesystem.FileExists(gitPath) {
 			continue
 		}
 
-		if err := askIfUpdatingStignore(folder.LocalPath, stignorePath, gitPath); err != nil {
+		if err := checkIfStignoreHasGitFolder(stignorePath); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func askIfCreateStignoreDefaults(folder, stignorePath, gitPath string) error {
-	log.Information("'.stignore' does not exist in folder '%s'. Okteto requires a '.stignore' file to ignore file patterns that help optimize the synchronization service.", folder)
-	stignoreDefaults, err := utils.AskYesNo("    Do you want to infer defaults for the '.stignore' file? (otherwise, it will be left blank) [y/n] ")
-	if err != nil {
-		return fmt.Errorf("failed to add '.stignore' to '%s': %s", folder, err.Error())
-	}
+func askIfCreateStignoreDefaults(folder, stignorePath string) error {
+	autogenerateStignore := env.LoadBoolean(model.OktetoAutogenerateStignoreEnvVar)
 
-	if !stignoreDefaults {
-		stignoreContent := ""
-		if err := ioutil.WriteFile(stignorePath, []byte(stignoreContent), 0644); err != nil {
-			return fmt.Errorf("failed to create empty '%s': %s", stignorePath, err.Error())
+	oktetoLog.Information("'.stignore' doesn't exist in folder '%s'.", folder)
+
+	if autogenerateStignore {
+		l, err := linguist.ProcessDirectory(stignorePath)
+		if err != nil {
+			oktetoLog.Infof("failed to process directory: %s", err)
+			l = linguist.Unrecognized
+		}
+		c := linguist.GetSTIgnore(l)
+		if err := os.WriteFile(stignorePath, c, 0600); err != nil {
+			return fmt.Errorf("failed to write stignore file for '%s': %w", folder, err)
 		}
 		return nil
 	}
 
-	language, err := initCMD.GetLanguage("", folder)
+	oktetoLog.Information("Okteto requires a '.stignore' file to ignore file patterns that help optimize the synchronization service.")
+	stignoreDefaults, err := utils.AskYesNo("Do you want to infer defaults for the '.stignore' file? (otherwise, it will be left blank)", utils.YesNoDefault_Yes)
 	if err != nil {
-		return fmt.Errorf("failed to get language for '%s': %s", folder, err.Error())
+		return fmt.Errorf("failed to add '.stignore' to '%s': %w", folder, err)
+	}
+
+	if !stignoreDefaults {
+		stignoreContent := ""
+		if err := os.WriteFile(stignorePath, []byte(stignoreContent), 0600); err != nil {
+			return fmt.Errorf("failed to create empty '%s': %w", stignorePath, err)
+		}
+		return nil
+	}
+
+	language, err := getLanguage("", folder)
+	if err != nil {
+		return fmt.Errorf("failed to get language for '%s': %w", folder, err)
 	}
 	c := linguist.GetSTIgnore(language)
-	if err := ioutil.WriteFile(stignorePath, c, 0600); err != nil {
-		return fmt.Errorf("failed to write stignore file for '%s': %s", folder, err.Error())
+	if err := os.WriteFile(stignorePath, c, 0600); err != nil {
+		return fmt.Errorf("failed to write stignore file for '%s': %w", folder, err)
 	}
 	return nil
 }
 
-func askIfUpdatingStignore(folder, stignorePath, gitPath string) error {
-	stignoreBytes, err := ioutil.ReadFile(stignorePath)
+func checkIfStignoreHasGitFolder(stignorePath string) error {
+	stignoreBytes, err := os.ReadFile(stignorePath)
 	if err != nil {
-		return fmt.Errorf("failed to read '%s': %s", stignorePath, err.Error())
+		return fmt.Errorf("failed to read '%s': %w", stignorePath, err)
 	}
 	stignoreContent := string(stignoreBytes)
 	if strings.Contains(stignoreContent, ".git") {
 		return nil
 	}
 
-	log.Information("The synchronization service performance is degraded if the '.git' folder is synchronized.")
-	ignoreGit, err := utils.AskYesNo("    Do you want to ignore the '.git' folder in your '.stignore' file? [y/n] ")
-	if err != nil {
-		return fmt.Errorf("failed to ask for adding '.git' to '%s': %s", stignorePath, err.Error())
-	}
-	log.Infof("adding '.git' to '%s'", stignorePath)
-	if ignoreGit {
-		stignoreContent = fmt.Sprintf(".git\n%s", stignoreContent)
-	} else {
-		stignoreContent = fmt.Sprintf("// .git\n%s", stignoreContent)
-	}
-	if err := ioutil.WriteFile(stignorePath, []byte(stignoreContent), 0644); err != nil {
-		return fmt.Errorf("failed to update '%s': %s", stignorePath, err.Error())
-	}
+	oktetoLog.Warning("The synchronization service performance could be degraded if the '.git' folder is synchronized. Please add '.git' to the '.stignore' file.")
 	return nil
+}
+
+// getLanguage returns the language of a given folder
+func getLanguage(language, workDir string) (string, error) {
+	if language != "" {
+		return language, nil
+	}
+	l, err := linguist.ProcessDirectory(workDir)
+	if err != nil {
+		oktetoLog.Infof("failed to process directory: %s", err)
+		l = linguist.Unrecognized
+	}
+	oktetoLog.Infof("language '%s' inferred for your current directory", l)
+	if l == linguist.Unrecognized {
+		l, err = askForLanguage()
+		if err != nil {
+			return "", err
+		}
+	}
+	return l, nil
+}
+
+func askForLanguage() (string, error) {
+	supportedLanguages := linguist.GetSupportedLanguages()
+	return utils.AskForOptions(
+		supportedLanguages,
+		"Couldn't detect any language in the current folder. Pick your project's main language from the list below:",
+	)
 }

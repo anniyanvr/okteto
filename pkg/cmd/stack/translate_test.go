@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,102 +14,43 @@
 package stack
 
 import (
-	"context"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
-	"os"
 	"reflect"
 	"testing"
+	"time"
 
-	okLabels "github.com/okteto/okteto/pkg/k8s/labels"
+	"github.com/okteto/okteto/pkg/build"
+	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/env"
+	"github.com/okteto/okteto/pkg/log/io"
 	"github.com/okteto/okteto/pkg/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/pointer"
-
-	extensions "k8s.io/api/extensions/v1beta1"
+	"k8s.io/utils/ptr"
 )
 
-const (
-	env = `A=1
-# comment
+const modifiedHostName = "modified.test.hostname"
 
-
-B=$B
-
-C=3`
-)
-
-func Test_translate(t *testing.T) {
-	ctx := context.Background()
-	stack := &model.Stack{
-		Name: "name",
-		Services: map[string]*model.Service{
-			"1": {
-				Image:    "image",
-				EnvFiles: []string{"/non-existing"},
-			},
-		},
-	}
-	if err := translate(ctx, stack, false, false); err == nil {
-		t.Fatalf("An error should be returned")
-	}
+type fakeDivert struct {
+	called bool
 }
 
-func Test_translateEnvVars(t *testing.T) {
-	tmpFile, err := ioutil.TempFile("", ".env")
-	if err != nil {
-		t.Fatalf("failed to create dynamic env file: %s", err.Error())
-	}
-	if err := ioutil.WriteFile(tmpFile.Name(), []byte(env), 0600); err != nil {
-		t.Fatalf("failed to write env file: %s", err.Error())
-	}
-	defer os.RemoveAll(tmpFile.Name())
-
-	os.Setenv("IMAGE", "image")
-	os.Setenv("B", "2")
-	os.Setenv("ENV_PATH", tmpFile.Name())
-	stack := &model.Stack{
-		Name: "name",
-		Services: map[string]*model.Service{
-			"1": {
-				Image:    "${IMAGE}",
-				EnvFiles: []string{"${ENV_PATH}"},
-				Environment: []model.EnvVar{
-					{
-						Name:  "C",
-						Value: "original",
-					},
-				},
-			},
-		},
-	}
-	translateStackEnvVars(stack)
-	if stack.Services["1"].Image != "image" {
-		t.Errorf("Wrong image: %s", stack.Services["1"].Image)
-	}
-	if len(stack.Services["1"].Environment) != 3 {
-		t.Errorf("Wrong environment: %v", stack.Services["1"].Environment)
-	}
-	for _, e := range stack.Services["1"].Environment {
-		if e.Name == "A" && e.Value != "1" {
-			t.Errorf("Wrong environment variable A: %s", e.Value)
-		}
-		if e.Name == "B" && e.Value != "2" {
-			t.Errorf("Wrong environment variable B: %s", e.Value)
-		}
-		if e.Name == "C" && e.Value != "original" {
-			t.Errorf("Wrong environment variable C: %s", e.Value)
-		}
-	}
+func (f *fakeDivert) UpdatePod(spec apiv1.PodSpec) apiv1.PodSpec {
+	f.called = true
+	spec.Hostname = modifiedHostName
+	return spec
 }
 
 func Test_translateConfigMap(t *testing.T) {
 	s := &model.Stack{
 		Manifest: []byte("manifest"),
-		Name:     "stackName",
+		Name:     "stack Name",
 		Services: map[string]*model.Service{
 			"svcName": {
 				Image: "image",
@@ -117,40 +58,44 @@ func Test_translateConfigMap(t *testing.T) {
 		},
 	}
 	result := translateConfigMap(s)
-	if result.Name != "okteto-stackName" {
+	if result.Name != "okteto-stack-name" {
 		t.Errorf("Wrong configmap name: '%s'", result.Name)
 	}
-	if result.Labels[okLabels.StackLabel] != "true" {
+	if result.Labels[model.StackLabel] != "true" {
 		t.Errorf("Wrong labels: '%s'", result.Labels)
 	}
-	if result.Data[nameField] != "stackName" {
-		t.Errorf("Wrong data.name: '%s'", result.Data[nameField])
+	if result.Data[NameField] != "stack Name" {
+		t.Errorf("Wrong data.name: '%s'", result.Data[NameField])
 	}
-	if result.Data[yamlField] != base64.StdEncoding.EncodeToString(s.Manifest) {
-
-		t.Errorf("Wrong data.yaml: '%s'", result.Data[yamlField])
+	if result.Data[YamlField] != base64.StdEncoding.EncodeToString(s.Manifest) {
+		t.Errorf("Wrong data.yaml: '%s'", result.Data[YamlField])
 	}
 }
 
 func Test_translateDeployment(t *testing.T) {
+	divert := &fakeDivert{}
 	s := &model.Stack{
 		Name: "stackName",
 		Services: map[string]*model.Service{
 			"svcName": {
-				Labels: map[string]string{
+				Labels: model.Labels{
 					"label1": "value1",
 					"label2": "value2",
 				},
-				Annotations: map[string]string{
+				Annotations: model.Annotations{
 					"annotation1": "value1",
 					"annotation2": "value2",
+				},
+				NodeSelector: model.Selector{
+					"node1": "value1",
+					"node2": "value2",
 				},
 				Image:           "image",
 				Replicas:        3,
 				StopGracePeriod: 20,
 				Entrypoint:      model.Entrypoint{Values: []string{"command1", "command2"}},
 				Command:         model.Command{Values: []string{"args1", "args2"}},
-				Environment: []model.EnvVar{
+				Environment: []env.Var{
 					{
 						Name:  "env1",
 						Value: "value1",
@@ -160,36 +105,40 @@ func Test_translateDeployment(t *testing.T) {
 						Value: "value2",
 					},
 				},
-				Ports: []model.Port{{Port: 80}, {Port: 90}},
+				Ports: []model.Port{{ContainerPort: 80}, {ContainerPort: 90}},
 			},
 		},
 	}
-	result := translateDeployment("svcName", s)
+	result := translateDeployment("svcName", s, divert)
 	if result.Name != "svcName" {
 		t.Errorf("Wrong deployment name: '%s'", result.Name)
 	}
 	labels := map[string]string{
-		"label1":                       "value1",
-		"label2":                       "value2",
-		okLabels.StackNameLabel:        "stackName",
-		okLabels.StackServiceNameLabel: "svcName",
+		"label1":                    "value1",
+		"label2":                    "value2",
+		model.StackNameLabel:        "stackname",
+		model.StackServiceNameLabel: "svcName",
+		model.DeployedByLabel:       "stackname",
 	}
-	if !reflect.DeepEqual(result.Labels, labels) {
-		t.Errorf("Wrong deployment labels: '%s'", result.Labels)
-	}
+	assert.Equal(t, result.Labels, labels)
 	annotations := map[string]string{
-		"annotation1": "value1",
-		"annotation2": "value2",
+		"annotation1":           "value1",
+		"annotation2":           "value2",
+		"dev.okteto.com/sample": "true",
 	}
-	if !reflect.DeepEqual(result.Annotations, annotations) {
-		t.Errorf("Wrong deployment annotations: '%s'", result.Annotations)
+	assert.Equal(t, result.Annotations, annotations)
+	nodeSelector := map[string]string{
+		"node1": "value1",
+		"node2": "value2",
 	}
+	assert.Equal(t, result.Spec.Template.Spec.NodeSelector, nodeSelector)
+
 	if *result.Spec.Replicas != 3 {
 		t.Errorf("Wrong deployment spec.replicas: '%d'", *result.Spec.Replicas)
 	}
 	selector := map[string]string{
-		okLabels.StackNameLabel:        "stackName",
-		okLabels.StackServiceNameLabel: "svcName",
+		model.StackNameLabel:        "stackname",
+		model.StackServiceNameLabel: "svcName",
 	}
 	if !reflect.DeepEqual(result.Spec.Selector.MatchLabels, selector) {
 		t.Errorf("Wrong spec.selector: '%s'", result.Spec.Selector.MatchLabels)
@@ -201,7 +150,7 @@ func Test_translateDeployment(t *testing.T) {
 		t.Errorf("Wrong spec.template.annotations: '%s'", result.Spec.Template.Annotations)
 	}
 	if *result.Spec.Template.Spec.TerminationGracePeriodSeconds != 20 {
-		t.Errorf("Wrong deployment spec.template.spec.termination_grade_period_seconds: '%d'", *result.Spec.Template.Spec.TerminationGracePeriodSeconds)
+		t.Errorf("Wrong deployment spec.template.spec.termination_grace_period_seconds: '%d'", *result.Spec.Template.Spec.TerminationGracePeriodSeconds)
 	}
 	c := result.Spec.Template.Spec.Containers[0]
 	if c.Name != "svcName" {
@@ -230,27 +179,36 @@ func Test_translateDeployment(t *testing.T) {
 	if !reflect.DeepEqual(c.Resources, apiv1.ResourceRequirements{}) {
 		t.Errorf("Wrong container.resources: '%v'", c.Resources)
 	}
+
+	require.Equal(t, modifiedHostName, result.Spec.Template.Spec.Hostname)
+	require.True(t, divert.called)
+
 }
 
 func Test_translateStatefulSet(t *testing.T) {
+	divert := &fakeDivert{}
 	s := &model.Stack{
 		Name: "stackName",
 		Services: map[string]*model.Service{
 			"svcName": {
-				Labels: map[string]string{
+				Labels: model.Labels{
 					"label1": "value1",
 					"label2": "value2",
 				},
-				Annotations: map[string]string{
+				Annotations: model.Annotations{
 					"annotation1": "value1",
 					"annotation2": "value2",
+				},
+				NodeSelector: model.Selector{
+					"node1": "value1",
+					"node2": "value2",
 				},
 				Image:           "image",
 				Replicas:        3,
 				StopGracePeriod: 20,
 				Entrypoint:      model.Entrypoint{Values: []string{"command1", "command2"}},
 				Command:         model.Command{Values: []string{"args1", "args2"}},
-				Environment: []model.EnvVar{
+				Environment: []env.Var{
 					{
 						Name:  "env1",
 						Value: "value1",
@@ -260,11 +218,11 @@ func Test_translateStatefulSet(t *testing.T) {
 						Value: "value2",
 					},
 				},
-				Ports:   []model.Port{{Port: 80}, {Port: 90}},
+				Ports:   []model.Port{{ContainerPort: 80}, {ContainerPort: 90}},
 				CapAdd:  []apiv1.Capability{apiv1.Capability("CAP_ADD")},
 				CapDrop: []apiv1.Capability{apiv1.Capability("CAP_DROP")},
 
-				Volumes: []model.StackVolume{{RemotePath: "/volume1"}, {RemotePath: "/volume2"}},
+				Volumes: []build.VolumeMounts{{RemotePath: "/volume1"}, {RemotePath: "/volume2"}},
 				Resources: &model.StackResources{
 					Limits: model.ServiceResources{
 						CPU:    model.Quantity{Value: resource.MustParse("100m")},
@@ -280,49 +238,51 @@ func Test_translateStatefulSet(t *testing.T) {
 			},
 		},
 	}
-	result := translateStatefulSet("svcName", s)
+	result := translateStatefulSet("svcName", s, divert)
 	if result.Name != "svcName" {
 		t.Errorf("Wrong statefulset name: '%s'", result.Name)
 	}
 	labels := map[string]string{
-		"label1":                       "value1",
-		"label2":                       "value2",
-		okLabels.StackNameLabel:        "stackName",
-		okLabels.StackServiceNameLabel: "svcName",
+		"label1":                    "value1",
+		"label2":                    "value2",
+		model.StackNameLabel:        "stackname",
+		model.StackServiceNameLabel: "svcName",
+		model.DeployedByLabel:       "stackname",
 	}
-	if !reflect.DeepEqual(result.Labels, labels) {
-		t.Errorf("Wrong statefulset labels: '%s'", result.Labels)
-	}
+	assert.Equal(t, labels, result.Labels)
 	annotations := map[string]string{
-		"annotation1": "value1",
-		"annotation2": "value2",
+		"annotation1":           "value1",
+		"annotation2":           "value2",
+		"dev.okteto.com/sample": "true",
 	}
-	if !reflect.DeepEqual(result.Annotations, annotations) {
-		t.Errorf("Wrong statefulset annotations: '%s'", result.Annotations)
+	assert.Equal(t, result.Annotations, annotations)
+	nodeSelector := map[string]string{
+		"node1": "value1",
+		"node2": "value2",
 	}
+	assert.Equal(t, result.Spec.Template.Spec.NodeSelector, nodeSelector)
 	if *result.Spec.Replicas != 3 {
 		t.Errorf("Wrong statefulset spec.replicas: '%d'", *result.Spec.Replicas)
 	}
 	selector := map[string]string{
-		okLabels.StackNameLabel:        "stackName",
-		okLabels.StackServiceNameLabel: "svcName",
+		model.StackNameLabel:        "stackname",
+		model.StackServiceNameLabel: "svcName",
 	}
 	if !reflect.DeepEqual(result.Spec.Selector.MatchLabels, selector) {
 		t.Errorf("Wrong spec.selector: '%s'", result.Spec.Selector.MatchLabels)
 	}
-	if !reflect.DeepEqual(result.Spec.Template.Labels, labels) {
-		t.Errorf("Wrong spec.template.labels: '%s'", result.Spec.Template.Labels)
-	}
+	assert.Equal(t, labels, result.Spec.Template.Labels)
 	if !reflect.DeepEqual(result.Spec.Template.Annotations, annotations) {
 		t.Errorf("Wrong spec.template.annotations: '%s'", result.Spec.Template.Annotations)
 	}
 	if *result.Spec.Template.Spec.TerminationGracePeriodSeconds != 20 {
-		t.Errorf("Wrong statefulset spec.template.spec.termination_grade_period_seconds: '%d'", *result.Spec.Template.Spec.TerminationGracePeriodSeconds)
+		t.Errorf("Wrong statefulset spec.template.spec.termination_grace_period_seconds: '%d'", *result.Spec.Template.Spec.TerminationGracePeriodSeconds)
 	}
 	initContainer := apiv1.Container{
-		Name:    fmt.Sprintf("init-%s", "svcName"),
-		Image:   "busybox",
-		Command: []string{"chmod", "-R", "777", "/data"},
+		Name:            fmt.Sprintf("init-%s", "svcName"),
+		Image:           config.NewImageConfig(io.NewIOController()).GetCliImage(),
+		Command:         []string{"sh", "-c", "chmod 777 /data"},
+		ImagePullPolicy: apiv1.PullIfNotPresent,
 		VolumeMounts: []apiv1.VolumeMount{
 			{
 				MountPath: "/data",
@@ -330,9 +290,27 @@ func Test_translateStatefulSet(t *testing.T) {
 			},
 		},
 	}
-	if !reflect.DeepEqual(result.Spec.Template.Spec.InitContainers[0], initContainer) {
-		t.Errorf("Wrong statefulset init container: '%v'", result.Spec.Template.Spec.InitContainers[0])
+	assert.Equal(t, initContainer, result.Spec.Template.Spec.InitContainers[0])
+	initVolumeContainer := apiv1.Container{
+		Name:            fmt.Sprintf("init-volume-%s", "svcName"),
+		Image:           "image",
+		ImagePullPolicy: apiv1.PullIfNotPresent,
+		Command:         []string{"sh", "-c", "echo initializing volume... && (cp -Rv /volume1/. /init-volume-0 || true) && (cp -Rv /volume2/. /init-volume-1 || true)"},
+		VolumeMounts: []apiv1.VolumeMount{
+			{
+				MountPath: "/init-volume-0",
+				Name:      pvcName,
+				SubPath:   "data-0",
+			},
+			{
+				MountPath: "/init-volume-1",
+				Name:      pvcName,
+				SubPath:   "data-1",
+			},
+		},
 	}
+	assert.Equal(t, initVolumeContainer, result.Spec.Template.Spec.InitContainers[1])
+
 	c := result.Spec.Template.Spec.Containers[0]
 	if c.Name != "svcName" {
 		t.Errorf("Wrong statefulset container.name: '%s'", c.Name)
@@ -384,174 +362,2103 @@ func Test_translateStatefulSet(t *testing.T) {
 			SubPath:   "data-1",
 		},
 	}
-	if !reflect.DeepEqual(c.VolumeMounts, volumeMounts) {
-		t.Errorf("Wrong container.volume_mounts: '%v'", c.VolumeMounts)
-	}
+	assert.Equal(t, volumeMounts, c.VolumeMounts)
 
 	vct := result.Spec.VolumeClaimTemplates[0]
 	if vct.Name != pvcName {
-		t.Errorf("Wrong statefulset name: '%s'", vct.Name)
+		t.Errorf("Wrong volume claim template name: '%s'", vct.Name)
 	}
 	if !reflect.DeepEqual(vct.Labels, labels) {
-		t.Errorf("Wrong statefulset labels: '%s'", vct.Labels)
+		t.Errorf("Wrong volume claim template labels: '%s'", vct.Labels)
 	}
 	if !reflect.DeepEqual(vct.Annotations, annotations) {
-		t.Errorf("Wrong statefulset annotations: '%s'", vct.Annotations)
+		t.Errorf("Wrong volume claim template annotations: '%s'", vct.Annotations)
 	}
 	volumeClaimTemplateSpec := apiv1.PersistentVolumeClaimSpec{
 		AccessModes: []apiv1.PersistentVolumeAccessMode{apiv1.ReadWriteOnce},
-		Resources: apiv1.ResourceRequirements{
+		Resources: apiv1.VolumeResourceRequirements{
 			Requests: apiv1.ResourceList{
 				"storage": resource.MustParse("20Gi"),
 			},
 		},
-		StorageClassName: pointer.StringPtr("class-name"),
+		StorageClassName: ptr.To("class-name"),
 	}
 	if !reflect.DeepEqual(vct.Spec, volumeClaimTemplateSpec) {
 		t.Errorf("Wrong statefulset volume claim template: '%v'", vct.Spec)
 	}
+
+	require.Equal(t, modifiedHostName, result.Spec.Template.Spec.Hostname)
+	require.True(t, divert.called)
+
 }
 
-func Test_translateService(t *testing.T) {
-	p1 := model.Port{Port: 80, Protocol: apiv1.ProtocolTCP}
-	p2 := model.Port{Port: 90, Protocol: apiv1.ProtocolTCP}
+func Test_translateJobWithoutVolumes(t *testing.T) {
+	divert := &fakeDivert{}
 	s := &model.Stack{
 		Name: "stackName",
 		Services: map[string]*model.Service{
 			"svcName": {
-				Labels: map[string]string{
+				Labels: model.Labels{
 					"label1": "value1",
 					"label2": "value2",
 				},
-				Annotations: map[string]string{
+				Annotations: model.Annotations{
 					"annotation1": "value1",
 					"annotation2": "value2",
 				},
-				Ports: []model.Port{p1, p2},
-			},
-		},
-	}
-	result := translateService("svcName", s)
-	if result.Name != "svcName" {
-		t.Errorf("Wrong service name: '%s'", result.Name)
-	}
-	labels := map[string]string{
-		"label1":                       "value1",
-		"label2":                       "value2",
-		okLabels.StackNameLabel:        "stackName",
-		okLabels.StackServiceNameLabel: "svcName",
-	}
-	if !reflect.DeepEqual(result.Labels, labels) {
-		t.Errorf("Wrong service labels: '%s'", result.Labels)
-	}
-	annotations := map[string]string{
-		"annotation1": "value1",
-		"annotation2": "value2",
-	}
-	if !reflect.DeepEqual(result.Annotations, annotations) {
-		t.Errorf("Wrong service annotations: '%s'", result.Annotations)
-	}
-	ports := []apiv1.ServicePort{
-		{
-			Name:       "p-80-tcp",
-			Port:       80,
-			TargetPort: intstr.IntOrString{IntVal: 80},
-			Protocol:   apiv1.ProtocolTCP,
-		},
-		{
-			Name:       "p-90-tcp",
-			Port:       90,
-			TargetPort: intstr.IntOrString{IntVal: 90},
-			Protocol:   apiv1.ProtocolTCP,
-		},
-	}
-	if !reflect.DeepEqual(result.Spec.Ports, ports) {
-		t.Errorf("Wrong service ports: '%v', expected: '%v'", result.Spec.Ports, ports)
-	}
-	if result.Spec.Type != apiv1.ServiceTypeClusterIP {
-		t.Errorf("Wrong service type: '%s'", result.Spec.Type)
-	}
-	selector := map[string]string{
-		okLabels.StackNameLabel:        "stackName",
-		okLabels.StackServiceNameLabel: "svcName",
-	}
-	if !reflect.DeepEqual(result.Spec.Selector, selector) {
-		t.Errorf("Wrong spec.selector: '%s'", result.Spec.Selector)
-	}
-
-	svc := s.Services["svcName"]
-	svc.Public = true
-	s.Services["svcName"] = svc
-	result = translateService("svcName", s)
-	annotations[okLabels.OktetoAutoIngressAnnotation] = "true"
-	if !reflect.DeepEqual(result.Annotations, annotations) {
-		t.Errorf("Wrong service annotations: '%s'", result.Annotations)
-	}
-	if result.Spec.Type != apiv1.ServiceTypeLoadBalancer {
-		t.Errorf("Wrong service type: '%s'", result.Spec.Type)
-	}
-	annotations[okLabels.OktetoAutoIngressAnnotation] = "true"
-	if !reflect.DeepEqual(result.Annotations, annotations) {
-		t.Errorf("Wrong service annotations: '%s'", result.Annotations)
-	}
-	if result.Spec.Type != apiv1.ServiceTypeLoadBalancer {
-		t.Errorf("Wrong service type: '%s'", result.Spec.Type)
-	}
-}
-
-func Test_translateEndpoints(t *testing.T) {
-	s := &model.Stack{
-		Name: "stackName",
-		Endpoints: map[string]model.Endpoint{
-			"endpoint1": {
-				Labels:      map[string]string{"label1": "value1"},
-				Annotations: map[string]string{"annotation1": "value1"},
-				Rules: []model.EndpointRule{
-					{Path: "/",
-						Service: "svcName",
-						Port:    80},
+				NodeSelector: model.Selector{
+					"node1": "value1",
+					"node2": "value2",
+				},
+				Image:           "image",
+				StopGracePeriod: 20,
+				Replicas:        3,
+				Entrypoint:      model.Entrypoint{Values: []string{"command1", "command2"}},
+				Command:         model.Command{Values: []string{"args1", "args2"}},
+				Environment: []env.Var{
+					{
+						Name:  "env1",
+						Value: "value1",
+					},
+					{
+						Name:  "env2",
+						Value: "value2",
+					},
+				},
+				Ports:         []model.Port{{ContainerPort: 80}, {ContainerPort: 90}},
+				CapAdd:        []apiv1.Capability{apiv1.Capability("CAP_ADD")},
+				CapDrop:       []apiv1.Capability{apiv1.Capability("CAP_DROP")},
+				RestartPolicy: apiv1.RestartPolicyNever,
+				BackOffLimit:  5,
+				Resources: &model.StackResources{
+					Limits: model.ServiceResources{
+						CPU:    model.Quantity{Value: resource.MustParse("100m")},
+						Memory: model.Quantity{Value: resource.MustParse("1Gi")},
+					},
+					Requests: model.ServiceResources{
+						Storage: model.StorageResource{
+							Size:  model.Quantity{Value: resource.MustParse("20Gi")},
+							Class: "class-name",
+						},
+					},
 				},
 			},
 		},
+	}
+	result := translateJob("svcName", s, divert)
+	if result.Name != "svcName" {
+		t.Errorf("Wrong job name: '%s'", result.Name)
+	}
+	labels := map[string]string{
+		"label1":                    "value1",
+		"label2":                    "value2",
+		model.StackNameLabel:        "stackname",
+		model.StackServiceNameLabel: "svcName",
+		model.DeployedByLabel:       "stackname",
+	}
+	assert.Equal(t, labels, result.Labels)
+	annotations := map[string]string{
+		"annotation1":           "value1",
+		"annotation2":           "value2",
+		"dev.okteto.com/sample": "true",
+	}
+	assert.Equal(t, result.Annotations, annotations)
+	nodeSelector := map[string]string{
+		"node1": "value1",
+		"node2": "value2",
+	}
+	assert.Equal(t, result.Spec.Template.Spec.NodeSelector, nodeSelector)
+	if *result.Spec.Completions != 3 {
+		t.Errorf("Wrong job spec.completions: '%d'", *result.Spec.Completions)
+	}
+	if *result.Spec.Parallelism != 1 {
+		t.Errorf("Wrong job spec.parallelism: '%d'", *result.Spec.Parallelism)
+	}
+	if *result.Spec.BackoffLimit != 5 {
+		t.Errorf("Wrong job spec.max_attempts: '%d'", *result.Spec.BackoffLimit)
+	}
+	if !reflect.DeepEqual(result.Spec.Template.Labels, labels) {
+		t.Errorf("Wrong spec.template.labels: '%s'", result.Spec.Template.Labels)
+	}
+	if !reflect.DeepEqual(result.Spec.Template.Annotations, annotations) {
+		t.Errorf("Wrong spec.template.annotations: '%s'", result.Spec.Template.Annotations)
+	}
+	if *result.Spec.Template.Spec.TerminationGracePeriodSeconds != 20 {
+		t.Errorf("Wrong job spec.template.spec.termination_grace_period_seconds: '%d'", *result.Spec.Template.Spec.TerminationGracePeriodSeconds)
+	}
+	if len(result.Spec.Template.Spec.InitContainers) > 0 {
+		t.Errorf("Wrong job spec.template.spec.initContainers: '%d'", len(result.Spec.Template.Spec.InitContainers))
+	}
+	c := result.Spec.Template.Spec.Containers[0]
+	if c.Name != "svcName" {
+		t.Errorf("Wrong job container.name: '%s'", c.Name)
+	}
+	if c.Image != "image" {
+		t.Errorf("Wrong job container.image: '%s'", c.Image)
+	}
+	if !reflect.DeepEqual(c.Command, []string{"command1", "command2"}) {
+		t.Errorf("Wrong container.command: '%v'", c.Command)
+	}
+	if !reflect.DeepEqual(c.Args, []string{"args1", "args2"}) {
+		t.Errorf("Wrong container.args: '%v'", c.Args)
+	}
+	env := []apiv1.EnvVar{{Name: "env1", Value: "value1"}, {Name: "env2", Value: "value2"}}
+	if !reflect.DeepEqual(c.Env, env) {
+		t.Errorf("Wrong container.env: '%v'", c.Env)
+	}
+	ports := []apiv1.ContainerPort{{ContainerPort: 80}, {ContainerPort: 90}}
+	if !reflect.DeepEqual(c.Ports, ports) {
+		t.Errorf("Wrong container.ports: '%v'", c.Ports)
+	}
+	securityContext := apiv1.SecurityContext{
+		Capabilities: &apiv1.Capabilities{
+			Add:  []apiv1.Capability{apiv1.Capability("CAP_ADD")},
+			Drop: []apiv1.Capability{apiv1.Capability("CAP_DROP")},
+		},
+	}
+	if !reflect.DeepEqual(*c.SecurityContext, securityContext) {
+		t.Errorf("Wrong job container.security_context: '%v'", c.SecurityContext)
+	}
+	resources := apiv1.ResourceRequirements{
+		Limits: apiv1.ResourceList{
+			apiv1.ResourceCPU:    resource.MustParse("100m"),
+			apiv1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+	}
+	if !reflect.DeepEqual(c.Resources, resources) {
+		t.Errorf("Wrong container.resources: '%v'", c.Resources)
+	}
+	if len(c.VolumeMounts) > 0 {
+		t.Errorf("Wrong c.VolumeMounts: '%d'", len(c.VolumeMounts))
+	}
+
+	require.Equal(t, modifiedHostName, result.Spec.Template.Spec.Hostname)
+	require.True(t, divert.called)
+}
+
+func Test_translateJobWithVolumes(t *testing.T) {
+	divert := &fakeDivert{}
+	s := &model.Stack{
+		Name: "stackName",
 		Services: map[string]*model.Service{
 			"svcName": {
-				Image: "image",
+				Labels: model.Labels{
+					"label1": "value1",
+					"label2": "value2",
+				},
+				Annotations: model.Annotations{
+					"annotation1": "value1",
+					"annotation2": "value2",
+				},
+				NodeSelector: model.Selector{
+					"node1": "value1",
+					"node2": "value2",
+				},
+				Image:           "image",
+				StopGracePeriod: 20,
+				Replicas:        3,
+				Entrypoint:      model.Entrypoint{Values: []string{"command1", "command2"}},
+				Command:         model.Command{Values: []string{"args1", "args2"}},
+				Environment: []env.Var{
+					{
+						Name:  "env1",
+						Value: "value1",
+					},
+					{
+						Name:  "env2",
+						Value: "value2",
+					},
+				},
+				Ports:         []model.Port{{ContainerPort: 80}, {ContainerPort: 90}},
+				CapAdd:        []apiv1.Capability{apiv1.Capability("CAP_ADD")},
+				CapDrop:       []apiv1.Capability{apiv1.Capability("CAP_DROP")},
+				RestartPolicy: apiv1.RestartPolicyNever,
+				BackOffLimit:  5,
+				Volumes:       []build.VolumeMounts{{RemotePath: "/volume1"}, {RemotePath: "/volume2"}},
+				Resources: &model.StackResources{
+					Limits: model.ServiceResources{
+						CPU:    model.Quantity{Value: resource.MustParse("100m")},
+						Memory: model.Quantity{Value: resource.MustParse("1Gi")},
+					},
+					Requests: model.ServiceResources{
+						Storage: model.StorageResource{
+							Size:  model.Quantity{Value: resource.MustParse("20Gi")},
+							Class: "class-name",
+						},
+					},
+				},
 			},
 		},
 	}
-	result := translateIngress("endpoint1", s)
-	if result.Name != "endpoint1" {
-		t.Errorf("Wrong service name: '%s'", result.Name)
+	result := translateJob("svcName", s, divert)
+	if result.Name != "svcName" {
+		t.Errorf("Wrong job name: '%s'", result.Name)
 	}
-
-	annotations := map[string]string{
-		okLabels.OktetoIngressAutoGenerateHost: "true",
-		"annotation1":                          "value1",
-	}
-
-	if !reflect.DeepEqual(result.Annotations, annotations) {
-		t.Errorf("Wrong service annotations: '%s'", result.Annotations)
-	}
-
-	paths := []extensions.HTTPIngressPath{
-		{Path: "/",
-			Backend: extensions.IngressBackend{
-				ServiceName: "svcName",
-				ServicePort: intstr.IntOrString{IntVal: 80},
-			},
-		},
-	}
-
-	if !reflect.DeepEqual(result.Spec.Rules[0].HTTP.Paths, paths) {
-		t.Errorf("Wrong ingress: '%v'", result.Spec.Rules[0].HTTP.Paths)
-	}
-
 	labels := map[string]string{
-		okLabels.StackNameLabel:         "stackName",
-		okLabels.StackEndpointNameLabel: "endpoint1",
-		"label1":                        "value1",
+		"label1":                    "value1",
+		"label2":                    "value2",
+		model.StackNameLabel:        "stackname",
+		model.StackServiceNameLabel: "svcName",
+		model.DeployedByLabel:       "stackname",
 	}
-	if !reflect.DeepEqual(result.Labels, labels) {
-		t.Errorf("Wrong labels: '%s'", result.Labels)
+	assert.Equal(t, labels, result.Labels)
+	annotations := map[string]string{
+		"annotation1":           "value1",
+		"annotation2":           "value2",
+		"dev.okteto.com/sample": "true",
+	}
+	assert.Equal(t, result.Annotations, annotations)
+	nodeSelector := map[string]string{
+		"node1": "value1",
+		"node2": "value2",
+	}
+	assert.Equal(t, result.Spec.Template.Spec.NodeSelector, nodeSelector)
+	if !reflect.DeepEqual(result.Annotations, annotations) {
+		t.Errorf("Wrong job annotations: '%s'", result.Annotations)
+	}
+	if *result.Spec.Completions != 3 {
+		t.Errorf("Wrong job spec.completions: '%d'", *result.Spec.Completions)
+	}
+	if *result.Spec.Parallelism != 1 {
+		t.Errorf("Wrong job spec.parallelism: '%d'", *result.Spec.Parallelism)
+	}
+	if *result.Spec.BackoffLimit != 5 {
+		t.Errorf("Wrong job spec.max_attempts: '%d'", *result.Spec.BackoffLimit)
+	}
+	if !reflect.DeepEqual(result.Spec.Template.Labels, labels) {
+		t.Errorf("Wrong spec.template.labels: '%s'", result.Spec.Template.Labels)
+	}
+	if !reflect.DeepEqual(result.Spec.Template.Annotations, annotations) {
+		t.Errorf("Wrong spec.template.annotations: '%s'", result.Spec.Template.Annotations)
+	}
+	if *result.Spec.Template.Spec.TerminationGracePeriodSeconds != 20 {
+		t.Errorf("Wrong job spec.template.spec.termination_grace_period_seconds: '%d'", *result.Spec.Template.Spec.TerminationGracePeriodSeconds)
+	}
+	initContainer := apiv1.Container{
+		Name:            fmt.Sprintf("init-%s", "svcName"),
+		Image:           config.NewImageConfig(io.NewIOController()).GetCliImage(),
+		ImagePullPolicy: apiv1.PullIfNotPresent,
+		Command:         []string{"sh", "-c", "chmod 777 /data"},
+		VolumeMounts: []apiv1.VolumeMount{
+			{
+				MountPath: "/data",
+				Name:      pvcName,
+			},
+		},
+	}
+	if !reflect.DeepEqual(result.Spec.Template.Spec.InitContainers[0], initContainer) {
+		t.Errorf("Wrong job init container: '%v' but expected '%v'", result.Spec.Template.Spec.InitContainers[0], initContainer)
+	}
+	initVolumeContainer := apiv1.Container{
+		Name:            fmt.Sprintf("init-volume-%s", "svcName"),
+		Image:           "image",
+		ImagePullPolicy: apiv1.PullIfNotPresent,
+		Command:         []string{"sh", "-c", "echo initializing volume... && (cp -Rv /volume1/. /init-volume-0 || true) && (cp -Rv /volume2/. /init-volume-1 || true)"},
+		VolumeMounts: []apiv1.VolumeMount{
+			{
+				MountPath: "/init-volume-0",
+				Name:      pvcName,
+				SubPath:   "data-0",
+			},
+			{
+				MountPath: "/init-volume-1",
+				Name:      pvcName,
+				SubPath:   "data-1",
+			},
+		},
+	}
+	if !reflect.DeepEqual(result.Spec.Template.Spec.InitContainers[1], initVolumeContainer) {
+		t.Errorf("Wrong job init container: '%v' but expected '%v'", result.Spec.Template.Spec.InitContainers[1], initVolumeContainer)
+	}
+	c := result.Spec.Template.Spec.Containers[0]
+	if c.Name != "svcName" {
+		t.Errorf("Wrong job container.name: '%s'", c.Name)
+	}
+	if c.Image != "image" {
+		t.Errorf("Wrong job container.image: '%s'", c.Image)
+	}
+	if !reflect.DeepEqual(c.Command, []string{"command1", "command2"}) {
+		t.Errorf("Wrong container.command: '%v'", c.Command)
+	}
+	if !reflect.DeepEqual(c.Args, []string{"args1", "args2"}) {
+		t.Errorf("Wrong container.args: '%v'", c.Args)
+	}
+	env := []apiv1.EnvVar{{Name: "env1", Value: "value1"}, {Name: "env2", Value: "value2"}}
+	if !reflect.DeepEqual(c.Env, env) {
+		t.Errorf("Wrong container.env: '%v'", c.Env)
+	}
+	ports := []apiv1.ContainerPort{{ContainerPort: 80}, {ContainerPort: 90}}
+	if !reflect.DeepEqual(c.Ports, ports) {
+		t.Errorf("Wrong container.ports: '%v'", c.Ports)
+	}
+	securityContext := apiv1.SecurityContext{
+		Capabilities: &apiv1.Capabilities{
+			Add:  []apiv1.Capability{apiv1.Capability("CAP_ADD")},
+			Drop: []apiv1.Capability{apiv1.Capability("CAP_DROP")},
+		},
+	}
+	if !reflect.DeepEqual(*c.SecurityContext, securityContext) {
+		t.Errorf("Wrong job container.security_context: '%v'", c.SecurityContext)
+	}
+	resources := apiv1.ResourceRequirements{
+		Limits: apiv1.ResourceList{
+			apiv1.ResourceCPU:    resource.MustParse("100m"),
+			apiv1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+	}
+	if !reflect.DeepEqual(c.Resources, resources) {
+		t.Errorf("Wrong container.resources: '%v'", c.Resources)
+	}
+	volumeMounts := []apiv1.VolumeMount{
+		{
+			MountPath: "/volume1",
+			Name:      pvcName,
+			SubPath:   "data-0",
+		},
+		{
+			MountPath: "/volume2",
+			Name:      pvcName,
+			SubPath:   "data-1",
+		},
+	}
+	if !reflect.DeepEqual(c.VolumeMounts, volumeMounts) {
+		t.Errorf("Wrong container.volume_mounts: '%v'", c.VolumeMounts)
+	}
+
+	require.Equal(t, modifiedHostName, result.Spec.Template.Spec.Hostname)
+	require.True(t, divert.called)
+}
+
+func Test_translateService(t *testing.T) {
+
+	var tests = []struct {
+		stack    *model.Stack
+		expected *apiv1.Service
+		name     string
+	}{
+		{
+			name: "translate svc no public endpoints",
+			stack: &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Labels: model.Labels{
+							"label1": "value1",
+							"label2": "value2",
+						},
+						Annotations: model.Annotations{
+							"annotation1": "value1",
+							"annotation2": "value2",
+						},
+						Ports: []model.Port{
+							{
+								HostPort:      82,
+								ContainerPort: 80,
+								Protocol:      apiv1.ProtocolTCP,
+							},
+							{
+								ContainerPort: 90,
+								Protocol:      apiv1.ProtocolTCP,
+							},
+						},
+					},
+				},
+			},
+			expected: &apiv1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "svcName",
+					Labels: map[string]string{
+						"label1":                    "value1",
+						"label2":                    "value2",
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+						model.DeployedByLabel:       "stackname",
+					},
+					Annotations: map[string]string{
+						"annotation1":           "value1",
+						"annotation2":           "value2",
+						"dev.okteto.com/sample": "true",
+					},
+				},
+				Spec: apiv1.ServiceSpec{
+					Type: apiv1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+					},
+					Ports: []apiv1.ServicePort{
+						{
+							Name:       "p-80-80-tcp",
+							Port:       80,
+							TargetPort: intstr.IntOrString{IntVal: 80},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+						{
+							Name:       "p-82-80-tcp",
+							Port:       82,
+							TargetPort: intstr.IntOrString{IntVal: 80},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+						{
+							Name:       "p-90-90-tcp",
+							Port:       90,
+							TargetPort: intstr.IntOrString{IntVal: 90},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "translate svc public endpoints",
+			stack: &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Labels: model.Labels{
+							"label1": "value1",
+							"label2": "value2",
+						},
+
+						Public: true,
+						Annotations: model.Annotations{
+							"annotation1":                     "value1",
+							"annotation2":                     "value2",
+							model.OktetoAutoIngressAnnotation: "true",
+						},
+						Ports: []model.Port{
+							{
+								HostPort:      82,
+								ContainerPort: 80,
+								Protocol:      apiv1.ProtocolTCP,
+							},
+							{
+								ContainerPort: 90,
+								Protocol:      apiv1.ProtocolTCP,
+							},
+						},
+					},
+				},
+			},
+			expected: &apiv1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "svcName",
+					Labels: map[string]string{
+						"label1":                    "value1",
+						"label2":                    "value2",
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+						model.DeployedByLabel:       "stackname",
+					},
+					Annotations: map[string]string{
+						"annotation1":                     "value1",
+						"annotation2":                     "value2",
+						model.OktetoAutoIngressAnnotation: "true",
+						"dev.okteto.com/sample":           "true",
+					},
+				},
+				Spec: apiv1.ServiceSpec{
+					Type: apiv1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+					},
+					Ports: []apiv1.ServicePort{
+						{
+							Name:       "p-80-80-tcp",
+							Port:       80,
+							TargetPort: intstr.IntOrString{IntVal: 80},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+						{
+							Name:       "p-82-80-tcp",
+							Port:       82,
+							TargetPort: intstr.IntOrString{IntVal: 80},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+						{
+							Name:       "p-90-90-tcp",
+							Port:       90,
+							TargetPort: intstr.IntOrString{IntVal: 90},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "translate svc private endpoints",
+			stack: &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Labels: model.Labels{
+							"label1": "value1",
+							"label2": "value2",
+						},
+						Annotations: model.Annotations{
+							"annotation1":                     "value1",
+							"annotation2":                     "value2",
+							model.OktetoAutoIngressAnnotation: "private",
+						},
+						Public: true,
+						Ports: []model.Port{
+							{
+								HostPort:      82,
+								ContainerPort: 80,
+								Protocol:      apiv1.ProtocolTCP,
+							},
+							{
+								ContainerPort: 90,
+								Protocol:      apiv1.ProtocolTCP,
+							}},
+					},
+				},
+			},
+			expected: &apiv1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "svcName",
+					Labels: map[string]string{
+						"label1":                    "value1",
+						"label2":                    "value2",
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+						model.DeployedByLabel:       "stackname",
+					},
+					Annotations: map[string]string{
+						"annotation1":                     "value1",
+						"annotation2":                     "value2",
+						model.OktetoAutoIngressAnnotation: "private",
+						"dev.okteto.com/sample":           "true",
+					},
+				},
+				Spec: apiv1.ServiceSpec{
+					Type: apiv1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+					},
+					Ports: []apiv1.ServicePort{
+						{
+							Name:       "p-80-80-tcp",
+							Port:       80,
+							TargetPort: intstr.IntOrString{IntVal: 80},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+						{
+							Name:       "p-82-80-tcp",
+							Port:       82,
+							TargetPort: intstr.IntOrString{IntVal: 80},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+						{
+							Name:       "p-90-90-tcp",
+							Port:       90,
+							TargetPort: intstr.IntOrString{IntVal: 90},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "translate svc private endpoints by private annotation",
+			stack: &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Labels: model.Labels{
+							"label1": "value1",
+							"label2": "value2",
+						},
+						Annotations: model.Annotations{
+							"annotation1":                    "value1",
+							"annotation2":                    "value2",
+							model.OktetoPrivateSvcAnnotation: "true",
+						},
+						Public: true,
+						Ports: []model.Port{
+							{
+								HostPort:      82,
+								ContainerPort: 80,
+								Protocol:      apiv1.ProtocolTCP,
+							},
+							{
+								ContainerPort: 90,
+								Protocol:      apiv1.ProtocolTCP,
+							}},
+					},
+				},
+			},
+			expected: &apiv1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "svcName",
+					Labels: map[string]string{
+						"label1":                    "value1",
+						"label2":                    "value2",
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+						model.DeployedByLabel:       "stackname",
+					},
+					Annotations: map[string]string{
+						"annotation1":                    "value1",
+						"annotation2":                    "value2",
+						model.OktetoPrivateSvcAnnotation: "true",
+						"dev.okteto.com/sample":          "true",
+					},
+				},
+				Spec: apiv1.ServiceSpec{
+					Type: apiv1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+					},
+					Ports: []apiv1.ServicePort{
+						{
+							Name:       "p-80-80-tcp",
+							Port:       80,
+							TargetPort: intstr.IntOrString{IntVal: 80},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+						{
+							Name:       "p-82-80-tcp",
+							Port:       82,
+							TargetPort: intstr.IntOrString{IntVal: 80},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+						{
+							Name:       "p-90-90-tcp",
+							Port:       90,
+							TargetPort: intstr.IntOrString{IntVal: 90},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "translate svc with same host and container port",
+			stack: &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Labels: model.Labels{
+							"label1": "value1",
+							"label2": "value2",
+						},
+						Annotations: model.Annotations{
+							"annotation1": "value1",
+							"annotation2": "value2",
+						},
+						Ports: []model.Port{
+							{
+								HostPort:      6379,
+								ContainerPort: 6379,
+								Protocol:      apiv1.ProtocolTCP,
+							},
+						},
+					},
+				},
+			},
+			expected: &apiv1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "svcName",
+					Labels: map[string]string{
+						"label1":                    "value1",
+						"label2":                    "value2",
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+						model.DeployedByLabel:       "stackname",
+					},
+					Annotations: map[string]string{
+						"annotation1":           "value1",
+						"annotation2":           "value2",
+						"dev.okteto.com/sample": "true",
+					},
+				},
+				Spec: apiv1.ServiceSpec{
+					Type: apiv1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+					},
+					Ports: []apiv1.ServicePort{
+						{
+							Name:       "p-6379-6379-tcp",
+							Port:       6379,
+							TargetPort: intstr.IntOrString{IntVal: 6379},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "translate service with VIP endpoint mode",
+			stack: &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						EndpointMode: model.EndpointModeVIP,
+						Ports: []model.Port{
+							{
+								ContainerPort: 80,
+								Protocol:      apiv1.ProtocolTCP,
+							},
+						},
+					},
+				},
+			},
+			expected: &apiv1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "svcName",
+					Labels: map[string]string{
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+						model.DeployedByLabel:       "stackname",
+					},
+					Annotations: map[string]string{
+						"dev.okteto.com/sample": "true",
+					},
+				},
+				Spec: apiv1.ServiceSpec{
+					Type: apiv1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+					},
+					Ports: []apiv1.ServicePort{
+						{
+							Name:       "p-80-80-tcp",
+							Port:       80,
+							TargetPort: intstr.IntOrString{IntVal: 80},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+					},
+					// ClusterIP should not be set for VIP mode (default behavior)
+				},
+			},
+		},
+		{
+			name: "translate service with DNSRR endpoint mode (headless)",
+			stack: &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						EndpointMode: model.EndpointModeDNSRR,
+						Ports: []model.Port{
+							{
+								ContainerPort: 80,
+								Protocol:      apiv1.ProtocolTCP,
+							},
+						},
+					},
+				},
+			},
+			expected: &apiv1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "svcName",
+					Labels: map[string]string{
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+						model.DeployedByLabel:       "stackname",
+					},
+					Annotations: map[string]string{
+						"dev.okteto.com/sample": "true",
+					},
+				},
+				Spec: apiv1.ServiceSpec{
+					Type: apiv1.ServiceTypeClusterIP,
+					Selector: map[string]string{
+						model.StackNameLabel:        "stackname",
+						model.StackServiceNameLabel: "svcName",
+					},
+					Ports: []apiv1.ServicePort{
+						{
+							Name:       "p-80-80-tcp",
+							Port:       80,
+							TargetPort: intstr.IntOrString{IntVal: 80},
+							Protocol:   apiv1.ProtocolTCP,
+						},
+					},
+					ClusterIP: "None", // This creates a headless service
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := translateService("svcName", tt.stack)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+
+}
+
+func Test_translateSvcProbe(t *testing.T) {
+	tests := []struct {
+		expected healthcheckProbes
+		svc      *model.Service
+		name     string
+	}{
+		{
+			name: "nil healthcheck",
+			svc: &model.Service{
+				Healtcheck: nil,
+			},
+			expected: healthcheckProbes{
+				readiness: nil,
+				liveness:  nil,
+			},
+		},
+		{
+			name: "healthcheck http",
+			svc: &model.Service{
+				Healtcheck: &model.HealthCheck{
+					HTTP: &model.HTTPHealtcheck{
+						Path: "/",
+						Port: 8080,
+					},
+					Readiness: true,
+				},
+			},
+			expected: healthcheckProbes{
+				readiness: &apiv1.Probe{
+					ProbeHandler: apiv1.ProbeHandler{
+						HTTPGet: &apiv1.HTTPGetAction{
+							Path: "/",
+							Port: intstr.IntOrString{IntVal: 8080},
+						},
+					},
+				},
+				liveness: nil,
+			},
+		},
+
+		{
+			name: "healthcheck http with other fields both ",
+			svc: &model.Service{
+				Healtcheck: &model.HealthCheck{
+					HTTP: &model.HTTPHealtcheck{
+						Path: "/",
+						Port: 8080,
+					},
+					StartPeriod: 30 * time.Second,
+					Retries:     5,
+					Timeout:     5 * time.Minute,
+					Interval:    45 * time.Second,
+					Readiness:   true,
+					Liveness:    true,
+				},
+			},
+			expected: healthcheckProbes{
+				readiness: &apiv1.Probe{
+					ProbeHandler: apiv1.ProbeHandler{
+						HTTPGet: &apiv1.HTTPGetAction{
+							Path: "/",
+							Port: intstr.IntOrString{IntVal: 8080},
+						},
+					},
+					InitialDelaySeconds: 30,
+					FailureThreshold:    5,
+					TimeoutSeconds:      300,
+					PeriodSeconds:       45,
+				},
+				liveness: &apiv1.Probe{
+					ProbeHandler: apiv1.ProbeHandler{
+						HTTPGet: &apiv1.HTTPGetAction{
+							Path: "/",
+							Port: intstr.IntOrString{IntVal: 8080},
+						},
+					},
+					InitialDelaySeconds: 30,
+					FailureThreshold:    5,
+					TimeoutSeconds:      300,
+					PeriodSeconds:       45,
+				},
+			},
+		},
+		{
+			name: "healthcheck exec only readiness",
+			svc: &model.Service{
+				Healtcheck: &model.HealthCheck{
+					Test: model.HealtcheckTest{
+						"curl", "db-service:8080/readiness",
+					},
+					Readiness: true,
+				},
+			},
+			expected: healthcheckProbes{
+				readiness: &apiv1.Probe{
+					ProbeHandler: apiv1.ProbeHandler{
+						Exec: &apiv1.ExecAction{
+							Command: []string{"curl", "db-service:8080/readiness"},
+						},
+					},
+				},
+				liveness: nil,
+			},
+		},
+		{
+			name: "healthcheck exec with other fields only liveness",
+			svc: &model.Service{
+				Healtcheck: &model.HealthCheck{
+					Test: model.HealtcheckTest{
+						"curl", "db-service:8080/readiness",
+					},
+					StartPeriod: 30 * time.Second,
+					Retries:     5,
+					Timeout:     5 * time.Minute,
+					Interval:    45 * time.Second,
+					Liveness:    true,
+				},
+			},
+			expected: healthcheckProbes{
+				liveness: &apiv1.Probe{
+					ProbeHandler: apiv1.ProbeHandler{
+						Exec: &apiv1.ExecAction{
+							Command: []string{"curl", "db-service:8080/readiness"},
+						},
+					},
+					InitialDelaySeconds: 30,
+					FailureThreshold:    5,
+					TimeoutSeconds:      300,
+					PeriodSeconds:       45,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			probe := getSvcHealthProbe(tt.svc)
+			assert.Equal(t, tt.expected, probe)
+		})
+	}
+}
+
+func Test_translateServiceEnvironment(t *testing.T) {
+	tests := []struct {
+		name     string
+		svc      *model.Service
+		expected []apiv1.EnvVar
+	}{
+		{
+			name: "none",
+			svc: &model.Service{
+				Environment: env.Environment{},
+			},
+			expected: []apiv1.EnvVar{},
+		},
+		{
+			name: "empty value",
+			svc: &model.Service{
+				Environment: env.Environment{
+					env.Var{
+						Name: "DEBUG",
+					},
+				},
+			},
+			expected: []apiv1.EnvVar{
+				{
+					Name: "DEBUG",
+				},
+			},
+		},
+		{
+			name: "empty name",
+			svc: &model.Service{
+				Environment: env.Environment{
+					env.Var{
+						Value: "DEBUG",
+					},
+				},
+			},
+			expected: []apiv1.EnvVar{},
+		},
+		{
+			name: "ok env var",
+			svc: &model.Service{
+				Environment: env.Environment{
+					env.Var{
+						Name:  "DEBUG",
+						Value: "true",
+					},
+				},
+			},
+			expected: []apiv1.EnvVar{
+				{
+					Name:  "DEBUG",
+					Value: "true",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			envs := translateServiceEnvironment(tt.svc)
+			if !reflect.DeepEqual(tt.expected, envs) {
+				t.Fatal("Wrong translation")
+			}
+		})
+	}
+}
+
+func Test_translateResources(t *testing.T) {
+	tests := []struct {
+		svc       *model.Service
+		name      string
+		resources apiv1.ResourceRequirements
+	}{
+		{
+			name: "svc not defined",
+			svc: &model.Service{
+				Resources: nil,
+			},
+			resources: apiv1.ResourceRequirements{},
+		},
+		{
+			name: "svc Limits CPU defined",
+			svc: &model.Service{
+				Resources: &model.StackResources{
+					Limits: model.ServiceResources{
+						CPU: model.Quantity{Value: resource.MustParse("2")},
+					},
+				},
+			},
+			resources: apiv1.ResourceRequirements{
+				Limits: apiv1.ResourceList{
+					apiv1.ResourceCPU: resource.MustParse("2"),
+				},
+			},
+		},
+		{
+			name: "svc Limits Memory defined",
+			svc: &model.Service{
+				Resources: &model.StackResources{
+					Limits: model.ServiceResources{
+						Memory: model.Quantity{Value: resource.MustParse("5Gi")},
+					},
+				},
+			},
+			resources: apiv1.ResourceRequirements{
+				Limits: apiv1.ResourceList{
+					apiv1.ResourceMemory: resource.MustParse("5Gi"),
+				},
+			},
+		},
+		{
+			name: "svc Limits ALL defined",
+			svc: &model.Service{
+				Resources: &model.StackResources{
+					Limits: model.ServiceResources{
+						CPU:    model.Quantity{Value: resource.MustParse("2")},
+						Memory: model.Quantity{Value: resource.MustParse("5Gi")},
+					},
+				},
+			},
+			resources: apiv1.ResourceRequirements{
+				Limits: apiv1.ResourceList{
+					apiv1.ResourceCPU:    resource.MustParse("2"),
+					apiv1.ResourceMemory: resource.MustParse("5Gi"),
+				},
+			},
+		},
+
+		{
+			name: "svc Requests CPU defined",
+			svc: &model.Service{
+				Resources: &model.StackResources{
+					Requests: model.ServiceResources{
+						CPU: model.Quantity{Value: resource.MustParse("11m")},
+					},
+				},
+			},
+			resources: apiv1.ResourceRequirements{
+				Requests: apiv1.ResourceList{
+					apiv1.ResourceCPU: resource.MustParse("11m"),
+				},
+			},
+		},
+		{
+			name: "svc Requests Memory defined",
+			svc: &model.Service{
+				Resources: &model.StackResources{
+					Requests: model.ServiceResources{
+						Memory: model.Quantity{Value: resource.MustParse("60Mi")},
+					},
+				},
+			},
+			resources: apiv1.ResourceRequirements{
+				Requests: apiv1.ResourceList{
+					apiv1.ResourceMemory: resource.MustParse("60Mi"),
+				},
+			},
+		},
+		{
+			name: "svc Requests ALL defined",
+			svc: &model.Service{
+				Resources: &model.StackResources{
+					Requests: model.ServiceResources{
+						CPU:    model.Quantity{Value: resource.MustParse("11m")},
+						Memory: model.Quantity{Value: resource.MustParse("60Mi")},
+					},
+				},
+			},
+			resources: apiv1.ResourceRequirements{
+				Requests: apiv1.ResourceList{
+					apiv1.ResourceCPU:    resource.MustParse("11m"),
+					apiv1.ResourceMemory: resource.MustParse("60Mi"),
+				},
+			},
+		},
+		{
+			name: "svc ALL defined",
+			svc: &model.Service{
+				Resources: &model.StackResources{
+					Limits: model.ServiceResources{
+						CPU:    model.Quantity{Value: resource.MustParse("2")},
+						Memory: model.Quantity{Value: resource.MustParse("5Gi")},
+					},
+					Requests: model.ServiceResources{
+						CPU:    model.Quantity{Value: resource.MustParse("11m")},
+						Memory: model.Quantity{Value: resource.MustParse("60Mi")},
+					},
+				},
+			},
+			resources: apiv1.ResourceRequirements{
+				Limits: apiv1.ResourceList{
+					apiv1.ResourceCPU:    resource.MustParse("2"),
+					apiv1.ResourceMemory: resource.MustParse("5Gi"),
+				},
+				Requests: apiv1.ResourceList{
+					apiv1.ResourceCPU:    resource.MustParse("11m"),
+					apiv1.ResourceMemory: resource.MustParse("60Mi"),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := translateResources(tt.svc)
+			if !reflect.DeepEqual(tt.resources, res) {
+				t.Fatalf("Wrong translation expected %v, got %v", tt.resources, res)
+			}
+		})
+	}
+}
+
+func Test_translateAffinity(t *testing.T) {
+	tests := []struct {
+		svc                   *model.Service
+		affinity              *apiv1.Affinity
+		name                  string
+		disableVolumeAffinity bool
+	}{
+		{
+			name: "none",
+			svc: &model.Service{
+				Environment: env.Environment{},
+			},
+			affinity: nil,
+		},
+		{
+			name: "only volume mounts",
+			svc: &model.Service{
+				VolumeMounts: []build.VolumeMounts{
+					{
+						LocalPath:  "",
+						RemotePath: "/var",
+					},
+				},
+			},
+			affinity: nil,
+		},
+		{
+			name: "one volume",
+			svc: &model.Service{
+				Volumes: []build.VolumeMounts{
+					{
+						LocalPath:  "test",
+						RemotePath: "/var",
+					},
+				},
+			},
+			affinity: &apiv1.Affinity{
+				PodAffinity: &apiv1.PodAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: []apiv1.PodAffinityTerm{
+						{
+							TopologyKey: "kubernetes.io/hostname",
+							LabelSelector: &metav1.LabelSelector{
+								MatchExpressions: []metav1.LabelSelectorRequirement{
+									{
+										Key:      fmt.Sprintf("%s-test", model.StackVolumeNameLabel),
+										Operator: metav1.LabelSelectorOpExists,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "multiple volumes",
+			svc: &model.Service{
+				Volumes: []build.VolumeMounts{
+					{
+						LocalPath:  "test-1",
+						RemotePath: "/var",
+					},
+					{
+						LocalPath:  "test-2",
+						RemotePath: "/var",
+					},
+					{
+						LocalPath:  "test-3",
+						RemotePath: "/var",
+					},
+				},
+			},
+			affinity: &apiv1.Affinity{
+				PodAffinity: &apiv1.PodAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: []apiv1.PodAffinityTerm{
+						{
+							TopologyKey: "kubernetes.io/hostname",
+							LabelSelector: &metav1.LabelSelector{
+								MatchExpressions: []metav1.LabelSelectorRequirement{
+									{
+										Key:      fmt.Sprintf("%s-test-1", model.StackVolumeNameLabel),
+										Operator: metav1.LabelSelectorOpExists,
+									},
+								},
+							},
+						},
+						{
+							TopologyKey: "kubernetes.io/hostname",
+							LabelSelector: &metav1.LabelSelector{
+								MatchExpressions: []metav1.LabelSelectorRequirement{
+									{
+										Key:      fmt.Sprintf("%s-test-2", model.StackVolumeNameLabel),
+										Operator: metav1.LabelSelectorOpExists,
+									},
+								},
+							},
+						},
+						{
+							TopologyKey: "kubernetes.io/hostname",
+							LabelSelector: &metav1.LabelSelector{
+								MatchExpressions: []metav1.LabelSelectorRequirement{
+									{
+										Key:      fmt.Sprintf("%s-test-3", model.StackVolumeNameLabel),
+										Operator: metav1.LabelSelectorOpExists,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "multiple volumes with volume affinity disabled",
+			svc: &model.Service{
+				Volumes: []build.VolumeMounts{
+					{
+						LocalPath:  "test-1",
+						RemotePath: "/var",
+					},
+					{
+						LocalPath:  "test-2",
+						RemotePath: "/var",
+					},
+					{
+						LocalPath:  "test-3",
+						RemotePath: "/var",
+					},
+				},
+			},
+			disableVolumeAffinity: true,
+			affinity:              nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.disableVolumeAffinity {
+				t.Setenv(oktetoComposeVolumeAffinityEnabledEnvVar, "false")
+			}
+			aff := translateAffinity(tt.svc)
+			assert.Equal(t, tt.affinity, aff)
+		})
+	}
+}
+
+func TestGetSvcPublicPorts(t *testing.T) {
+	tests := []struct {
+		stack          *model.Stack
+		name           string
+		svcName        string
+		expectedLength int
+	}{
+		{
+			name:    "one public port",
+			svcName: "test",
+			stack: &model.Stack{
+				Services: map[string]*model.Service{
+					"test": {
+						Ports: []model.Port{
+							{
+								HostPort:      80,
+								ContainerPort: 80,
+							},
+						},
+					},
+				},
+			},
+			expectedLength: 1,
+		},
+		{
+			name:    "one private port",
+			svcName: "test",
+			stack: &model.Stack{
+				Services: map[string]*model.Service{
+					"test": {
+						Ports: []model.Port{
+							{
+								ContainerPort: 80,
+							},
+						},
+					},
+				},
+			},
+			expectedLength: 0,
+		},
+		{
+			name:    "one public port with public field",
+			svcName: "test",
+			stack: &model.Stack{
+				Services: map[string]*model.Service{
+					"test": {
+						Public: true,
+						Ports: []model.Port{
+							{
+								ContainerPort: 80,
+								HostPort:      80,
+							},
+						},
+					},
+				},
+			},
+			expectedLength: 1,
+		},
+		{
+			name:    "one public port",
+			svcName: "test",
+			stack: &model.Stack{
+				Services: map[string]*model.Service{
+					"test": {
+						Public: true,
+						Ports: []model.Port{
+							{
+								HostPort:      80,
+								ContainerPort: 80,
+							},
+						},
+					},
+				},
+			},
+			expectedLength: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ports := getSvcPublicPorts(tt.svcName, tt.stack)
+			assert.Len(t, ports, tt.expectedLength)
+		})
+	}
+}
+
+func TestGetDeploymentStrategy(t *testing.T) {
+	tests := []struct {
+		expected appsv1.DeploymentStrategy
+		svc      *model.Service
+		envs     map[string]string
+		name     string
+	}{
+		{
+			name: "default",
+			svc: &model.Service{
+				Annotations: model.Annotations{},
+			},
+			envs: map[string]string{},
+			expected: appsv1.DeploymentStrategy{
+				Type: appsv1.RecreateDeploymentStrategyType,
+			},
+		},
+		{
+			name: "annotation ok - rolling",
+			svc: &model.Service{
+				Annotations: model.Annotations{
+					model.OktetoComposeUpdateStrategyAnnotation: string(rollingUpdateStrategy),
+				},
+			},
+			envs: map[string]string{},
+			expected: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+			},
+		},
+		{
+			name: "annotation ok with different env var - rolling",
+			svc: &model.Service{
+				Annotations: model.Annotations{
+					model.OktetoComposeUpdateStrategyAnnotation: string(rollingUpdateStrategy),
+				},
+			},
+			envs: map[string]string{
+				model.OktetoComposeUpdateStrategyEnvVar: string(recreateUpdateStrategy),
+			},
+			expected: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+			},
+		},
+		{
+			name: "annotation not ok - recreate",
+			svc: &model.Service{
+				Annotations: model.Annotations{
+					model.OktetoComposeUpdateStrategyAnnotation: string(onDeleteUpdateStrategy),
+				},
+			},
+			envs: map[string]string{},
+			expected: appsv1.DeploymentStrategy{
+				Type: appsv1.RecreateDeploymentStrategyType,
+			},
+		},
+		{
+			name: "annotation ok - recreate",
+			svc: &model.Service{
+				Annotations: model.Annotations{
+					model.OktetoComposeUpdateStrategyAnnotation: string(recreateUpdateStrategy),
+				},
+			},
+			envs: map[string]string{},
+			expected: appsv1.DeploymentStrategy{
+				Type: appsv1.RecreateDeploymentStrategyType,
+			},
+		},
+		{
+			name: "env var ok - recreate",
+			svc: &model.Service{
+				Annotations: model.Annotations{},
+			},
+			envs: map[string]string{
+				model.OktetoComposeUpdateStrategyEnvVar: string(recreateUpdateStrategy),
+			},
+			expected: appsv1.DeploymentStrategy{
+				Type: appsv1.RecreateDeploymentStrategyType,
+			},
+		},
+		{
+			name: "env var ok - rolling",
+			svc: &model.Service{
+				Annotations: model.Annotations{},
+			},
+			envs: map[string]string{
+				model.OktetoComposeUpdateStrategyEnvVar: string(rollingUpdateStrategy),
+			},
+			expected: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+			},
+		},
+		{
+			name: "env var not ok",
+			svc: &model.Service{
+				Annotations: model.Annotations{},
+			},
+			envs: map[string]string{
+				model.OktetoComposeUpdateStrategyEnvVar: string(onDeleteUpdateStrategy),
+			},
+			expected: appsv1.DeploymentStrategy{
+				Type: appsv1.RecreateDeploymentStrategyType,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.envs {
+				t.Setenv(k, v)
+			}
+			result := getDeploymentUpdateStrategy(tt.svc)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestGetStatefulSetStrategy(t *testing.T) {
+	tests := []struct {
+		expected appsv1.StatefulSetUpdateStrategy
+		svc      *model.Service
+		envs     map[string]string
+		name     string
+	}{
+		{
+			name: "default",
+			svc: &model.Service{
+				Annotations: model.Annotations{},
+			},
+			envs: map[string]string{},
+			expected: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+			},
+		},
+		{
+			name: "annotation ok - rolling",
+			svc: &model.Service{
+				Annotations: model.Annotations{
+					model.OktetoComposeUpdateStrategyAnnotation: string(rollingUpdateStrategy),
+				},
+			},
+			envs: map[string]string{},
+			expected: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+			},
+		},
+		{
+			name: "annotation ok with different env var - rolling",
+			svc: &model.Service{
+				Annotations: model.Annotations{
+					model.OktetoComposeUpdateStrategyAnnotation: string(rollingUpdateStrategy),
+				},
+			},
+			envs: map[string]string{
+				model.OktetoComposeUpdateStrategyEnvVar: string(recreateUpdateStrategy),
+			},
+			expected: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+			},
+		},
+		{
+			name: "annotation not ok - rolling",
+			svc: &model.Service{
+				Annotations: model.Annotations{
+					model.OktetoComposeUpdateStrategyAnnotation: string(recreateUpdateStrategy),
+				},
+			},
+			envs: map[string]string{},
+			expected: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+			},
+		},
+		{
+			name: "annotation ok - on-delete",
+			svc: &model.Service{
+				Annotations: model.Annotations{
+					model.OktetoComposeUpdateStrategyAnnotation: string(onDeleteUpdateStrategy),
+				},
+			},
+			envs: map[string]string{},
+			expected: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
+			},
+		},
+		{
+			name: "env var ok - on-delete",
+			svc: &model.Service{
+				Annotations: model.Annotations{},
+			},
+			envs: map[string]string{
+				model.OktetoComposeUpdateStrategyEnvVar: string(onDeleteUpdateStrategy),
+			},
+			expected: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
+			},
+		},
+		{
+			name: "env var ok - rolling",
+			svc: &model.Service{
+				Annotations: model.Annotations{},
+			},
+			envs: map[string]string{
+				model.OktetoComposeUpdateStrategyEnvVar: string(rollingUpdateStrategy),
+			},
+			expected: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+			},
+		},
+		{
+			name: "env var not ok",
+			svc: &model.Service{
+				Annotations: model.Annotations{},
+			},
+			envs: map[string]string{
+				model.OktetoComposeUpdateStrategyEnvVar: string(recreateUpdateStrategy),
+			},
+			expected: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.envs {
+				t.Setenv(k, v)
+			}
+			result := getStatefulsetUpdateStrategy(tt.svc)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// hasIdentityTokenVolume reports whether the slice contains the projected identity-token volume.
+func hasIdentityTokenVolume(t *testing.T, volumes []apiv1.Volume) bool {
+	t.Helper()
+	for _, v := range volumes {
+		if v.Name == identityTokenVolumeName {
+			return true
+		}
+	}
+	return false
+}
+
+// hasIdentityTokenVolumeMount reports whether the slice contains the projected identity-token mount.
+func hasIdentityTokenVolumeMount(t *testing.T, mounts []apiv1.VolumeMount) bool {
+	t.Helper()
+	for _, m := range mounts {
+		if m.Name == identityTokenVolumeName {
+			return true
+		}
+	}
+	return false
+}
+
+func Test_translateIdentityTokenVolume(t *testing.T) {
+	tests := []struct {
+		name     string
+		svc      *model.Service
+		expected *apiv1.Volume
+	}{
+		{
+			name: "identity token set without expiration uses default",
+			svc: &model.Service{
+				IdentityToken: &model.ServiceIdentityToken{
+					Audience:  "sts.amazonaws.com",
+					MountPath: "/var/run/secrets/tokens/aws",
+				},
+			},
+			expected: &apiv1.Volume{
+				Name: identityTokenVolumeName,
+				VolumeSource: apiv1.VolumeSource{
+					Projected: &apiv1.ProjectedVolumeSource{
+						Sources: []apiv1.VolumeProjection{
+							{
+								ServiceAccountToken: &apiv1.ServiceAccountTokenProjection{
+									Audience:          "sts.amazonaws.com",
+									ExpirationSeconds: ptr.To(int64(3600)),
+									Path:              identityTokenFileName,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "identity token set with explicit expiration",
+			svc: &model.Service{
+				IdentityToken: &model.ServiceIdentityToken{
+					Audience:          "sts.amazonaws.com",
+					MountPath:         "/var/run/secrets/tokens/aws",
+					ExpirationSeconds: ptr.To(model.IdentityTokenExpiration(1200)),
+				},
+			},
+			expected: &apiv1.Volume{
+				Name: identityTokenVolumeName,
+				VolumeSource: apiv1.VolumeSource{
+					Projected: &apiv1.ProjectedVolumeSource{
+						Sources: []apiv1.VolumeProjection{
+							{
+								ServiceAccountToken: &apiv1.ServiceAccountTokenProjection{
+									Audience:          "sts.amazonaws.com",
+									ExpirationSeconds: ptr.To(int64(1200)),
+									Path:              identityTokenFileName,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:     "identity token not set returns nil",
+			svc:      &model.Service{},
+			expected: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := translateIdentityTokenVolume(tt.svc)
+			require.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func Test_translateIdentityTokenVolumeMount(t *testing.T) {
+	tests := []struct {
+		name     string
+		svc      *model.Service
+		expected *apiv1.VolumeMount
+	}{
+		{
+			name: "identity token set returns read-only mount",
+			svc: &model.Service{
+				IdentityToken: &model.ServiceIdentityToken{
+					Audience:  "sts.amazonaws.com",
+					MountPath: "/var/run/secrets/tokens/aws",
+				},
+			},
+			expected: &apiv1.VolumeMount{
+				Name:      identityTokenVolumeName,
+				MountPath: "/var/run/secrets/tokens/aws",
+				ReadOnly:  true,
+			},
+		},
+		{
+			name:     "identity token not set returns nil",
+			svc:      &model.Service{},
+			expected: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := translateIdentityTokenVolumeMount(tt.svc)
+			require.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func Test_translateDeployment_withIdentityToken(t *testing.T) {
+	s := &model.Stack{
+		Name: "stackName",
+		Services: map[string]*model.Service{
+			"svcName": {
+				Image:         "image",
+				Replicas:      1,
+				RestartPolicy: apiv1.RestartPolicyAlways,
+				IdentityToken: &model.ServiceIdentityToken{
+					Audience:  "sts.amazonaws.com",
+					MountPath: "/var/run/secrets/tokens/aws",
+				},
+			},
+		},
+	}
+	require.True(t, s.Services["svcName"].IsDeployment())
+
+	result := translateDeployment("svcName", s, nil)
+
+	require.True(t, hasIdentityTokenVolume(t, result.Spec.Template.Spec.Volumes))
+	require.True(t, hasIdentityTokenVolumeMount(t, result.Spec.Template.Spec.Containers[0].VolumeMounts))
+}
+
+func Test_translateDeployment_withoutIdentityToken(t *testing.T) {
+	s := &model.Stack{
+		Name: "stackName",
+		Services: map[string]*model.Service{
+			"svcName": {
+				Image:         "image",
+				Replicas:      1,
+				RestartPolicy: apiv1.RestartPolicyAlways,
+			},
+		},
+	}
+	require.True(t, s.Services["svcName"].IsDeployment())
+
+	result := translateDeployment("svcName", s, nil)
+
+	require.False(t, hasIdentityTokenVolume(t, result.Spec.Template.Spec.Volumes))
+	require.False(t, hasIdentityTokenVolumeMount(t, result.Spec.Template.Spec.Containers[0].VolumeMounts))
+}
+
+func Test_translateStatefulSet_withIdentityToken(t *testing.T) {
+	s := &model.Stack{
+		Name: "stackName",
+		Services: map[string]*model.Service{
+			"svcName": {
+				Image:         "image",
+				Replicas:      1,
+				RestartPolicy: apiv1.RestartPolicyAlways,
+				Volumes:       []build.VolumeMounts{{RemotePath: "/volume1"}},
+				Resources: &model.StackResources{
+					Requests: model.ServiceResources{
+						Storage: model.StorageResource{
+							Size: model.Quantity{Value: resource.MustParse("20Gi")},
+						},
+					},
+				},
+				IdentityToken: &model.ServiceIdentityToken{
+					Audience:  "sts.amazonaws.com",
+					MountPath: "/var/run/secrets/tokens/aws",
+				},
+			},
+		},
+	}
+	require.True(t, s.Services["svcName"].IsStatefulset())
+
+	result := translateStatefulSet("svcName", s, nil)
+
+	require.True(t, hasIdentityTokenVolume(t, result.Spec.Template.Spec.Volumes))
+	require.True(t, hasIdentityTokenVolumeMount(t, result.Spec.Template.Spec.Containers[0].VolumeMounts))
+}
+
+func Test_translateStatefulSet_withoutIdentityToken(t *testing.T) {
+	s := &model.Stack{
+		Name: "stackName",
+		Services: map[string]*model.Service{
+			"svcName": {
+				Image:         "image",
+				Replicas:      1,
+				RestartPolicy: apiv1.RestartPolicyAlways,
+				Volumes:       []build.VolumeMounts{{RemotePath: "/volume1"}},
+				Resources: &model.StackResources{
+					Requests: model.ServiceResources{
+						Storage: model.StorageResource{
+							Size: model.Quantity{Value: resource.MustParse("20Gi")},
+						},
+					},
+				},
+			},
+		},
+	}
+	require.True(t, s.Services["svcName"].IsStatefulset())
+
+	result := translateStatefulSet("svcName", s, nil)
+
+	require.False(t, hasIdentityTokenVolume(t, result.Spec.Template.Spec.Volumes))
+	require.False(t, hasIdentityTokenVolumeMount(t, result.Spec.Template.Spec.Containers[0].VolumeMounts))
+}
+
+func Test_translateJob_withIdentityToken(t *testing.T) {
+	s := &model.Stack{
+		Name: "stackName",
+		Services: map[string]*model.Service{
+			"svcName": {
+				Image:         "image",
+				Replicas:      1,
+				RestartPolicy: apiv1.RestartPolicyNever,
+				BackOffLimit:  5,
+				IdentityToken: &model.ServiceIdentityToken{
+					Audience:  "sts.amazonaws.com",
+					MountPath: "/var/run/secrets/tokens/aws",
+				},
+			},
+		},
+	}
+	require.True(t, s.Services["svcName"].IsJob())
+
+	result := translateJob("svcName", s, nil)
+
+	require.True(t, hasIdentityTokenVolume(t, result.Spec.Template.Spec.Volumes))
+	require.True(t, hasIdentityTokenVolumeMount(t, result.Spec.Template.Spec.Containers[0].VolumeMounts))
+}
+
+func Test_translateJob_withoutIdentityToken(t *testing.T) {
+	s := &model.Stack{
+		Name: "stackName",
+		Services: map[string]*model.Service{
+			"svcName": {
+				Image:         "image",
+				Replicas:      1,
+				RestartPolicy: apiv1.RestartPolicyNever,
+				BackOffLimit:  5,
+			},
+		},
+	}
+	require.True(t, s.Services["svcName"].IsJob())
+
+	result := translateJob("svcName", s, nil)
+
+	require.False(t, hasIdentityTokenVolume(t, result.Spec.Template.Spec.Volumes))
+	require.False(t, hasIdentityTokenVolumeMount(t, result.Spec.Template.Spec.Containers[0].VolumeMounts))
+}
+
+func Test_translateDeployment_enableServiceLinks(t *testing.T) {
+	tests := []struct {
+		enableServiceLinks *bool
+		name               string
+	}{
+		{name: "unset", enableServiceLinks: nil},
+		{name: "disabled", enableServiceLinks: ptr.To(false)},
+		{name: "enabled", enableServiceLinks: ptr.To(true)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Image:              "image",
+						Replicas:           1,
+						EnableServiceLinks: tt.enableServiceLinks,
+					},
+				},
+			}
+
+			result := translateDeployment("svcName", s, nil)
+
+			require.Equal(t, tt.enableServiceLinks, result.Spec.Template.Spec.EnableServiceLinks)
+		})
+	}
+}
+
+func Test_translateStatefulSet_enableServiceLinks(t *testing.T) {
+	tests := []struct {
+		enableServiceLinks *bool
+		name               string
+	}{
+		{name: "unset", enableServiceLinks: nil},
+		{name: "disabled", enableServiceLinks: ptr.To(false)},
+		{name: "enabled", enableServiceLinks: ptr.To(true)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Image:              "image",
+						Replicas:           1,
+						EnableServiceLinks: tt.enableServiceLinks,
+					},
+				},
+			}
+
+			result := translateStatefulSet("svcName", s, nil)
+
+			require.Equal(t, tt.enableServiceLinks, result.Spec.Template.Spec.EnableServiceLinks)
+		})
+	}
+}
+
+func Test_translateJob_enableServiceLinks(t *testing.T) {
+	tests := []struct {
+		enableServiceLinks *bool
+		name               string
+	}{
+		{name: "unset", enableServiceLinks: nil},
+		{name: "disabled", enableServiceLinks: ptr.To(false)},
+		{name: "enabled", enableServiceLinks: ptr.To(true)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Image:              "image",
+						Replicas:           1,
+						RestartPolicy:      apiv1.RestartPolicyNever,
+						BackOffLimit:       5,
+						EnableServiceLinks: tt.enableServiceLinks,
+					},
+				},
+			}
+			require.True(t, s.Services["svcName"].IsJob())
+
+			result := translateJob("svcName", s, nil)
+
+			require.Equal(t, tt.enableServiceLinks, result.Spec.Template.Spec.EnableServiceLinks)
+		})
+	}
+}
+
+func Test_translateDeployment_serviceAccount(t *testing.T) {
+	tests := []struct {
+		name           string
+		serviceAccount string
+	}{
+		{name: "unset", serviceAccount: ""},
+		{name: "set", serviceAccount: "my-sa"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Image:          "image",
+						Replicas:       1,
+						ServiceAccount: tt.serviceAccount,
+					},
+				},
+			}
+
+			result := translateDeployment("svcName", s, nil)
+
+			require.Equal(t, tt.serviceAccount, result.Spec.Template.Spec.ServiceAccountName)
+		})
+	}
+}
+
+func Test_translateStatefulSet_serviceAccount(t *testing.T) {
+	tests := []struct {
+		name           string
+		serviceAccount string
+	}{
+		{name: "unset", serviceAccount: ""},
+		{name: "set", serviceAccount: "my-sa"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Image:          "image",
+						Replicas:       1,
+						ServiceAccount: tt.serviceAccount,
+					},
+				},
+			}
+
+			result := translateStatefulSet("svcName", s, nil)
+
+			require.Equal(t, tt.serviceAccount, result.Spec.Template.Spec.ServiceAccountName)
+		})
+	}
+}
+
+func Test_translateJob_serviceAccount(t *testing.T) {
+	tests := []struct {
+		name           string
+		serviceAccount string
+	}{
+		{name: "unset", serviceAccount: ""},
+		{name: "set", serviceAccount: "my-sa"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &model.Stack{
+				Name: "stackName",
+				Services: map[string]*model.Service{
+					"svcName": {
+						Image:          "image",
+						Replicas:       1,
+						RestartPolicy:  apiv1.RestartPolicyNever,
+						BackOffLimit:   5,
+						ServiceAccount: tt.serviceAccount,
+					},
+				},
+			}
+			require.True(t, s.Services["svcName"].IsJob())
+
+			result := translateJob("svcName", s, nil)
+
+			require.Equal(t, tt.serviceAccount, result.Spec.Template.Spec.ServiceAccountName)
+		})
 	}
 }

@@ -1,0 +1,41 @@
+# Only ignore specific directories and files
+/bin/
+/docs/
+/integration/
+/.circleci/
+/.github/
+/.vscode/
+/artifacts/
+/images/
+/samples/
+/.codecov.yml
+/.copyright-header.tmpl
+/.DEREK.yml
+/.editorconfig
+/.gitignore
+/.golangci.yml
+/.mdlrc
+/.pre-commit-config.yaml
+/.prettierrc
+/.prettierignore
+/.stignore
+/.yaml-lint.yml
+/CODE_OF_CONDUCT.md
+/CODEOWNERS
+
+# Applied to deploy commands only - ignore everything
+[deploy]
+*
+
+# Applied to destroy commands only - ignore everything
+[destroy]
+*
+
+[test.unit]
+*
+!**/*.go
+!tools/go.mod
+!tools/go.sum
+!go.mod
+!go.sum
+!Makefile

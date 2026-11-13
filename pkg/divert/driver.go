@@ -1,0 +1,85 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package divert
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/divert/gatewayapi"
+	"github.com/okteto/okteto/pkg/divert/istio"
+	"github.com/okteto/okteto/pkg/divert/k8s"
+	"github.com/okteto/okteto/pkg/divert/noop"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/k8s/virtualservices"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/log/io"
+	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
+	istioNetworkingV1beta1 "istio.io/api/networking/v1beta1"
+	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
+)
+
+type Driver interface {
+	Deploy(ctx context.Context) error
+	Destroy(ctx context.Context) error
+	UpdatePod(spec apiv1.PodSpec) apiv1.PodSpec
+	UpdateVirtualService(vs *istioNetworkingV1beta1.VirtualService)
+}
+
+func New(divert *model.DivertDeploy, name, namespace string, c kubernetes.Interface, ioCtrl *io.Controller) (Driver, error) {
+	if !okteto.IsOkteto() {
+		return nil, oktetoErrors.ErrDivertNotSupported
+	}
+
+	switch divert.Driver {
+	// Loading the manifest translates the legacy nginx driver into gateway-api, but older CLIs send nginx to
+	// the remote runner in OKTETO_DEPLOYABLE, which isn't loaded as a manifest
+	case constants.OktetoDivertGatewayAPIDriver, constants.OktetoDivertLegacyNginxDriver:
+		if divert.Driver == constants.OktetoDivertLegacyNginxDriver {
+			oktetoLog.Infof("divert driver '%s' received, using the '%s' driver", constants.OktetoDivertLegacyNginxDriver, constants.OktetoDivertGatewayAPIDriver)
+		}
+
+		var err error
+		divertClient := k8s.GetNoopDivertClient(ioCtrl)
+
+		// If divert CRDs are not enabled, we use the noop divert client
+		if okteto.GetContext().DivertCRDSEnabled {
+			divertClient, err = k8s.GetDivertClient()
+			if err != nil {
+				return nil, fmt.Errorf("error creating divert client: %w", err)
+			}
+		}
+
+		manager := NewManager(divertClient)
+		return gatewayapi.New(divert, name, namespace, c, manager), nil
+	case constants.OktetoDivertIstioDriver:
+		ic, err := virtualservices.GetIstioClient()
+		if err != nil {
+			return nil, fmt.Errorf("error creating istio client: %w", err)
+		}
+
+		return istio.New(divert, name, namespace, c, ic), nil
+	default:
+		return nil, fmt.Errorf("the divert driver '%s' isn't supported", divert.Driver)
+	}
+}
+
+// NewNoop returns a new noop driver for divert. Useful for cases in which divert is not defined
+// in the manifest but the flow needs a driver
+func NewNoop() Driver {
+	return &noop.Driver{}
+}

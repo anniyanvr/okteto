@@ -1,0 +1,928 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package okteto
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/types"
+	"github.com/shurcooL/graphql"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestDeployPipeline(t *testing.T) {
+	type input struct {
+		client    *fakeGraphQLClient
+		name      string
+		variables []types.Variable
+		labels    []string
+	}
+	type expected struct {
+		response *types.GitDeployResponse
+		err      error
+	}
+	testCases := []struct {
+		expected expected
+		name     string
+		input    input
+	}{
+		{
+			name: "with variables - error",
+			input: input{
+				client: &fakeGraphQLClient{
+					err: assert.AnError,
+				},
+				name: "test",
+				variables: []types.Variable{
+					{
+						Name:  "OKTETO_ORIGIN",
+						Value: "VALUE",
+					},
+				},
+			},
+			expected: expected{
+				response: nil,
+				err:      assert.AnError,
+			},
+		},
+		{
+			name: "with variables - no error",
+			input: input{
+				client: &fakeGraphQLClient{
+					mutationResult: &deployPipelineMutation{
+						Response: deployPipelineResponse{
+							Action: actionStruct{
+								Id:     "test",
+								Name:   "test",
+								Status: ProgressingStatus,
+							},
+							GitDeploy: gitDeployInfoWithRepoInfo{
+								Id:         "test",
+								Name:       "test",
+								Status:     ProgressingStatus,
+								Repository: "my-repo",
+							},
+						},
+					},
+					err: nil,
+				},
+				name: "test",
+				variables: []types.Variable{
+					{
+						Name:  "KEY",
+						Value: "VALUE",
+					},
+				},
+			},
+			expected: expected{
+				response: &types.GitDeployResponse{
+					Action: &types.Action{
+						ID:     "test",
+						Name:   "test",
+						Status: progressingStatus,
+					},
+					GitDeploy: &types.GitDeploy{
+						ID:         "test",
+						Name:       "test",
+						Repository: "my-repo",
+						Status:     progressingStatus,
+					},
+				},
+				err: nil,
+			},
+		},
+		{
+			name: "without variables - error",
+			input: input{
+				client: &fakeGraphQLClient{
+					err: assert.AnError,
+				},
+				name:      "test",
+				variables: []types.Variable{},
+			},
+			expected: expected{
+				response: nil,
+				err:      assert.AnError,
+			},
+		},
+		{
+			name: "without variables - no error",
+			input: input{
+				client: &fakeGraphQLClient{
+					mutationResult: &deployPipelineMutation{
+						Response: deployPipelineResponse{
+							Action: actionStruct{
+								Id:     "test",
+								Name:   "test",
+								Status: ProgressingStatus,
+							},
+							GitDeploy: gitDeployInfoWithRepoInfo{
+								Id:         "test",
+								Name:       "test",
+								Status:     ProgressingStatus,
+								Repository: "my-repo",
+							},
+						},
+					},
+					err: nil,
+				},
+				name:      "test",
+				variables: []types.Variable{},
+			},
+			expected: expected{
+				response: &types.GitDeployResponse{
+					Action: &types.Action{
+						ID:     "test",
+						Name:   "test",
+						Status: progressingStatus,
+					},
+					GitDeploy: &types.GitDeploy{
+						ID:         "test",
+						Name:       "test",
+						Status:     ProgressingStatus,
+						Repository: "my-repo",
+					},
+				},
+				err: nil,
+			},
+		},
+		{
+			name: "with labels - error",
+			input: input{
+				client: &fakeGraphQLClient{
+					err: assert.AnError,
+				},
+				name: "test",
+				labels: []string{
+					"key",
+				},
+			},
+			expected: expected{
+				response: nil,
+				err:      assert.AnError,
+			},
+		},
+		{
+			name: "with labels - deprecation error",
+			input: input{
+				client: &fakeGraphQLClient{
+					err: fmt.Errorf("Unknown argument \"labels\" on field \"deployGitRepository\" of type \"Mutation\""),
+				},
+				name: "test",
+				labels: []string{
+					"key",
+				},
+			},
+			expected: expected{
+				response: nil,
+				err:      ErrDeployPipelineLabelsFeatureNotSupported,
+			},
+		},
+		{
+			name: "with labels - no error",
+			input: input{
+				client: &fakeGraphQLClient{
+					mutationResult: &deployPipelineMutation{
+						Response: deployPipelineResponse{
+							Action: actionStruct{
+								Id:     "test",
+								Name:   "test",
+								Status: ProgressingStatus,
+							},
+							GitDeploy: gitDeployInfoWithRepoInfo{
+								Id:         "test",
+								Name:       "test",
+								Status:     ProgressingStatus,
+								Repository: "my-repo",
+							},
+						},
+					},
+					err: nil,
+				},
+				labels: []string{
+					"key",
+				},
+				name: "test",
+			},
+			expected: expected{
+				response: &types.GitDeployResponse{
+					Action: &types.Action{
+						ID:     "test",
+						Name:   "test",
+						Status: progressingStatus,
+					},
+					GitDeploy: &types.GitDeploy{
+						ID:         "test",
+						Name:       "test",
+						Repository: "my-repo",
+						Status:     progressingStatus,
+					},
+				},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := pipelineClient{
+				client: tc.input.client,
+			}
+			response, err := pc.Deploy(context.Background(), types.PipelineDeployOptions{
+				Name:      tc.input.name,
+				Variables: tc.input.variables,
+				Labels:    tc.input.labels,
+			})
+			assert.ErrorIs(t, err, tc.expected.err)
+			assert.Equal(t, tc.expected.response, response)
+		})
+	}
+}
+
+func TestDeployPipelineWorkflowIDFallback(t *testing.T) {
+	successResult := &deployPipelineMutation{
+		Response: deployPipelineResponse{
+			Action: actionStruct{
+				Id:     "test",
+				Name:   "test",
+				Status: ProgressingStatus,
+			},
+			GitDeploy: gitDeployInfoWithRepoInfo{
+				Id:         "test",
+				Name:       "test",
+				Status:     ProgressingStatus,
+				Repository: "my-repo",
+			},
+		},
+	}
+	expectedResponse := &types.GitDeployResponse{
+		Action: &types.Action{
+			ID:     "test",
+			Name:   "test",
+			Status: progressingStatus,
+		},
+		GitDeploy: &types.GitDeploy{
+			ID:         "test",
+			Name:       "test",
+			Repository: "my-repo",
+			Status:     progressingStatus,
+		},
+	}
+
+	t.Run("workflowId not supported - falls back to legacy mutation", func(t *testing.T) {
+		client := &fakeGraphQLMultipleCallsClient{
+			errs:           []error{errors.New(`Unknown argument "workflowId" on field "deployGitRepository" of type "Mutation"`), nil},
+			mutationResult: []interface{}{nil, successResult},
+		}
+		pc := pipelineClient{client: client}
+		response, err := pc.Deploy(context.Background(), types.PipelineDeployOptions{Name: "test"})
+		require.NoError(t, err)
+		assert.Equal(t, expectedResponse, response)
+	})
+
+	t.Run("workflowId not supported with labels - falls back to legacy mutation", func(t *testing.T) {
+		client := &fakeGraphQLMultipleCallsClient{
+			errs:           []error{errors.New(`Unknown argument "workflowId" on field "deployGitRepository" of type "Mutation"`), nil},
+			mutationResult: []interface{}{nil, successResult},
+		}
+		pc := pipelineClient{client: client}
+		response, err := pc.Deploy(context.Background(), types.PipelineDeployOptions{Name: "test", Labels: []string{"key"}})
+		assert.NoError(t, err)
+		assert.Equal(t, expectedResponse, response)
+	})
+
+	t.Run("parentWorkflowId not supported - falls back to legacy mutation", func(t *testing.T) {
+		client := &fakeGraphQLMultipleCallsClient{
+			errs:           []error{errors.New(`Unknown argument "parentWorkflowId" on field "deployGitRepository" of type "Mutation"`), nil},
+			mutationResult: []interface{}{nil, successResult},
+		}
+		pc := pipelineClient{client: client}
+		response, err := pc.Deploy(context.Background(), types.PipelineDeployOptions{Name: "test", ParentWorkflowID: "parent-id"})
+		assert.NoError(t, err)
+		assert.Equal(t, expectedResponse, response)
+	})
+
+	t.Run("parentWorkflowId not supported with labels - falls back to legacy mutation", func(t *testing.T) {
+		client := &fakeGraphQLMultipleCallsClient{
+			errs:           []error{errors.New(`Unknown argument "parentWorkflowId" on field "deployGitRepository" of type "Mutation"`), nil},
+			mutationResult: []interface{}{nil, successResult},
+		}
+		pc := pipelineClient{client: client}
+		response, err := pc.Deploy(context.Background(), types.PipelineDeployOptions{Name: "test", ParentWorkflowID: "parent-id", Labels: []string{"key"}})
+		assert.NoError(t, err)
+		assert.Equal(t, expectedResponse, response)
+	})
+}
+
+// capturingMutateClient records the variables sent on each mutation so tests can
+// assert which arguments are forwarded to the GraphQL backend.
+type capturingMutateClient struct {
+	err  error
+	vars []map[string]interface{}
+}
+
+func (c *capturingMutateClient) Query(_ context.Context, _ interface{}, _ map[string]interface{}) error {
+	return nil
+}
+
+func (c *capturingMutateClient) Mutate(_ context.Context, _ interface{}, vars map[string]interface{}) error {
+	c.vars = append(c.vars, vars)
+	return c.err
+}
+
+func TestDeployPipelineSendsParentWorkflowID(t *testing.T) {
+	client := &capturingMutateClient{}
+	pc := pipelineClient{client: client}
+
+	_, err := pc.Deploy(context.Background(), types.PipelineDeployOptions{
+		Name:             "test",
+		WorkflowID:       "workflow-id",
+		ParentWorkflowID: "parent-id",
+	})
+
+	require.NoError(t, err)
+	require.Len(t, client.vars, 1)
+	require.Equal(t, graphql.String("parent-id"), client.vars[0]["parentWorkflowId"])
+	require.Equal(t, graphql.String("workflow-id"), client.vars[0]["workflowId"])
+}
+
+func TestDeployPipelineOmitsEmptyParentWorkflowID(t *testing.T) {
+	client := &capturingMutateClient{}
+	pc := pipelineClient{client: client}
+
+	_, err := pc.Deploy(context.Background(), types.PipelineDeployOptions{
+		Name:       "test",
+		WorkflowID: "workflow-id",
+	})
+
+	require.NoError(t, err)
+	require.Len(t, client.vars, 1)
+	_, ok := client.vars[0]["parentWorkflowId"]
+	require.False(t, ok, "parentWorkflowId must not be sent when there is no parent")
+}
+
+func TestGetPipelineByName(t *testing.T) {
+	type input struct {
+		client *fakeGraphQLClient
+		name   string
+	}
+	type expected struct {
+		response *types.GitDeploy
+		err      error
+	}
+	testCases := []struct {
+		expected expected
+		input    input
+		name     string
+	}{
+		{
+			name: "error",
+			input: input{
+				client: &fakeGraphQLClient{
+					err: assert.AnError,
+				},
+				name: "test",
+			},
+			expected: expected{
+				response: nil,
+				err:      assert.AnError,
+			},
+		},
+		{
+			name: "not found",
+			input: input{
+				client: &fakeGraphQLClient{
+					queryResult: &getPipelineByNameQuery{
+						Response: getPipelineByNameResponse{
+							GitDeploys: []gitDeployInfoIdNameStatus{
+								{
+									Id:     "",
+									Name:   "test1",
+									Status: ProgressingStatus,
+								},
+								{
+									Id:     "",
+									Name:   "test2",
+									Status: ProgressingStatus,
+								},
+							},
+						},
+					},
+					err: nil,
+				},
+				name: "not found",
+			},
+			expected: expected{
+				response: nil,
+				err:      oktetoErrors.ErrNotFound,
+			},
+		},
+		{
+			name: "found",
+			input: input{
+				client: &fakeGraphQLClient{
+					queryResult: &getPipelineByNameQuery{
+						Response: getPipelineByNameResponse{
+							GitDeploys: []gitDeployInfoIdNameStatus{
+								{
+									Id:     "",
+									Name:   "test1",
+									Status: ProgressingStatus,
+								},
+								{
+									Id:     "",
+									Name:   "test2",
+									Status: ProgressingStatus,
+								},
+							},
+						},
+					},
+					err: nil,
+				},
+				name: "test1",
+			},
+			expected: expected{
+				response: &types.GitDeploy{
+					ID:     "",
+					Name:   "test1",
+					Status: progressingStatus,
+				},
+				err: nil,
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := pipelineClient{
+				client: tc.input.client,
+			}
+			response, err := pc.GetByName(context.Background(), tc.input.name, "")
+			assert.ErrorIs(t, err, tc.expected.err)
+			assert.Equal(t, tc.expected.response, response)
+		})
+	}
+}
+
+func TestDestroyPipeline(t *testing.T) {
+	type input struct {
+		client         *fakeGraphQLMultipleCallsClient
+		name           string
+		destroyVolumes bool
+	}
+	type expected struct {
+		response *types.GitDeployResponse
+		err      error
+	}
+	testCases := []struct {
+		expected expected
+		name     string
+		input    input
+	}{
+		{
+			name: "destroy volumes - error",
+			input: input{
+				client: &fakeGraphQLMultipleCallsClient{
+					errs: []error{assert.AnError},
+				},
+				name:           "test",
+				destroyVolumes: true,
+			},
+			expected: expected{
+				err: assert.AnError,
+			},
+		},
+		{
+			name: "destroy no volumes - error",
+			input: input{
+				client: &fakeGraphQLMultipleCallsClient{
+					errs: []error{assert.AnError},
+				},
+				name:           "test",
+				destroyVolumes: false,
+			},
+			expected: expected{
+				err: assert.AnError,
+			},
+		},
+		{
+			name: "destroy volumes - no error",
+			input: input{
+				client: &fakeGraphQLMultipleCallsClient{
+					mutationResult: []interface{}{
+						&destroyPipelineMutation{
+							Response: destroyPipelineResponse{
+								Action: actionStruct{
+									Id:     "test",
+									Name:   "test",
+									Status: ProgressingStatus,
+								},
+								GitDeploy: gitDeployInfoWithRepoInfo{
+									Id:         "test",
+									Name:       "test",
+									Status:     ProgressingStatus,
+									Repository: "repo",
+								},
+							},
+						},
+					},
+				},
+				name:           "test",
+				destroyVolumes: true,
+			},
+			expected: expected{
+				response: &types.GitDeployResponse{
+					Action: &types.Action{
+						ID:     "test",
+						Name:   "test",
+						Status: progressingStatus,
+					},
+					GitDeploy: &types.GitDeploy{
+						ID:         "test",
+						Name:       "test",
+						Repository: "repo",
+						Status:     progressingStatus,
+					},
+				},
+				err: nil,
+			},
+		},
+		{
+			name: "destroy no volumes - no error",
+			input: input{
+				client: &fakeGraphQLMultipleCallsClient{
+					mutationResult: []interface{}{
+						&destroyPipelineMutation{
+							Response: destroyPipelineResponse{
+								Action: actionStruct{
+									Id:     "test",
+									Name:   "test",
+									Status: ProgressingStatus,
+								},
+								GitDeploy: gitDeployInfoWithRepoInfo{
+									Id:         "test",
+									Name:       "test",
+									Status:     ProgressingStatus,
+									Repository: "repo",
+								},
+							},
+						},
+					},
+				},
+				name:           "test",
+				destroyVolumes: false,
+			},
+			expected: expected{
+				response: &types.GitDeployResponse{
+					Action: &types.Action{
+						ID:     "test",
+						Name:   "test",
+						Status: progressingStatus,
+					},
+					GitDeploy: &types.GitDeploy{
+						ID:         "test",
+						Name:       "test",
+						Repository: "repo",
+						Status:     progressingStatus,
+					},
+				},
+				err: nil,
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := pipelineClient{
+				client: tc.input.client,
+			}
+			response, err := pc.Destroy(context.Background(), tc.input.name, "", tc.input.destroyVolumes, false, false)
+			assert.ErrorIs(t, err, tc.expected.err)
+			assert.Equal(t, tc.expected.response, response)
+		})
+	}
+}
+
+func TestGetPipelineResourcesStatus(t *testing.T) {
+	type input struct {
+		client     *fakeGraphQLClient
+		namespace  string
+		devenvName string
+	}
+	type expected struct {
+		response map[string]string
+		err      error
+	}
+	testCases := []struct {
+		expected expected
+		input    input
+		name     string
+	}{
+		{
+			name: "error",
+			input: input{
+				client: &fakeGraphQLClient{
+					queryResult: nil,
+					err:         assert.AnError,
+				},
+			},
+			expected: expected{
+				err: assert.AnError,
+			},
+		},
+		{
+			name: "no error - devenv owns all resources - return all the resources",
+			input: input{
+				client: &fakeGraphQLClient{
+					queryResult: &getPipelineResources{
+						Response: previewResourcesStatus{
+							Deployments: []resourceInfo{
+								{
+									ID:         "test",
+									Name:       "error",
+									Status:     "error",
+									DeployedBy: "test",
+								},
+								{
+									ID:         "test",
+									Name:       "queued",
+									Status:     "queued",
+									DeployedBy: "test",
+								},
+								{
+									ID:         "test",
+									Name:       "progressing",
+									Status:     "progressing",
+									DeployedBy: "test",
+								},
+							},
+							Statefulsets: []resourceInfo{
+								{
+									ID:         "test",
+									Name:       "error",
+									Status:     "error",
+									DeployedBy: "test",
+								},
+								{
+									ID:         "test",
+									Name:       "queued",
+									Status:     "queued",
+									DeployedBy: "test",
+								},
+								{
+									ID:         "test",
+									Name:       "progressing",
+									Status:     "progressing",
+									DeployedBy: "test",
+								},
+							},
+							Jobs: []resourceInfo{
+								{
+									ID:         "test",
+									Name:       "error",
+									Status:     "error",
+									DeployedBy: "test",
+								},
+								{
+									ID:         "test",
+									Name:       "queued",
+									Status:     "queued",
+									DeployedBy: "test",
+								},
+								{
+									ID:         "test",
+									Name:       "progressing",
+									Status:     "progressing",
+									DeployedBy: "test",
+								},
+							},
+							Cronjobs: []resourceInfo{
+								{
+									ID:         "test",
+									Name:       "error",
+									Status:     "error",
+									DeployedBy: "test",
+								},
+								{
+									ID:         "test",
+									Name:       "queued",
+									Status:     "queued",
+									DeployedBy: "test",
+								},
+								{
+									ID:         "test",
+									Name:       "progressing",
+									Status:     "progressing",
+									DeployedBy: "test",
+								},
+							},
+						},
+					},
+					err: nil,
+				},
+				namespace:  "test",
+				devenvName: "test",
+			},
+			expected: expected{
+				response: map[string]string{
+					"deployment/error":        "error",
+					"deployment/queued":       "queued",
+					"deployment/progressing":  "progressing",
+					"statefulset/error":       "error",
+					"statefulset/queued":      "queued",
+					"statefulset/progressing": "progressing",
+					"job/error":               "error",
+					"job/queued":              "queued",
+					"job/progressing":         "progressing",
+					"cronjob/error":           "error",
+					"cronjob/queued":          "queued",
+					"cronjob/progressing":     "progressing",
+				},
+				err: nil,
+			},
+		},
+		{
+			name: "no error - devenv only deploy errors",
+			input: input{
+				client: &fakeGraphQLClient{
+					queryResult: &getPipelineResources{
+						Response: previewResourcesStatus{
+							Deployments: []resourceInfo{
+								{
+									ID:         "test",
+									Name:       "error",
+									Status:     "error",
+									DeployedBy: "1",
+								},
+								{
+									ID:         "test",
+									Name:       "queued",
+									Status:     "queued",
+									DeployedBy: "2",
+								},
+								{
+									ID:         "test",
+									Name:       "progressing",
+									Status:     "progressing",
+									DeployedBy: "3",
+								},
+							},
+							Statefulsets: []resourceInfo{
+								{
+									ID:         "test",
+									Name:       "error",
+									Status:     "error",
+									DeployedBy: "1",
+								},
+								{
+									ID:         "test",
+									Name:       "queued",
+									Status:     "queued",
+									DeployedBy: "2",
+								},
+								{
+									ID:         "test",
+									Name:       "progressing",
+									Status:     "progressing",
+									DeployedBy: "3",
+								},
+							},
+							Jobs: []resourceInfo{
+								{
+									ID:         "test",
+									Name:       "error",
+									Status:     "error",
+									DeployedBy: "1",
+								},
+								{
+									ID:         "test",
+									Name:       "queued",
+									Status:     "queued",
+									DeployedBy: "2",
+								},
+								{
+									ID:         "test",
+									Name:       "progressing",
+									Status:     "progressing",
+									DeployedBy: "3",
+								},
+							},
+							Cronjobs: []resourceInfo{
+								{
+									ID:         "test",
+									Name:       "error",
+									Status:     "error",
+									DeployedBy: "1",
+								},
+								{
+									ID:         "test",
+									Name:       "queued",
+									Status:     "queued",
+									DeployedBy: "2",
+								},
+								{
+									ID:         "test",
+									Name:       "progressing",
+									Status:     "progressing",
+									DeployedBy: "3",
+								},
+							},
+						},
+					},
+					err: nil,
+				},
+				namespace:  "test",
+				devenvName: "1",
+			},
+			expected: expected{
+				response: map[string]string{
+					"deployment/error":  "error",
+					"statefulset/error": "error",
+					"job/error":         "error",
+					"cronjob/error":     "error",
+				},
+				err: nil,
+			},
+		},
+		{
+			name: "not found -> ",
+			input: input{
+				client: &fakeGraphQLClient{
+					queryResult: nil,
+					err:         oktetoErrors.ErrNotFound,
+				},
+				namespace:  "test",
+				devenvName: "non-existing",
+			},
+			expected: expected{
+				response: nil,
+				err:      errURLNotSet,
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := pipelineClient{
+				client: tc.input.client,
+			}
+			response, err := pc.GetResourcesStatus(context.Background(), tc.input.devenvName, tc.input.namespace)
+			assert.ErrorIs(t, err, tc.expected.err)
+			assert.Equal(t, tc.expected.response, response)
+		})
+	}
+}
+
+func Test_getResourceFullName(t *testing.T) {
+	tests := []struct {
+		name    string
+		kindArg string
+		nameArg string
+		result  string
+	}{
+		{
+			name:    "deployment",
+			kindArg: Deployment,
+			nameArg: "name",
+			result:  "deployment/name",
+		},
+		{
+			name:    "statefulset",
+			kindArg: StatefulSet,
+			nameArg: "name",
+			result:  "statefulset/name",
+		},
+		{
+			name:    "job",
+			kindArg: Job,
+			nameArg: "name",
+			result:  "job/name",
+		},
+		{
+			name:    "cronjob",
+			kindArg: CronJob,
+			nameArg: "name",
+			result:  "cronjob/name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := getResourceFullName(tt.kindArg, tt.nameArg)
+			if result != tt.result {
+				t.Errorf("Test %s: expected %s, but got %s", tt.name, tt.result, result)
+			}
+		})
+	}
+}

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,149 +14,180 @@
 package utils
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"net/url"
 	"os"
+	"runtime"
+	"sort"
 	"strings"
 
-	"github.com/okteto/okteto/pkg/errors"
-	"github.com/okteto/okteto/pkg/k8s/client"
-	"github.com/okteto/okteto/pkg/log"
+	"github.com/manifoldco/promptui"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/k8s/apps"
+	"github.com/okteto/okteto/pkg/k8s/deployments"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
+	"k8s.io/client-go/kubernetes"
+)
+
+var (
+	// ErrNoDevSelected is raised when no development environment is selected
+	ErrNoDevSelected = errors.New("No Development Environment selected")
 )
 
 const (
-	//DefaultDevManifest default okteto manifest file
-	DefaultDevManifest   = "okteto.yml"
-	secondaryDevManifest = "okteto.yaml"
+	// DefaultManifest default okteto manifest file
+	DefaultManifest = "okteto.yml"
 )
 
-//LoadDev loads an okteto manifest checking "yml" and "yaml"
-func LoadDev(devPath, namespace, k8sContext string) (*model.Dev, error) {
-	if !model.FileExists(devPath) {
-		if devPath == DefaultDevManifest {
-			if model.FileExists(secondaryDevManifest) {
-				return LoadDev(secondaryDevManifest, namespace, k8sContext)
+// GetDevFromManifest gets a dev from a manifest by comparing the given dev name with the dev name in the manifest
+func GetDevFromManifest(manifest *model.Manifest, devName string) (*model.Dev, error) {
+	if len(manifest.Dev) == 0 {
+		return nil, oktetoErrors.ErrManifestNoDevSection
+	} else if len(manifest.Dev) == 1 {
+		for name, dev := range manifest.Dev {
+			if devName != "" {
+				if devName != name {
+					return nil, oktetoErrors.UserError{
+						E:    fmt.Errorf(oktetoErrors.ErrDevContainerNotExists, devName),
+						Hint: fmt.Sprintf("Available options are: [%s]", name),
+					}
+				}
 			}
-		}
 
-		return nil, fmt.Errorf("'%s' does not exist. Generate it by executing 'okteto init'", devPath)
+			return dev, nil
+		}
 	}
 
-	dev, err := model.Get(devPath)
+	if devName == "" {
+		return nil, ErrNoDevSelected
+	}
+
+	var options []string
+	for name, dev := range manifest.Dev {
+		if name == devName {
+			return dev, nil
+		}
+		options = append(options, name)
+	}
+	return nil, oktetoErrors.UserError{
+		E:    fmt.Errorf(oktetoErrors.ErrDevContainerNotExists, devName),
+		Hint: fmt.Sprintf("Available options are: [%s]", strings.Join(options, ", ")),
+	}
+}
+
+// SelectDevFromManifest prompts the selector to choose a development container and returns the dev selected or error
+func SelectDevFromManifest(manifest *model.Manifest, selector OktetoSelectorInterface, devs []string) (*model.Dev, error) {
+	sort.Slice(devs, func(i, j int) bool {
+		l1, l2 := len(devs[i]), len(devs[j])
+		if l1 != l2 {
+			return l1 < l2
+		}
+		return devs[i] < devs[j]
+	})
+	var items []SelectorItem
+	for _, dev := range devs {
+		items = append(items, SelectorItem{
+			Name:   dev,
+			Label:  dev,
+			Enable: true,
+		})
+	}
+	devKey, err := selector.AskForOptionsOkteto(items, -1)
 	if err != nil {
 		return nil, err
 	}
-	loadContext(dev, k8sContext)
-	loadNamespace(dev, namespace)
-	return dev, nil
+	dev := manifest.Dev[devKey]
+
+	dev.Name = devKey
+
+	if err := dev.Validate(); err != nil {
+		return nil, err
+	}
+
+	return manifest.Dev[devKey], nil
 }
 
-func loadContext(dev *model.Dev, k8sContext string) {
-	if k8sContext != "" {
-		dev.Context = k8sContext
-		return
-	}
-	if dev.Context != "" {
-		return
-	}
-	if os.Getenv(client.OktetoContextVariableName) != "" {
-		dev.Context = os.Getenv(client.OktetoContextVariableName)
-		return
-	}
-	dev.Context = client.GetSessionContext("")
-}
+// YesNoDefault specifies what will be assumed when the user doesn't answer explicitly
+type YesNoDefault string
 
-func loadNamespace(dev *model.Dev, namespace string) {
-	if namespace != "" {
-		dev.Namespace = namespace
-	}
-	if dev.Namespace == "" {
-		dev.Namespace = client.GetContextNamespace(dev.Context)
-	}
-}
+const (
+	YesNoDefault_Unspecified = "[y/n]"
+	YesNoDefault_Yes         = "[Y/n]"
+	YesNoDefault_No          = "[y/N]"
+)
 
-//LoadDevOrDefault loads an okteto manifest or a default one if does not exist
-func LoadDevOrDefault(devPath, name, namespace, k8sContext string) (*model.Dev, error) {
-	dev, err := LoadDev(devPath, namespace, k8sContext)
-	if err == nil {
-		return dev, nil
-	}
-
-	if errors.IsNotExist(err) && len(name) > 0 {
-		dev, err := model.Read(nil)
-		if err != nil {
-			return nil, err
-		}
-		dev.Name = name
-		return dev, nil
-	}
-
-	return nil, err
-}
-
-//AskYesNo prompts for yes/no confirmation
-func AskYesNo(q string) (bool, error) {
+// AskYesNo prompts for yes/no confirmation
+func AskYesNo(q string, d YesNoDefault) (bool, error) {
 	var answer string
 	for {
-		fmt.Print(q)
-		if _, err := fmt.Scanln(&answer); err != nil {
+		if err := oktetoLog.Question("%s %s: ", q, d); err != nil {
+			return false, err
+		}
+		if _, err := fmt.Scanln(&answer); err != nil && err.Error() != "unexpected newline" {
 			return false, err
 		}
 
-		if answer == "y" || answer == "n" {
+		if answer == "" && d != YesNoDefault_Unspecified {
+			answer = "y"
+			if d == YesNoDefault_No {
+				answer = "n"
+			}
 			break
 		}
 
-		log.Fail("input must be 'y' or 'n'")
-	}
-
-	return answer == "y", nil
-}
-
-//AskIfOktetoInit asks if okteto init should be executed
-func AskIfOktetoInit(devPath string) bool {
-	result, err := AskYesNo(fmt.Sprintf("okteto manifest (%s) doesn't exist, do you want to create it? [y/n] ", devPath))
-	if err != nil {
-		return false
-	}
-	return result
-}
-
-//AskIfDeploy asks if a new deployment must be created
-func AskIfDeploy(name, namespace string) error {
-	deploy, err := AskYesNo(fmt.Sprintf("Deployment %s doesn't exist in namespace %s. Do you want to create a new one? [y/n]: ", name, namespace))
-	if err != nil {
-		return fmt.Errorf("couldn't read your response")
-	}
-	if !deploy {
-		return errors.UserError{
-			E:    fmt.Errorf("Deployment %s doesn't exist in namespace %s", name, namespace),
-			Hint: "Deploy your application first or use 'okteto namespace' to select a different namespace and try again",
+		if answer == "y" || answer == "Y" || answer == "n" || answer == "N" {
+			break
 		}
+
+		oktetoLog.Fail("input must be 'Y/y' or 'N/n'")
 	}
-	return nil
+
+	if answer == "y" || answer == "Y" {
+		return true, nil
+	}
+	return false, nil
 }
 
-//ParseURL validates a URL
-func ParseURL(u string) (string, error) {
-	url, err := url.Parse(u)
+func AskForOptions(options []string, label string) (string, error) {
+	selectedTemplate := `{{ " ✓ " | bgGreen | black }} {{ .Label | green }}`
+	activeTemplate := fmt.Sprintf("%s {{ . | oktetoblue }}", promptui.IconSelect)
+	inactiveTemplate := "  {{ . | oktetoblue }}"
+	if runtime.GOOS == "windows" {
+		selectedTemplate = " ✓  {{ . | blue }}"
+		activeTemplate = fmt.Sprintf("%s {{ . | blue }}", promptui.IconSelect)
+		inactiveTemplate = "  {{ . | blue }}"
+	}
+
+	prompt := promptui.Select{
+		Label: label,
+		Items: options,
+		Size:  len(options),
+		Templates: &promptui.SelectTemplates{
+			Label:    "{{ . }}",
+			Selected: selectedTemplate,
+			Active:   activeTemplate,
+			Inactive: inactiveTemplate,
+			FuncMap:  promptui.FuncMap,
+		},
+	}
+	prompt.Templates.FuncMap["oktetoblue"] = oktetoLog.BlueString
+
+	i, _, err := prompt.Run()
 	if err != nil {
-		return "", fmt.Errorf("%s is not a valid URL", u)
+		oktetoLog.Infof("invalid option: %s", err)
+		return "", fmt.Errorf("invalid option")
 	}
 
-	if url.Scheme == "" {
-		url.Scheme = "https"
-	}
-
-	return strings.TrimRight(url.String(), "/"), nil
+	return options[i], nil
 }
 
-//CheckIfDirectory checks if a path is a directory
+// CheckIfDirectory checks if a path is a directory
 func CheckIfDirectory(path string) error {
 	fileInfo, err := os.Stat(path)
 	if err != nil {
-		log.Infof("error on CheckIfDirectory: %s", err.Error())
+		oktetoLog.Infof("error on CheckIfDirectory: %s", err.Error())
 		return fmt.Errorf("'%s' does not exist", path)
 	}
 	if fileInfo.IsDir() {
@@ -165,15 +196,52 @@ func CheckIfDirectory(path string) error {
 	return fmt.Errorf("'%s' is not a directory", path)
 }
 
-//CheckIfRegularFile checks if a path is a regular file
-func CheckIfRegularFile(path string) error {
-	fileInfo, err := os.Stat(path)
+func GetDownCommand(devPath string) string {
+	okDownCommandHint := "okteto down -v"
+	if DefaultManifest != devPath && devPath != "" {
+		okDownCommandHint = fmt.Sprintf("okteto down -v -f %s", devPath)
+	}
+	return okDownCommandHint
+}
+
+func GetApp(ctx context.Context, dev *model.Dev, namespace string, c kubernetes.Interface, isRetry bool) (apps.App, bool, error) {
+	app, err := apps.Get(ctx, dev, namespace, c)
 	if err != nil {
-		log.Infof("error on CheckIfRegularFile: %s", err.Error())
-		return fmt.Errorf("'%s' does not exist", path)
+		if !oktetoErrors.IsNotFound(err) {
+			return nil, false, err
+		}
+		if dev.Autocreate {
+			if isRetry && !doesAutocreateAppExist(ctx, dev, namespace, c) {
+				return nil, false, fmt.Errorf("development container has been deactivated")
+			}
+			return apps.NewDeploymentApp(deployments.Sandbox(dev, namespace)), true, nil
+		}
+		if len(dev.Selector) > 0 {
+			if oktetoErrors.IsNotFound(err) {
+				err = oktetoErrors.UserError{
+					E:    fmt.Errorf("didn't find an application in namespace %s that matches the selector in your Okteto manifest", namespace),
+					Hint: "Update the selector or point your context to a different namespace and try again"}
+			}
+			return nil, false, err
+		}
+		return nil, false, oktetoErrors.UserError{
+			E: fmt.Errorf("application '%s' not found in namespace '%s'", dev.Name, namespace),
+			Hint: `Verify that your application is running and your okteto context is pointing to the right namespace
+    Or set the 'autocreate' field in your okteto manifest if you want to create a standalone development container
+    More information is available here: https://okteto.com/docs/reference/okteto-cli/#up`,
+		}
 	}
-	if !fileInfo.IsDir() {
-		return nil
+	return app, false, nil
+}
+
+func doesAutocreateAppExist(ctx context.Context, dev *model.Dev, namespace string, c kubernetes.Interface) bool {
+	autocreateDev := *dev
+	autocreateDev.Name = model.DevCloneName(dev.Name)
+	_, err := apps.Get(ctx, &autocreateDev, namespace, c)
+	if err != nil && !oktetoErrors.IsNotFound(err) {
+		oktetoLog.Infof("getApp autocreate k8s error, retrying...")
+		_, err := apps.Get(ctx, &autocreateDev, namespace, c)
+		return err == nil
 	}
-	return fmt.Errorf("'%s' is not a regular file", path)
+	return err == nil
 }

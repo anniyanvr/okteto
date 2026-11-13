@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,14 +18,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	enry "github.com/src-d/enry/v2"
 )
 
@@ -39,7 +38,7 @@ var (
 
 // this is all based on enry's main command https://github.com/src-d/enry
 
-// ProcessDirectory walks a directory and returns a list of guess for the programming language
+// ProcessDirectory walks a directory and returns the best guess for the programming language
 func ProcessDirectory(root string) (string, error) {
 	out := make(map[string][]string)
 	analysisTimeout := false
@@ -65,7 +64,7 @@ func ProcessDirectory(root string) (string, error) {
 
 		relativePath, err := filepath.Rel(root, path)
 		if err != nil {
-			log.Infof("failed to calculate relative path: %s", err)
+			oktetoLog.Infof("failed to calculate relative path: %s", err)
 			return nil
 		}
 
@@ -95,7 +94,7 @@ func ProcessDirectory(root string) (string, error) {
 			if language, ok = enry.GetLanguageByFilename(path); !ok {
 				content, err := readFile(path, readFileLimit)
 				if err != nil {
-					log.Infof("failed to read %s: %s", path, err)
+					oktetoLog.Infof("failed to read %s: %s", path, err)
 					return nil
 				}
 
@@ -128,35 +127,39 @@ func ProcessDirectory(root string) (string, error) {
 	}
 	chosen := strings.ToLower(sorted[0])
 
-	if chosen == java {
+	if chosen == Java {
 		return refineJavaChoice(root), nil
 	}
 
-	return normalizeLanguage(chosen), nil
+	return NormalizeLanguage(chosen), nil
 }
 
 func refineJavaChoice(root string) string {
 	p := filepath.Join(root, "build.gradle")
 	_, err := os.Stat(p)
 	if err == nil {
-		return gradle
+		return Gradle
 	}
 
-	log.Infof("didn't found %s : %s", p, err)
-	return maven
+	oktetoLog.Infof("didn't find %s : %s", p, err)
+	return Maven
 }
 
 func readFile(path string, limit int64) ([]byte, error) {
 	if limit <= 0 {
-		return ioutil.ReadFile(path)
+		return os.ReadFile(path)
 	}
 
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			oktetoLog.Debugf("Error closing file %s: %s", path, err)
+		}
+	}()
 
-	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -180,7 +183,7 @@ func sortLanguagesByUsage(fSummary map[string][]string) []string {
 	fileValues := make(map[string]float64)
 
 	for fType, files := range fSummary {
-		if normalizeLanguage(fType) == Unrecognized {
+		if NormalizeLanguage(fType) == Unrecognized {
 			continue
 		}
 		val := float64(len(files))
@@ -201,7 +204,7 @@ func sortLanguagesByUsage(fSummary map[string][]string) []string {
 		_, _ = buff.WriteString(fmt.Sprintf("%.2f%%\t%s\n", percent, fType))
 	}
 
-	log.Infof("Language guesses: \r\n %s", buff.String())
+	oktetoLog.Infof("Language guesses: \r\n %s", buff.String())
 
 	return keys
 }

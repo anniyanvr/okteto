@@ -1,0 +1,328 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package build
+
+import (
+	"bytes"
+	"context"
+	"encoding/csv"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/moby/buildkit/frontend/dockerfile/instructions"
+	"github.com/moby/buildkit/frontend/dockerfile/linter"
+	"github.com/moby/buildkit/frontend/dockerfile/parser"
+	buildv1 "github.com/okteto/okteto/cmd/build/v1"
+	buildv2 "github.com/okteto/okteto/cmd/build/v2"
+	contextCMD "github.com/okteto/okteto/cmd/context"
+	"github.com/okteto/okteto/cmd/namespace"
+	"github.com/okteto/okteto/cmd/utils"
+	"github.com/okteto/okteto/pkg/analytics"
+	buildCmd "github.com/okteto/okteto/pkg/cmd/build"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/log/io"
+	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/registry"
+	"github.com/okteto/okteto/pkg/types"
+	"github.com/okteto/okteto/pkg/validator"
+	"github.com/spf13/afero"
+	"github.com/spf13/cobra"
+)
+
+type outputFormat string
+
+const (
+	// TTYFormat is the default format for the output
+	TTYFormat outputFormat = "tty"
+)
+
+// Command defines the build command
+type Command struct {
+	GetManifest func(path string, fs afero.Fs) (*model.Manifest, error)
+
+	Builder          buildCmd.OktetoBuilderInterface
+	Registry         registryInterface
+	analyticsTracker buildTrackerInterface
+	insights         buildTrackerInterface
+	ioCtrl           *io.Controller
+	k8slogger        *io.K8sLogger
+}
+
+type buildTrackerInterface interface {
+	TrackImageBuild(ctx context.Context, meta *analytics.ImageBuildMetadata)
+	TrackBuildkitConnection(m *analytics.BuildkitConnectorMetadata)
+}
+
+type registryInterface interface {
+	GetImageTagWithDigest(imageTag string) (string, error)
+	IsOktetoRegistry(image string) bool
+	GetImageReference(image string) (registry.OktetoImageReference, error)
+	HasGlobalPushAccess() (bool, error)
+	IsGlobalRegistry(image string) bool
+
+	GetRegistryAndRepo(image string) (string, string)
+	GetRepoNameAndTag(repo string) (string, string)
+	GetDevImageFromGlobal(imageWithDigest string) string
+	Clone(from, to string) (string, error)
+}
+
+// NewBuildCommand creates a struct to run all build methods
+func NewBuildCommand(ioCtrl *io.Controller, analyticsTracker, insights buildTrackerInterface, okCtx *okteto.ContextStateless, k8slogger *io.K8sLogger) *Command {
+	return &Command{
+		GetManifest:      model.GetManifestV2,
+		Builder:          buildCmd.NewOktetoBuilder(okCtx, afero.NewOsFs(), ioCtrl, buildCmd.GetBuildkitConnector(okCtx, ioCtrl, analyticsTracker)),
+		Registry:         registry.NewOktetoRegistry(buildCmd.GetRegistryConfigFromOktetoConfig(okCtx)),
+		ioCtrl:           ioCtrl,
+		k8slogger:        k8slogger,
+		analyticsTracker: analyticsTracker,
+		insights:         insights,
+	}
+}
+
+const (
+	maxV1CommandArgs = 1
+	docsURL          = "https://okteto.com/docs/reference/okteto-cli/#build"
+)
+
+// Build builds and optionally pushes a Docker image
+func Build(ctx context.Context, ioCtrl *io.Controller, at, insights buildTrackerInterface, k8slogger *io.K8sLogger) *cobra.Command {
+	options := &types.BuildOptions{}
+	cmd := &cobra.Command{
+		Use:   "build [image...]",
+		Short: "Build and push the images defined in the 'build' section of your Okteto Manifest",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			options.CommandArgs = args
+			// The context must be loaded before reading manifest. Otherwise,
+			// secrets will not be resolved when GetManifest is called and
+			// the manifest will load empty values.
+			oktetoContext, err := getOktetoContext(ctx, options, ioCtrl)
+			if err != nil {
+				return err
+			}
+
+			if !okteto.IsOkteto() {
+				return oktetoErrors.ErrContextIsNotOktetoCluster
+			}
+
+			if err := validator.FileArgumentIsNotDir(afero.NewOsFs(), options.File); err != nil {
+				return err
+			}
+
+			ioCtrl.Logger().Info("context loaded")
+
+			bc := NewBuildCommand(ioCtrl, at, insights, oktetoContext, k8slogger)
+
+			builder, err := bc.getBuilder(options, oktetoContext)
+			if err != nil {
+				return err
+			}
+
+			if builder.IsV1() {
+				if len(options.CommandArgs) > maxV1CommandArgs {
+					return oktetoErrors.UserError{
+						E:    fmt.Errorf("when passing a context to 'okteto build', it accepts at most %d arg(s), but received %d", maxV1CommandArgs, len(options.CommandArgs)),
+						Hint: fmt.Sprintf("Visit %s for more information.", docsURL),
+					}
+				}
+			}
+
+			for _, s := range options.Secrets {
+				if err := validateBuildSecretFlag(s); err != nil {
+					return err
+				}
+			}
+
+			analytics.TrackBuildWithManifestVsDockerfile(builder.IsV1())
+			return builder.Build(ctx, options)
+		},
+	}
+
+	cmd.Flags().StringVarP(&options.K8sContext, "context", "c", "", "overwrite the current Okteto Context")
+	cmd.Flags().StringVarP(&options.File, "file", "f", "", "the path to the Okteto Manifest or Dockerfile")
+	cmd.Flags().StringVarP(&options.Tag, "tag", "t", "", "tag name to be pushed (optional)")
+	cmd.Flags().StringVarP(&options.Target, "target", "", "", "target build stage to build (optional)")
+	cmd.Flags().BoolVarP(&options.NoCache, "no-cache", "", false, "do not use cache when building the image")
+	cmd.Flags().StringArrayVar(&options.CacheFrom, "cache-from", nil, "list of cache source images (optional)")
+	cmd.Flags().StringArrayVar(&options.ExportCache, "export-cache", nil, "image tag for exported cache when building (optional)")
+	cmd.Flags().StringVarP(&options.OutputMode, "progress", "", string(TTYFormat), "show plain/tty build output")
+	cmd.Flags().StringArrayVar(&options.BuildArgs, "build-arg", nil, "set build-time variables (optional)")
+	cmd.Flags().StringArrayVar(&options.Secrets, "secret", nil, "secret exposed to the build. Formats: id=mysecret,src=/local/secret (file) or id=mysecret,env=MY_ENV_VAR (env var)")
+	cmd.Flags().StringVar(&options.Platform, "platform", "", "specify which platform to build the container image for (optional)")
+	cmd.Flags().StringVarP(&options.Namespace, "namespace", "n", "", "overwrite the current Okteto Namespace")
+	return cmd
+}
+
+// getBuilder returns the proper builder (V1 or V2) based on the manifest. The following rules are applied:
+//   - If the manifest is not found or there is any error getting the manifest, the builder falls back to V1
+//   - If the manifest is found and it is a V2 manifest and the build section has some image, the builder is V2
+//   - If the manifest is found and it is a V1 manifest, the builder falls back to V1
+func (bc *Command) getBuilder(options *types.BuildOptions, okCtx *okteto.ContextStateless) (Builder, error) {
+	// the file flag is a Dockerfile
+	isDockerfileValid := validateDockerfile(options.File) == nil
+	if options.File != "" && isDockerfileValid {
+		return buildv1.NewBuilder(bc.Builder, bc.ioCtrl), nil
+	}
+
+	var builder Builder
+	manifest, err := bc.GetManifest(options.File, afero.NewOsFs())
+	if err != nil {
+		if options.File != "" && errors.Is(err, oktetoErrors.ErrInvalidManifest) && validateDockerfile(options.File) != nil {
+			return nil, err
+		}
+
+		bc.ioCtrl.Logger().Infof("manifest located at %s is not v2 compatible: %s", options.File, err)
+		bc.ioCtrl.Logger().Info("falling back to building as a v1 manifest")
+
+		builder = buildv1.NewBuilder(bc.Builder, bc.ioCtrl)
+	} else {
+		if len(manifest.Build) > 0 {
+			callbacks := []buildv2.OnBuildFinish{
+				bc.analyticsTracker.TrackImageBuild,
+				bc.insights.TrackImageBuild,
+			}
+			if !okCtx.IsOktetoCluster() && manifest.Type == model.StackType {
+				return nil, oktetoErrors.UserError{
+					E: fmt.Errorf("Docker Compose is only available using the Okteto Platform"),
+					Hint: `Visit our docs to learn more about the Okteto Platform:
+    https://www.okteto.com/docs`,
+				}
+			}
+			builder = buildv2.NewBuilder(bc.Builder, bc.Registry, bc.ioCtrl, okCtx, bc.k8slogger, callbacks)
+		} else {
+			return nil, oktetoErrors.UserError{
+				E: fmt.Errorf("specified Okteto Manifest doesn't contain a build section"),
+				Hint: `Add a build section to your Okteto Manifest to build your images.
+    See more at: https://www.okteto.com/docs/1.25/core/okteto-manifest/#build`,
+			}
+		}
+	}
+
+	options.Manifest = manifest
+
+	return builder, nil
+}
+
+func validateDockerfile(file string) error {
+	dat, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+
+	parsedDockerfile, err := parser.Parse(bytes.NewBuffer(dat))
+	if err != nil {
+		return err
+	}
+
+	_, _, err = instructions.Parse(parsedDockerfile.AST, linter.New(&linter.Config{
+		ReturnAsError: true,
+	}))
+	return err
+}
+
+const secretFlagHint = "secret should have the format 'id=mysecret,src=/local/secret' (file) or 'id=mysecret,env=MY_ENV_VAR' (env var)"
+
+// validateBuildSecretFlag checks that a single --secret flag value is well-formed.
+// Each secret must be a comma-separated list of key=value pairs and must include id=.
+func validateBuildSecretFlag(secret string) error {
+	fields, err := csv.NewReader(strings.NewReader(secret)).Read()
+	if err != nil {
+		return oktetoErrors.UserError{
+			E:    fmt.Errorf("invalid --secret flag value %q", secret),
+			Hint: secretFlagHint,
+		}
+	}
+	hasID := false
+	for _, field := range fields {
+		key, value, found := strings.Cut(field, "=")
+		if !found {
+			return oktetoErrors.UserError{
+				E:    fmt.Errorf("invalid --secret flag value %q: %q is not a key=value pair", secret, field),
+				Hint: secretFlagHint,
+			}
+		}
+		key = strings.ToLower(key)
+		if value == "" {
+			return oktetoErrors.UserError{
+				E:    fmt.Errorf("invalid --secret flag value %q: %q must not be empty", secret, key),
+				Hint: secretFlagHint,
+			}
+		}
+		if key == "id" {
+			hasID = true
+		}
+	}
+	if !hasID {
+		return oktetoErrors.UserError{
+			E:    fmt.Errorf("invalid --secret flag value %q: missing required 'id' field", secret),
+			Hint: secretFlagHint,
+		}
+	}
+	return nil
+}
+
+func getOktetoContext(ctx context.Context, options *types.BuildOptions, ioCtrl *io.Controller) (*okteto.ContextStateless, error) {
+	ctxOpts := &contextCMD.Options{
+		Context:   options.K8sContext,
+		Namespace: options.Namespace,
+		Show:      true,
+	}
+
+	oktetoContext, err := contextCMD.NewContextCommand().RunStateless(ctx, ctxOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	if oktetoContext.IsOktetoCluster() && ctxOpts.Namespace != "" {
+		ocfg := defaultOktetoClientCfg(oktetoContext)
+		c, err := okteto.NewOktetoClientStateless(ocfg)
+		if err != nil {
+			return nil, err
+		}
+
+		create, err := utils.ShouldCreateNamespaceStateless(ctx, ctxOpts.Namespace, c)
+		if err != nil {
+			return nil, err
+		}
+		if create {
+			if err := namespace.NewCommandStateless(c, ioCtrl).Create(ctx, &namespace.CreateOptions{Namespace: ctxOpts.Namespace}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return oktetoContext, err
+}
+
+type oktetoClientCfgContext interface {
+	ExistsContext() bool
+	GetCurrentName() string
+	GetCurrentToken() string
+	GetCurrentCertStr() string
+}
+
+func defaultOktetoClientCfg(octx oktetoClientCfgContext) *okteto.ClientCfg {
+	if !octx.ExistsContext() {
+		return &okteto.ClientCfg{}
+	}
+
+	return &okteto.ClientCfg{
+		CtxName: octx.GetCurrentName(),
+		Token:   octx.GetCurrentToken(),
+		Cert:    octx.GetCurrentCertStr(),
+	}
+
+}

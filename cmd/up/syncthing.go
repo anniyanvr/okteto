@@ -1,3 +1,16 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package up
 
 import (
@@ -6,26 +19,31 @@ import (
 	"time"
 
 	"github.com/okteto/okteto/cmd/utils"
-	"github.com/okteto/okteto/pkg/analytics"
 	"github.com/okteto/okteto/pkg/config"
-	"github.com/okteto/okteto/pkg/errors"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/syncthing"
+	"github.com/spf13/afero"
+)
+
+const (
+	defaultProgressBarWidth = 40
+	totalProgressValue      = 100
 )
 
 func (up *upContext) initializeSyncthing() error {
-	sy, err := syncthing.New(up.Dev)
+	sy, err := syncthing.New(up.Dev, up.Namespace, up.Fs)
 	if err != nil {
 		return err
 	}
 	sy.ResetDatabase = up.resetSyncthing
 	up.Sy = sy
 
-	log.Infof("local syncthing initialized: gui -> %d, sync -> %d", up.Sy.LocalGUIPort, up.Sy.LocalPort)
-	log.Infof("remote syncthing initialized: gui -> %d, sync -> %d", up.Sy.RemoteGUIPort, up.Sy.RemotePort)
+	oktetoLog.Infof("local syncthing initialized: gui -> %d, sync -> %d", up.Sy.LocalGUIPort, up.Sy.LocalPort)
+	oktetoLog.Infof("remote syncthing initialized: gui -> %d, sync -> %d", up.Sy.RemoteGUIPort, up.Sy.RemotePort)
 
-	if err := up.Sy.SaveConfig(up.Dev); err != nil {
-		log.Infof("error saving syncthing object: %s", err)
+	if err := up.Sy.SaveConfig(up.Dev, up.Namespace); err != nil {
+		oktetoLog.Infof("error saving syncthing object: %s", err)
 	}
 
 	up.hardTerminate <- up.Sy.HardTerminate()
@@ -39,25 +57,32 @@ func (up *upContext) sync(ctx context.Context) error {
 	}
 
 	start := time.Now()
-	if err := config.UpdateStateFile(up.Dev, config.Synchronizing); err != nil {
+	if err := config.UpdateStateFile(up.Dev.Name, up.Namespace, config.Synchronizing); err != nil {
 		return err
 	}
 
+	up.checkForSystemErrors(ctx)
+
+	startSyncFiles := time.Now()
 	if err := up.synchronizeFiles(ctx); err != nil {
 		return err
 	}
+	up.analyticsMeta.ContextSync(time.Since(startSyncFiles))
 
-	log.Success("Files synchronized")
+	msg := "Files synchronized"
+	if up.Dev.IsHybridModeEnabled() {
+		msg = "Reverse tunnel configured"
+	}
+	oktetoLog.Success("%s", msg)
 
 	elapsed := time.Since(start)
-	maxDuration := time.Duration(1) * time.Minute
-	if elapsed > maxDuration {
-		minutes := elapsed / time.Minute
-		elapsed -= minutes * time.Minute
-		seconds := elapsed / time.Second
-		log.Warning(`File synchronization took %dm %ds
-    Consider to update your '.stignore' to optimize the file synchronization
-    More information is available here: https://okteto.com/docs/reference/file-synchronization`, minutes, seconds)
+	up.analyticsMeta.InitialSyncDuration(elapsed)
+	maxDuration := 1 * time.Minute
+	if time.Duration(elapsed.Minutes()) > maxDuration {
+		elapsedString := elapsed.String()
+		oktetoLog.Warning(`File synchronization took %s
+    Consider updating your '.stignore' to optimize the file synchronization
+    More information is available here: https://okteto.com/docs/reference/file-synchronization/`, elapsedString)
 	}
 
 	up.Sy.Type = "sendreceive"
@@ -68,19 +93,22 @@ func (up *upContext) sync(ctx context.Context) error {
 
 	go up.Sy.Monitor(ctx, up.Disconnect)
 	go up.Sy.MonitorStatus(ctx, up.Disconnect)
-	log.Infof("restarting syncthing to update sync mode to sendreceive")
+	oktetoLog.Infof("restarting syncthing to update sync mode to sendreceive")
 	return up.Sy.Restart(ctx)
 }
 
 func (up *upContext) startSyncthing(ctx context.Context) error {
-	spinner := utils.NewSpinner("Starting the file synchronization service...")
-	spinner.Start()
-	if err := config.UpdateStateFile(up.Dev, config.StartingSync); err != nil {
+	if !up.Dev.IsHybridModeEnabled() {
+		oktetoLog.Spinner("Starting the file synchronization service...")
+		oktetoLog.StartSpinner()
+		defer oktetoLog.StopSpinner()
+	}
+
+	if err := config.UpdateStateFile(up.Dev.Name, up.Namespace, config.StartingSync); err != nil {
 		return err
 	}
-	defer spinner.Stop()
 
-	if err := up.Sy.Run(ctx); err != nil {
+	if err := up.Sy.Run(); err != nil {
 		return err
 	}
 
@@ -89,31 +117,52 @@ func (up *upContext) startSyncthing(ctx context.Context) error {
 	}
 
 	if err := up.Sy.WaitForPing(ctx, false); err != nil {
-		log.Infof("failed to ping syncthing: %s", err.Error())
+		oktetoLog.Infof("failed to ping syncthing: %s", err.Error())
+		if up.isTransient(err) {
+			return err
+		}
 		return up.checkOktetoStartError(ctx, "Failed to connect to the synchronization service")
 	}
 
-	spinner.Update("Scanning file system...")
-	if err := up.Sy.WaitForScanning(ctx, up.Dev, true); err != nil {
+	if !up.Dev.IsHybridModeEnabled() {
+		oktetoLog.Spinner("Scanning file system...")
+	}
+	startLocalScan := time.Now()
+	if err := up.Sy.WaitForScanning(ctx, true); err != nil {
+		return err
+	}
+	up.analyticsMeta.LocalFolderScan(time.Since(startLocalScan))
+
+	if err := up.Sy.WaitForScanning(ctx, false); err != nil {
 		return err
 	}
 
-	if !up.Dev.PersistentVolumeEnabled() {
-		if err := up.Sy.WaitForScanning(ctx, up.Dev, false); err != nil {
-			log.Infof("failed to wait for syncthing scanning: %s", err.Error())
-			return up.checkOktetoStartError(ctx, "Failed to connect to the synchronization service")
-		}
+	return up.Sy.WaitForConnected(ctx)
+}
+
+// checkForSystemErrors is called when syncthing is started to check for system errors (ie. available disk space is lower than 1%) and print a warning
+func (up *upContext) checkForSystemErrors(ctx context.Context) {
+	if up.Dev.IsHybridModeEnabled() {
+		return
 	}
 
-	return up.Sy.WaitForConnected(ctx, up.Dev)
+	oktetoLog.Spinner("Verifying synchronization errors...")
+	oktetoLog.StartSpinner()
+	defer oktetoLog.StopSpinner()
+
+	if up.Sy.IsLocalRunningOutOfSpace(ctx) {
+		oktetoLog.Warning("Your local disk is almost full. Please free up some space to avoid synchronization issues.")
+	}
 }
 
 func (up *upContext) synchronizeFiles(ctx context.Context) error {
-	spinner := utils.NewSpinner("Synchronizing your files...")
-	spinner.Start()
-	defer spinner.Stop()
+	if !up.Dev.IsHybridModeEnabled() {
+		oktetoLog.Spinner("Synchronizing your files...")
+		oktetoLog.StartSpinner()
+		defer oktetoLog.StopSpinner()
+	}
 
-	progressBar := utils.NewSyncthingProgressBar(40)
+	progressBar := utils.NewSyncthingProgressBar(defaultProgressBarWidth)
 	defer progressBar.Finish()
 
 	quit := make(chan bool)
@@ -125,8 +174,8 @@ func (up *upContext) synchronizeFiles(ctx context.Context) error {
 				return
 			case <-time.NewTicker(1 * time.Second).C:
 				inSynchronizationFile := up.Sy.GetInSynchronizationFile(ctx)
-				if inSynchronizationFile != "" {
-					spinner.Stop()
+				if inSynchronizationFile != "" && oktetoLog.GetOutputFormat() != oktetoLog.PlainFormat {
+					oktetoLog.StopSpinner()
 					progressBar.UpdateItemInSync(inSynchronizationFile)
 				}
 			}
@@ -138,36 +187,47 @@ func (up *upContext) synchronizeFiles(ctx context.Context) error {
 		for c := range reporter {
 			value := int64(c)
 			if value > 0 && value < 100 {
-				spinner.Stop()
-				progressBar.SetCurrent(value)
+				if oktetoLog.GetOutputFormat() == oktetoLog.PlainFormat {
+					oktetoLog.Spinner(fmt.Sprintf("Synchronizing your files [%d]...", value))
+				} else {
+					oktetoLog.StopSpinner()
+					progressBar.SetCurrent(value)
+				}
 			}
 		}
 		quit <- true
 	}()
 
-	if err := up.Sy.WaitForCompletion(ctx, up.Dev, reporter); err != nil {
-		analytics.TrackSyncError()
+	if err := up.Sy.WaitForCompletion(ctx, reporter); err != nil {
+		up.analyticsMeta.ErrSync()
 		switch err {
-		case errors.ErrLostSyncthing:
+		case oktetoErrors.ErrLostSyncthing:
+			up.analyticsMeta.ErrSyncLostSyncthing()
 			return err
-		case errors.ErrInsufficientSpace:
+		case oktetoErrors.ErrInsufficientSpace:
+			up.analyticsMeta.ErrSyncInsufficientSpace()
 			return up.getInsufficientSpaceError(err)
-		case errors.ErrNeedsResetSyncError:
-			return errors.UserError{
-				E:    fmt.Errorf("The synchronization service state is inconsistent"),
+		case oktetoErrors.ErrNeedsResetSyncError:
+			up.analyticsMeta.ErrSyncResetDatabase()
+			return oktetoErrors.UserError{
+				E:    fmt.Errorf("the synchronization service state is inconsistent"),
 				Hint: `Try running 'okteto up --reset' to reset the synchronization service`,
 			}
 		default:
-			return errors.UserError{
+			return oktetoErrors.UserError{
 				E: err,
-				Hint: `Help us improve okteto by filing an issue in https://github.com/okteto/okteto/issues/new.
+				Hint: fmt.Sprintf(`Help us improve okteto by filing an issue in https://github.com/okteto/okteto/issues/new.
     Please include the file generated by 'okteto doctor' if possible.
-    Then, try to run 'okteto down -v' + 'okteto up' again`,
+    Then, try to run '%s' + 'okteto up' again`, utils.GetDownCommand(up.Options.ManifestPathFlag)),
 			}
 		}
 	}
 
-	progressBar.SetCurrent(100)
+	progressBar.SetCurrent(totalProgressValue)
 
 	return nil
+}
+
+func (up *upContext) getSyncTempDir() (string, error) {
+	return afero.TempDir(up.Fs, "", "")
 }

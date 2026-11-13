@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,10 +17,13 @@ import (
 	"context"
 	"time"
 
-	"github.com/okteto/okteto/pkg/analytics"
-	"github.com/okteto/okteto/pkg/errors"
-	"github.com/okteto/okteto/pkg/log"
-	"github.com/okteto/okteto/pkg/model"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
+)
+
+const (
+	completedProgress     = 100
+	maxNeedDeletesRetries = 50
 )
 
 // Completion represents the completion of a syncthing folder.
@@ -33,21 +36,21 @@ type Completion struct {
 	NeedDeletes int64   `json:"needDeletes"`
 }
 
-//waitForCompletion represents a wait for completion iteration
+// waitForCompletion represents a wait for completion iteration
 type waitForCompletion struct {
 	localCompletion           *Completion
 	remoteCompletion          *Completion
+	sy                        *Syncthing
 	previousLocalGlobalBytes  int64
 	previousRemoteGlobalBytes int64
 	globalBytesRetries        int64
 	needDeletesRetries        int64
 	retries                   int64
 	progress                  float64
-	sy                        *Syncthing
 }
 
 // WaitForCompletion waits for the remote to be totally synched
-func (s *Syncthing) WaitForCompletion(ctx context.Context, dev *model.Dev, reporter chan float64) error {
+func (s *Syncthing) WaitForCompletion(ctx context.Context, reporter chan float64) error {
 	defer close(reporter)
 	ticker := time.NewTicker(250 * time.Millisecond)
 	wfc := &waitForCompletion{sy: s}
@@ -56,19 +59,19 @@ func (s *Syncthing) WaitForCompletion(ctx context.Context, dev *model.Dev, repor
 		case <-ticker.C:
 			wfc.retries++
 			if wfc.retries%40 == 0 {
-				log.Info("checking syncthing for error....")
-				if err := s.IsHealthy(ctx, false, 3); err != nil {
+				oktetoLog.Info("checking syncthing for error....")
+				if err := s.IsHealthy(ctx, false, maxRetries); err != nil {
 					return err
 				}
 			}
 
-			if err := s.Overwrite(ctx, dev); err != nil {
-				if err != errors.ErrBusySyncthing {
+			if err := s.Overwrite(ctx); err != nil {
+				if err != oktetoErrors.ErrBusySyncthing {
 					return err
 				}
 			}
 			if err := wfc.computeProgress(ctx); err != nil {
-				if err == errors.ErrBusySyncthing {
+				if err == oktetoErrors.ErrBusySyncthing {
 					reporter <- wfc.progress
 					continue
 				}
@@ -78,8 +81,7 @@ func (s *Syncthing) WaitForCompletion(ctx context.Context, dev *model.Dev, repor
 			reporter <- wfc.progress
 
 			if wfc.needsDatabaseReset() {
-				analytics.TrackResetDatabase(true)
-				return errors.ErrNeedsResetSyncError
+				return oktetoErrors.ErrNeedsResetSyncError
 			}
 
 			if wfc.isCompleted() {
@@ -87,7 +89,7 @@ func (s *Syncthing) WaitForCompletion(ctx context.Context, dev *model.Dev, repor
 			}
 
 		case <-ctx.Done():
-			log.Info("call to syncthing.WaitForCompletion canceled")
+			oktetoLog.Info("call to syncthing.WaitForCompletion canceled")
 			return ctx.Err()
 		}
 	}
@@ -99,9 +101,9 @@ func (wfc *waitForCompletion) computeProgress(ctx context.Context) error {
 		return err
 	}
 	wfc.localCompletion = localCompletion
-	log.Infof("syncthing status in local: globalBytes %d, needBytes %d, globalItems %d, needItems %d, needDeletes %d", localCompletion.GlobalBytes, localCompletion.NeedBytes, localCompletion.GlobalItems, localCompletion.NeedItems, localCompletion.NeedDeletes)
+	oktetoLog.Infof("syncthing status in local: globalBytes %d, needBytes %d, globalItems %d, needItems %d, needDeletes %d", localCompletion.GlobalBytes, localCompletion.NeedBytes, localCompletion.GlobalItems, localCompletion.NeedItems, localCompletion.NeedDeletes)
 	if localCompletion.GlobalBytes == 0 {
-		wfc.progress = 100
+		wfc.progress = completedProgress
 	} else {
 		wfc.progress = (float64(localCompletion.GlobalBytes-localCompletion.NeedBytes) / float64(localCompletion.GlobalBytes)) * 100
 	}
@@ -111,7 +113,7 @@ func (wfc *waitForCompletion) computeProgress(ctx context.Context) error {
 		return err
 	}
 	wfc.remoteCompletion = remoteCompletion
-	log.Infof("syncthing status in remote: globalBytes %d, needBytes %d, globalItems %d, needItems %d, needDeletes %d",
+	oktetoLog.Infof("syncthing status in remote: globalBytes %d, needBytes %d, globalItems %d, needItems %d, needDeletes %d",
 		remoteCompletion.GlobalBytes,
 		remoteCompletion.NeedBytes,
 		remoteCompletion.GlobalItems,
@@ -128,23 +130,23 @@ func (wfc *waitForCompletion) needsDatabaseReset() bool {
 		wfc.previousRemoteGlobalBytes = wfc.remoteCompletion.GlobalBytes
 		return false
 	}
-	log.Infof("local globalBytes %d, remote global bytes %d", wfc.localCompletion.GlobalBytes, wfc.remoteCompletion.GlobalBytes)
+	oktetoLog.Infof("local globalBytes %d, remote global bytes %d", wfc.localCompletion.GlobalBytes, wfc.remoteCompletion.GlobalBytes)
 	if wfc.localCompletion.GlobalBytes != wfc.previousLocalGlobalBytes {
-		log.Infof("local globalBytes has changed %d vs %d", wfc.localCompletion.GlobalBytes, wfc.previousLocalGlobalBytes)
+		oktetoLog.Infof("local globalBytes has changed %d vs %d", wfc.localCompletion.GlobalBytes, wfc.previousLocalGlobalBytes)
 		wfc.previousLocalGlobalBytes = wfc.localCompletion.GlobalBytes
 		wfc.previousRemoteGlobalBytes = wfc.remoteCompletion.GlobalBytes
 		wfc.globalBytesRetries = 0
 		return false
 	}
 	if wfc.remoteCompletion.GlobalBytes != wfc.previousRemoteGlobalBytes {
-		log.Infof("remote globalBytes has changed %d vs %d", wfc.remoteCompletion.GlobalBytes, wfc.previousRemoteGlobalBytes)
+		oktetoLog.Infof("remote globalBytes has changed %d vs %d", wfc.remoteCompletion.GlobalBytes, wfc.previousRemoteGlobalBytes)
 		wfc.previousLocalGlobalBytes = wfc.localCompletion.GlobalBytes
 		wfc.previousRemoteGlobalBytes = wfc.remoteCompletion.GlobalBytes
 		wfc.globalBytesRetries = 0
 		return false
 	}
 	wfc.globalBytesRetries++
-	log.Infof("globalBytesRetries %d", wfc.globalBytesRetries)
+	oktetoLog.Infof("globalBytesRetries %d", wfc.globalBytesRetries)
 	return wfc.globalBytesRetries > 360 // 90 seconds
 }
 
@@ -161,13 +163,13 @@ func (wfc *waitForCompletion) isCompleted() bool {
 
 	if wfc.localCompletion.NeedDeletes > 0 {
 		wfc.needDeletesRetries++
-		if wfc.needDeletesRetries < 50 {
-			log.Info("synced completed, but need deletes, retrying...")
+		if wfc.needDeletesRetries < maxNeedDeletesRetries {
+			oktetoLog.Info("sync completed, but need deletes, retrying...")
 			return false
 		}
 	}
 	if !wfc.sy.IsAllOverwritten() {
-		log.Info("synced completed, but overwrites not sent, retrying...")
+		oktetoLog.Info("sync completed, but overwrites not sent, retrying...")
 		return false
 	}
 	return true

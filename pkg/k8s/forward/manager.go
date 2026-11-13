@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,37 +16,36 @@ package forward
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
-	"net/http"
+	"io"
 	"runtime"
 	"time"
 
 	"github.com/okteto/okteto/pkg/k8s/labels"
 	"github.com/okteto/okteto/pkg/k8s/pods"
 	"github.com/okteto/okteto/pkg/k8s/services"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
-
-	"k8s.io/apimachinery/pkg/util/httpstream"
+	"github.com/okteto/okteto/pkg/model/forward"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/portforward"
-	"k8s.io/client-go/transport/spdy"
+	"k8s.io/streaming/pkg/httpstream"
 )
 
 // PortForwardManager keeps a list of all the active port forwards
 type PortForwardManager struct {
-	stopped        bool
-	iface          string
-	ports          map[int]model.Forward
+	ctx            context.Context
+	client         kubernetes.Interface
+	ports          map[int]forward.Forward
 	services       map[string]struct{}
 	activeDev      *active
 	activeServices map[string]*active
-	ctx            context.Context
 	restConfig     *rest.Config
-	client         kubernetes.Interface
+	iface          string
 	namespace      string
+	stopped        bool
 }
 
 type active struct {
@@ -83,7 +82,7 @@ func NewPortForwardManager(ctx context.Context, iface string, restConfig *rest.C
 	return &PortForwardManager{
 		ctx:        ctx,
 		iface:      iface,
-		ports:      make(map[int]model.Forward),
+		ports:      make(map[int]forward.Forward),
 		services:   make(map[string]struct{}),
 		restConfig: restConfig,
 		client:     c,
@@ -92,13 +91,14 @@ func NewPortForwardManager(ctx context.Context, iface string, restConfig *rest.C
 }
 
 // Add initializes a port forward
-func (p *PortForwardManager) Add(f model.Forward) error {
+func (p *PortForwardManager) Add(f forward.Forward) error {
 	if _, ok := p.ports[f.Local]; ok {
 		return fmt.Errorf("port %d is listed multiple times, please check your configuration", f.Local)
 	}
 
 	if !model.IsPortAvailable(p.iface, f.Local) {
-		if f.Local <= 1024 {
+		maxSystemPorts := 1024
+		if f.Local <= maxSystemPorts {
 			os := runtime.GOOS
 			switch os {
 			case "darwin":
@@ -118,8 +118,13 @@ func (p *PortForwardManager) Add(f model.Forward) error {
 	return nil
 }
 
+// StartGlobalForwarding is not implemented
+func (*PortForwardManager) StartGlobalForwarding() error {
+	return fmt.Errorf("not implemented")
+}
+
 // AddReverse is not implemented
-func (p *PortForwardManager) AddReverse(_ model.Reverse) error {
+func (*PortForwardManager) AddReverse(_ model.Reverse) error {
 	return fmt.Errorf("not implemented")
 }
 
@@ -135,9 +140,13 @@ func (p *PortForwardManager) Start(devPod, namespace string) error {
 	go func() {
 		err := devPF.ForwardPorts()
 		if err != nil {
-			log.Infof("k8s forwarding to dev pod finished with errors: %s", err)
-			p.activeDev.closeReady()
-			p.activeDev.err = err
+			oktetoLog.Infof("k8s forwarding to dev pod finished with errors: %s", err)
+			if p.activeDev != nil {
+				if !errors.Is(err, portforward.ErrLostConnectionToPod) {
+					p.activeDev.closeReady()
+				}
+				p.activeDev.err = err
+			}
 		}
 	}()
 
@@ -152,7 +161,7 @@ func (p *PortForwardManager) Start(devPod, namespace string) error {
 		return err
 	}
 
-	log.Infof("all k8s port-forwards are connected")
+	oktetoLog.Infof("all k8s port-forwards are connected")
 	return nil
 }
 
@@ -167,10 +176,10 @@ func (p *PortForwardManager) Stop() {
 
 	p.activeServices = nil
 	p.activeDev = nil
-	log.Infof("stopped k8s forwarder")
+	oktetoLog.Infof("stopped k8s forwarder")
 }
 
-func (fm *PortForwardManager) TransformLabelsToServiceName(f model.Forward) (model.Forward, error) {
+func (fm *PortForwardManager) TransformLabelsToServiceName(f forward.Forward) (forward.Forward, error) {
 	serviceName, err := fm.GetServiceNameByLabel(fm.namespace, f.Labels)
 	if err != nil {
 		return f, err
@@ -202,13 +211,13 @@ func (p *PortForwardManager) buildForwarder(namespace, pod string, ports []strin
 		out:       new(bytes.Buffer),
 	}
 
-	pf, err := portforward.NewOnAddresses(
+	pf, err := portforward.NewOnAddressesForStreaming(
 		dialer,
 		[]string{p.iface},
 		ports,
 		a.stopChan,
 		a.readyChan,
-		ioutil.Discard,
+		io.Discard,
 		a.out)
 
 	if err != nil {
@@ -219,7 +228,7 @@ func (p *PortForwardManager) buildForwarder(namespace, pod string, ports []strin
 }
 
 func (p *PortForwardManager) buildForwarderToService(ctx context.Context, namespace, service string) (*active, *portforward.PortForwarder, error) {
-	svc, err := services.Get(ctx, namespace, service, p.client)
+	svc, err := services.Get(ctx, service, namespace, p.client)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -237,7 +246,7 @@ func (p *PortForwardManager) buildForwarderToService(ctx context.Context, namesp
 	return p.buildForwarder(pod.GetNamespace(), pod.GetName(), ports)
 }
 
-func getServicePorts(service string, forwards map[int]model.Forward) []string {
+func getServicePorts(service string, forwards map[int]forward.Forward) []string {
 	ports := []string{}
 	for _, f := range forwards {
 		if f.Service && f.ServiceName == service {
@@ -260,12 +269,7 @@ func (p *PortForwardManager) buildDialer(namespace, pod string) (httpstream.Dial
 		return nil, fmt.Errorf("restConfig is nil")
 	}
 
-	transport, upgrader, err := spdy.RoundTripperFor(p.restConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	return spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", url), nil
+	return NewDialer(p.restConfig, url)
 }
 
 func (p *PortForwardManager) forwardService(ctx context.Context, namespace, service string) {
@@ -276,19 +280,19 @@ func (p *PortForwardManager) forwardService(ctx context.Context, namespace, serv
 			return
 		}
 
-		log.Infof("k8s forwarding ports for service/%s", service)
+		oktetoLog.Infof("k8s forwarding ports for service/%s", service)
 		a, pf, err := p.buildForwarderToService(ctx, namespace, service)
 		if err != nil {
-			log.Infof("failed to k8s forward ports to service/%s: %s", service, err)
+			oktetoLog.Infof("failed to k8s forward ports to service/%s: %s", service, err)
 			<-t.C
 			continue
 		}
 
 		if err := pf.ForwardPorts(); err != nil {
-			log.Infof("k8s forwarding to service/%s finished with errors: %s", service, err)
+			oktetoLog.Infof("k8s forwarding to service/%s finished with errors: %s", service, err)
 			a.stop()
 		} else {
-			log.Infof("k8s forwarding to service/%s finished", service)
+			oktetoLog.Infof("k8s forwarding to service/%s finished", service)
 		}
 
 		<-t.C

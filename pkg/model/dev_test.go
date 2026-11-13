@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,231 +15,265 @@ package model
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/compose-spec/godotenv"
+	"github.com/okteto/okteto/pkg/env"
+	"github.com/okteto/okteto/pkg/model/forward"
+	"github.com/spf13/afero"
+	"github.com/stretchr/testify/assert"
 	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-func Test_LoadDev(t *testing.T) {
-	manifest := []byte(`
-name: deployment
-container: core
-image: code/core:0.1.8
-command: ["uwsgi"]
-annotations:
-  key1: value1
-  key2: value2
-resources:
-  requests:
-    memory: "64Mi"
-    cpu: "250m"
-  limits:
-    memory: "128Mi"
-    cpu: "500m"
-securityContext:
-  capabilities:
-    add:
-    - SYS_TRACE
-    drop:
-    - SYS_NICE
-serviceAccount: sa
-workdir: /app
-persistentVolume:
-  enabled: true
-timeout: 63s
-services:
-  - name: deployment
-    container: core
-    image: code/core:0.1.8
-    command: ["uwsgi"]
-    annotations:
-      key1: value1
-      key2: value2
-    resources:
-      requests:
-        memory: "64Mi"
-        cpu: "250m"
-      limits:
-        memory: "128Mi"
-        cpu: "500m"
-    securityContext:
-      capabilities:
-        add:
-          - SYS_TRACE
-        drop:
-          - SYS_NICE
-    workdir: /app`)
-	main, err := Read(manifest)
+// Test helpers
+func assertDevFields(t *testing.T, dev, main *Dev) {
+	t.Helper()
+	assert := assert.New(t)
+
+	assert.Equal("deployment", dev.Name, "'name' was not parsed: %+v", main)
+	assert.Len(dev.Command.Values, 1, "command was not parsed: %+v", dev)
+	if assert.Len(dev.Command.Values, 1) {
+		assert.Equal("uwsgi", dev.Command.Values[0], "command was not parsed: %+v", dev)
+	}
+
+	memory := dev.Resources.Requests["memory"]
+	assert.Equal("64Mi", memory.String(), "Resources.Requests.Memory was not parsed: %s", memory.String())
+
+	cpu := dev.Resources.Requests["cpu"]
+	assert.Equal("250m", cpu.String(), "Resources.Requests.CPU was not parsed correctly. Expected '250m', got '%s'", cpu.String())
+
+	memory = dev.Resources.Limits["memory"]
+	assert.Equal("128Mi", memory.String(), "Resources.Limits.Memory was not parsed: %s", memory.String())
+
+	cpu = dev.Resources.Limits["cpu"]
+	assert.Equal("500m", cpu.String(), "Resources.Limits.CPU was not parsed correctly. Expected '500m', got '%s'", cpu.String())
+
+	assert.Equal("value1", dev.Metadata.Annotations["key1"], "Annotation 'key1' was not parsed correctly")
+	assert.Equal("value2", dev.Metadata.Annotations["key2"], "Annotation 'key2' was not parsed correctly")
+	assert.Equal("value4", dev.Metadata.Labels["key4"], "Label 'key4' was not parsed correctly")
+	assert.Equal("value3", dev.Selector["key3"], "Selector 'key3' was not parsed correctly")
+}
+
+func assertManifestDefaults(t *testing.T, d *Dev, expectedEnvironment env.Environment, expectedForward []forward.Forward) {
+	t.Helper()
+	if len(d.Command.Values) != 1 || d.Command.Values[0] != "sh" {
+		t.Errorf("command was parsed: %+v", d)
+	}
+	for _, env := range d.Environment {
+		found := false
+		for _, expectedEnv := range expectedEnvironment {
+			if env.Name == expectedEnv.Name && env.Value == expectedEnv.Value {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("environment was not parsed correctly:\n%+v\n%+v", d.Environment, expectedEnvironment)
+		}
+	}
+	if !reflect.DeepEqual(d.Forward, expectedForward) {
+		t.Errorf("forward was not parsed correctly:\n%+v\n%+v", d.Forward, expectedForward)
+	}
+	for k, v := range d.Resources.Limits {
+		if v.IsZero() {
+			t.Errorf("resources.limits.%s wasn't set", k)
+		}
+	}
+	for k, v := range d.Resources.Requests {
+		if !v.IsZero() {
+			t.Errorf("resources.requests.%s was set", k)
+		}
+	}
+	if !d.PersistentVolumeEnabled() {
+		t.Errorf("persistent volume was not enabled by default")
+	}
+	defaultTimeout, err := GetTimeout()
+	assert.NoError(t, err)
+	if defaultTimeout != d.Timeout.Default {
+		t.Errorf("the default timeout wasn't applied, got %s, expected %s", d.Timeout, defaultTimeout)
+	}
+}
+
+func assertDevName(t *testing.T, got, want string) {
+	t.Helper()
+	if got != want {
+		t.Errorf("got: '%s', expected: '%s'", got, want)
+	}
+}
+
+func assertSelector(t *testing.T, got, want Selector) {
+	t.Helper()
+	for key, value := range got {
+		if want[key] != value {
+			t.Errorf("got: '%v', expected: '%v'", got, want)
+		}
+	}
+}
+
+func assertImage(t *testing.T, got, want string) {
+	t.Helper()
+	if got != want {
+		t.Errorf("got: '%s', expected: '%s'", got, want)
+	}
+}
+
+func Test_LoadManifest(t *testing.T) {
+	manifestBytes := []byte(`dev:
+  deployment:
+        container: core
+        image: code/core:0.1.8
+        command: ["uwsgi"]
+        selector:
+            key3: value3
+        metadata:
+            labels:
+                key4: value4
+            annotations:
+                key1: value1
+                key2: value2
+        resources:
+            requests:
+                memory: "64Mi"
+                cpu: "250m"
+            limits:
+                memory: "128Mi"
+                cpu: "500m"
+        securityContext:
+            capabilities:
+                add:
+                - SYS_PTRACE
+                drop:
+                - SYS_NICE
+        serviceAccount: sa
+        workdir: /app
+        persistentVolume:
+            enabled: true
+        timeout: 63s
+        services:
+        - name: deployment
+          container: core
+          image: code/core:0.1.8
+          command: ["uwsgi"]
+          selector:
+            key3: value3
+          metadata:
+            labels:
+              key4: value4
+            annotations:
+              key1: value1
+              key2: value2
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "250m"
+            limits:
+              memory: "128Mi"
+              cpu: "500m"
+`)
+	manifest, err := Read(manifestBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	main := manifest.Dev["deployment"]
 	if len(main.Services) != 1 {
 		t.Errorf("'services' was not parsed: %+v", main)
 	}
 	for _, dev := range []*Dev{main, main.Services[0]} {
-		if dev.Name != "deployment" {
-			t.Errorf("'name' was not parsed: %+v", main)
-		}
-
-		if len(dev.Command.Values) != 1 || dev.Command.Values[0] != "uwsgi" {
-			t.Errorf("command was not parsed: %+v", dev)
-		}
-
-		memory := dev.Resources.Requests["memory"]
-		if memory.String() != "64Mi" {
-			t.Errorf("Resources.Requests.Memory was not parsed: %s", memory.String())
-		}
-
-		cpu := dev.Resources.Requests["cpu"]
-		if cpu.String() != "250m" {
-			t.Errorf("Resources.Requests.CPU was not parsed correctly. Expected '250M', got '%s'", cpu.String())
-		}
-
-		memory = dev.Resources.Limits["memory"]
-		if memory.String() != "128Mi" {
-			t.Errorf("Resources.Requests.Memory was not parsed: %s", memory.String())
-		}
-
-		cpu = dev.Resources.Limits["cpu"]
-		if cpu.String() != "500m" {
-			t.Errorf("Resources.Requests.CPU was not parsed correctly. Expected '500M', got '%s'", cpu.String())
-		}
-
-		if dev.Annotations["key1"] != "value1" && dev.Annotations["key2"] != "value2" {
-			t.Errorf("Annotations were not parsed correctly")
-		}
-
-		if !reflect.DeepEqual(dev.SecurityContext.Capabilities.Add, []apiv1.Capability{"SYS_TRACE"}) {
-			t.Errorf("SecurityContext.Capabilities.Add was not parsed correctly. Expected [SYS_TRACE]")
-		}
-
-		if !reflect.DeepEqual(dev.SecurityContext.Capabilities.Drop, []apiv1.Capability{"SYS_NICE"}) {
-			t.Errorf("SecurityContext.Capabilities.Drop was not parsed correctly. Expected [SYS_NICE]")
-		}
+		assertDevFields(t, dev, main)
 	}
-
-	expected := (63 * time.Second)
-	if expected != main.Timeout {
+	expected := 63 * time.Second
+	if expected != main.Timeout.Default {
 		t.Errorf("the default timeout wasn't applied, got %s, expected %s", main.Timeout, expected)
 	}
 }
 
 func Test_extraArgs(t *testing.T) {
-	manifest := []byte(`
-name: deployment
-container: core
-image: code/core:0.1.8
-command: ["uwsgi"]
-requests:
-    memory: "64Mi"
-    cpu: "250m"
-  limits:
-    memory: "128Mi"
-    cpu: "500m"
-workdir: /app`)
+	manifest := []byte(`dev:
+    deployment:
+        container: core
+        image: code/core:0.1.8
+        command: ["uwsgi"]
+        requests:
+            memory: "64Mi"
+            cpu: "250m"
+        limits:
+            memory: "128Mi"
+            cpu: "500m"
+        workdir: /app`)
 	_, err := Read(manifest)
 	if err == nil {
 		t.Errorf("manifest with bad attribute didn't fail to load")
 	}
 }
 
-func Test_LoadDevDefaults(t *testing.T) {
-	var tests = []struct {
+func Test_LoadManifestDefaults(t *testing.T) {
+	tests := []struct {
 		name                string
 		manifest            []byte
-		expectedEnvironment []EnvVar
-		expectedForward     []Forward
+		expectedEnvironment env.Environment
+		expectedForward     []forward.Forward
 	}{
 		{
 			"long script",
-			[]byte(`name: service
-container: core
-workdir: /app`),
-			[]EnvVar{},
-			[]Forward{},
+			[]byte(`dev:
+    service:
+        container: core
+        workdir: /app`),
+			env.Environment{},
+			[]forward.Forward{},
 		},
 		{
 			"basic script",
-			[]byte(`name: service
-container: core
-workdir: /app`),
-			[]EnvVar{},
-			[]Forward{},
+			[]byte(`dev:
+    service:
+        container: core
+        workdir: /app`),
+			env.Environment{},
+			[]forward.Forward{},
 		},
 		{
 			"env vars",
-			[]byte(`name: service
-container: core
-workdir: /app
-environment:
-  - ENV=production
-  - name=test-node`),
-			[]EnvVar{
-				{Name: "ENV", Value: "production"},
-				{Name: "name", Value: "test-node"},
+			[]byte(`dev:
+    service:
+        container: core
+        workdir: /app
+        environment:
+        - ENV=production
+        - name=test-node`),
+			env.Environment{
+				env.Var{Name: "ENV", Value: "production"},
+				env.Var{Name: "name", Value: "test-node"},
 			},
-			[]Forward{},
+			[]forward.Forward{},
 		},
 		{
 			"forward",
-			[]byte(`name: service
-container: core
-workdir: /app
-forward:
-  - 9000:8000
-  - 9001:8001`),
-			[]EnvVar{},
-			[]Forward{
+			[]byte(`dev:
+    service:
+        container: core
+        workdir: /app
+        forward:
+        - 9000:8000
+        - 9001:8001`),
+			env.Environment{},
+			[]forward.Forward{
 				{Local: 9000, Remote: 8000, Service: false, ServiceName: ""},
 				{Local: 9001, Remote: 8001, Service: false, ServiceName: ""},
 			},
 		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d, err := Read(tt.manifest)
+			manifest, err := Read(tt.manifest)
 			if err != nil {
 				t.Fatal(err)
 			}
-
-			if len(d.Command.Values) != 1 || d.Command.Values[0] != "sh" {
-				t.Errorf("command was parsed: %+v", d)
-			}
-
-			if !reflect.DeepEqual(d.Environment, tt.expectedEnvironment) {
-				t.Errorf("environment was not parsed correctly:\n%+v\n%+v", d.Environment, tt.expectedEnvironment)
-			}
-
-			if !reflect.DeepEqual(d.Forward, tt.expectedForward) {
-				t.Errorf("environment was not parsed correctly:\n%+v\n%+v", d.Forward, tt.expectedForward)
-			}
-
-			for k, v := range d.Resources.Limits {
-				if v.IsZero() {
-					t.Errorf("resources.limits.%s wasn't set", k)
-				}
-			}
-
-			for k, v := range d.Resources.Requests {
-				if !v.IsZero() {
-					t.Errorf("resources.limits.%s was set", k)
-				}
-			}
-
-			if !d.PersistentVolumeEnabled() {
-				t.Errorf("persistent volume was not enabled by default")
-			}
-
-			defaultTimeout, _ := GetTimeout()
-			if defaultTimeout != d.Timeout {
-				t.Errorf("the default timeout wasn't applied, got %s, expected %s", d.Timeout, defaultTimeout)
-			}
+			d := manifest.Dev["service"]
+			assertManifestDefaults(t, d, tt.expectedEnvironment, tt.expectedForward)
 		})
 	}
 }
@@ -249,8 +283,8 @@ func Test_loadName(t *testing.T) {
 		name      string
 		devName   string
 		value     string
-		onService bool
 		want      string
+		onService bool
 	}{
 		{
 			name:    "no-var",
@@ -271,7 +305,7 @@ func Test_loadName(t *testing.T) {
 			want:    "code-",
 		},
 		{
-			name:      "no-var-vc",
+			name:      "no-var-svc",
 			devName:   "code",
 			value:     "1",
 			onService: true,
@@ -292,73 +326,68 @@ func Test_loadName(t *testing.T) {
 			want:      "code-",
 		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manifest := []byte(fmt.Sprintf(`
-name: %s`, tt.devName))
-
+			manifestBytes := []byte(fmt.Sprintf(`dev:
+    %s:
+`, tt.devName))
+			devName := tt.want
 			if tt.onService {
-				manifest = []byte(fmt.Sprintf(`
-name: n1
-services:
-  - name: %s`, tt.devName))
+				manifestBytes = []byte(fmt.Sprintf(`dev:
+    n1:
+        services:
+        - name: %s`, tt.devName))
+				devName = "n1"
 			}
-
-			os.Setenv("value", tt.value)
-			dev, err := Read(manifest)
+			t.Setenv("value", tt.value)
+			manifest, err := Read(manifestBytes)
 			if err != nil {
 				t.Fatal(err)
 			}
-
-			name := dev.Name
+			dev := manifest.Dev[devName]
+			name := devName
 			if tt.onService {
 				name = dev.Services[0].Name
 			}
-
-			if name != tt.want {
-				t.Errorf("got: '%s', expected: '%s'", name, tt.want)
-			}
+			assertDevName(t, name, tt.want)
 		})
 	}
 }
 
-func Test_loadLabels(t *testing.T) {
+func Test_loadSelector(t *testing.T) {
 	tests := []struct {
-		name   string
-		labels map[string]string
-		value  string
-		want   map[string]string
+		selector Selector
+		want     Selector
+		name     string
+		value    string
 	}{
 		{
-			name:   "no-var",
-			labels: map[string]string{"a": "1", "b": "2"},
-			value:  "3",
-			want:   map[string]string{"a": "1", "b": "2"},
+			name:     "no-var",
+			selector: Selector{"a": "1", "b": "2"},
+			value:    "3",
+			want:     Selector{"a": "1", "b": "2"},
 		},
 		{
-			name:   "var",
-			labels: map[string]string{"a": "1", "b": "${value}"},
-			value:  "3",
-			want:   map[string]string{"a": "1", "b": "3"},
+			name:     "var",
+			selector: Selector{"a": "1", "b": "${value}"},
+			value:    "3",
+			want:     Selector{"a": "1", "b": "3"},
 		},
 		{
-			name:   "missing",
-			labels: map[string]string{"a": "1", "b": "${valueX}"},
-			value:  "1",
-			want:   map[string]string{"a": "1", "b": ""},
+			name:     "missing",
+			selector: Selector{"a": "1", "b": "${valueX}"},
+			value:    "1",
+			want:     Selector{"a": "1", "b": ""},
 		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dev := &Dev{Labels: tt.labels}
-			os.Setenv("value", tt.value)
-			dev.loadLabels()
-
-			if !reflect.DeepEqual(tt.want, dev.Labels) {
-				t.Errorf("got: '%v', expected: '%v'", dev.Labels, tt.want)
+			dev := &Dev{Selector: tt.selector}
+			t.Setenv("value", tt.value)
+			if err := dev.loadSelector(); err != nil {
+				t.Fatalf("couldn't load selector")
 			}
+			assertSelector(t, dev.Selector, tt.want)
 		})
 	}
 }
@@ -424,38 +453,32 @@ func Test_loadImage(t *testing.T) {
 			onService: true,
 		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manifest := []byte(fmt.Sprintf(`
-name: deployment
-image: %s
+			manifestBytes := []byte(fmt.Sprintf(`dev:
+    deployment:
+        image: %s
 `, tt.image))
-
 			if tt.onService {
-				manifest = []byte(fmt.Sprintf(`
-name: deployment
-image: image
-services:
-  - name: svc
-    image: %s
+				manifestBytes = []byte(fmt.Sprintf(`dev:
+    deployment:
+        image: image
+        services:
+          - name: svc
+            image: %s
 `, tt.image))
 			}
-
-			os.Setenv("tag", tt.tagValue)
-			dev, err := Read(manifest)
+			t.Setenv("tag", tt.tagValue)
+			manifest, err := Read(manifestBytes)
 			if err != nil {
 				t.Fatal(err)
 			}
-
+			dev := manifest.Dev["deployment"]
 			img := dev.Image
 			if tt.onService {
 				img = dev.Services[0].Image
 			}
-
-			if img.Name != tt.want {
-				t.Errorf("got: '%s', expected: '%s'", img, tt.want)
-			}
+			assertImage(t, img, tt.want)
 		})
 	}
 }
@@ -478,8 +501,7 @@ func TestDev_validateName(t *testing.T) {
 			dev := &Dev{
 				Name:            tt.devName,
 				ImagePullPolicy: apiv1.PullAlways,
-				Image:           &BuildInfo{},
-				Push:            &BuildInfo{},
+				Image:           "",
 				Sync: Sync{
 					Folders: []SyncFolder{
 						{
@@ -491,49 +513,79 @@ func TestDev_validateName(t *testing.T) {
 			}
 			// Since dev isn't being unmarshalled through Read, apply defaults
 			// before validating.
-			if err := dev.setDefaults(); err != nil {
+			if err := dev.SetDefaults(); err != nil {
 				t.Fatalf("error applying defaults: %v", err)
 			}
-			if err := dev.validate(); (err != nil) != tt.wantErr {
+			if err := dev.Validate(); (err != nil) != tt.wantErr {
 				t.Errorf("Dev.validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
 }
 
+func TestDev_validateReplicas(t *testing.T) {
+	replicasNumber := 5
+	dev := &Dev{
+		Name:            "test",
+		ImagePullPolicy: apiv1.PullAlways,
+		Image:           "",
+		Replicas:        &replicasNumber,
+		Sync: Sync{
+			Folders: []SyncFolder{
+				{
+					LocalPath:  ".",
+					RemotePath: "/app",
+				},
+			},
+		},
+	}
+	// Since dev isn't being unmarshalled through Read, apply defaults
+	// before validating.
+	if err := dev.SetDefaults(); err != nil {
+		t.Fatalf("error applying defaults: %v", err)
+	}
+	if err := dev.Validate(); err == nil {
+		t.Errorf("Dev.validate() error = %v, wantErr %v", err, true)
+	}
+
+}
+
 func Test_LoadRemote(t *testing.T) {
-	manifest := []byte(`
-  name: deployment
-  container: core
-  image: code/core:0.1.8
-  command: ["uwsgi"]
-  remote: 22100
-  annotations:
-    key1: value1
-    key2: value2
-  forward:
-    - 8080:8080
-  sshServerPort: 2222
-  resources:
-    requests:
-      memory: "64Mi"
-      cpu: "250m"
-    limits:
-      memory: "128Mi"
-      cpu: "500m"
-  environment:
-    - env=development
-  securityContext:
-    capabilities:
-      add:
-      - SYS_TRACE
-      drop:
-      - SYS_NICE
-  workdir: /app`)
-	dev, err := Read(manifest)
+	manifestBytes := []byte(`dev:
+    deployment:
+        container: core
+        image: code/core:0.1.8
+        command: ["uwsgi"]
+        remote: 22100
+        metadata:
+          annotations:
+              key1: value1
+              key2: value2
+        forward:
+        - 8080:8080
+        sshServerPort: 2222
+        resources:
+            requests:
+                memory: "64Mi"
+                cpu: "250m"
+            limits:
+                memory: "128Mi"
+                cpu: "500m"
+        environment:
+        - env=development
+        securityContext:
+            capabilities:
+                add:
+                - SYS_PTRACE
+                drop:
+                - SYS_NICE
+        workdir: /app`)
+	manifest, err := Read(manifestBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	dev := manifest.Dev["deployment"]
 
 	dev.LoadRemote("/tmp/key.pub")
 
@@ -563,25 +615,34 @@ func Test_LoadRemote(t *testing.T) {
 }
 
 func Test_Reverse(t *testing.T) {
-	manifest := []byte(`
-  name: deployment
-  container: core
-  image: code/core:0.1.8
-  command: ["uwsgi"]
-  annotations:
-    key1: value1
-    key2: value2
-  reverse:
-    - 8080:8080`)
-	dev, err := Read(manifest)
+	manifestBytes := []byte(`dev:
+    deployment:
+        container: core
+        image: code/core:0.1.8
+        command: ["uwsgi"]
+        metadata:
+          annotations:
+              key1: value1
+              key2: value2
+        reverse:
+        - 8080:8080`)
+	manifest, err := Read(manifestBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
+	dev := manifest.Dev["deployment"]
 
 	dev.LoadRemote("/tmp/key.pub")
 
+	// a dev with reverse forwards runs in remote mode; the local SSH port is
+	// assigned separately (right before opening the tunnel) via AssignRemotePort
+	if !dev.RemoteModeEnabled() {
+		t.Error("remote mode was not automatically enabled")
+	}
+
+	dev.AssignRemotePort()
 	if dev.RemotePort == 0 {
-		t.Error("remote port was not automatically enabled")
+		t.Error("remote port was not assigned")
 	}
 
 	if dev.Reverse[0].Local != 8080 {
@@ -594,17 +655,20 @@ func Test_Reverse(t *testing.T) {
 }
 
 func Test_LoadForcePull(t *testing.T) {
-	manifest := []byte(`
-  name: a
-  annotations:
-    key1: value1
-  services:
-    - name: b
-      imagePullPolicy: IfNotPresent`)
-	dev, err := Read(manifest)
+	manifestBytes := []byte(`dev:
+    a:
+        metadata:
+          annotations:
+              key1: value1
+        services:
+        - name: b
+          imagePullPolicy: IfNotPresent`)
+	manifest, err := Read(manifestBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	dev := manifest.Dev["a"]
 
 	dev.LoadForcePull()
 
@@ -612,7 +676,7 @@ func Test_LoadForcePull(t *testing.T) {
 		t.Errorf("wrong image pull policy for main container: %s", dev.ImagePullPolicy)
 	}
 
-	if dev.Annotations[OktetoRestartAnnotation] == "" {
+	if dev.Metadata.Annotations[OktetoRestartAnnotation] == "" {
 		t.Errorf("restart annotation not set for main container")
 	}
 
@@ -621,32 +685,34 @@ func Test_LoadForcePull(t *testing.T) {
 		t.Errorf("wrong image pull policy for services: %s", dev.ImagePullPolicy)
 	}
 
-	if dev.Annotations[OktetoRestartAnnotation] == "" {
+	if dev.Metadata.Annotations[OktetoRestartAnnotation] == "" {
 		t.Errorf("restart annotation not set for services")
 	}
 }
 
 func Test_validate(t *testing.T) {
-	file, err := ioutil.TempFile("/tmp", "okteto-secret-test")
+	file, err := os.CreateTemp("", "okteto-secret-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.Remove(file.Name())
 
-	var tests = []struct {
+	dir := t.TempDir()
+
+	tests := []struct {
 		name      string
 		manifest  []byte
 		expectErr bool
 	}{
 		{
 			name: "services-with-disabled-pvc",
-			manifest: []byte(`
-      name: deployment
-      sync:
+			manifest: []byte(`dev:
+    deployment:
+        sync:
         - .:/app
-      persistentVolume:
-        enabled: false
-      services:
+        persistentVolume:
+            enabled: false
+        services:
         - name: foo
           sync:
             - .:/app`),
@@ -654,8 +720,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "services-with-enabled-pvc",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       services:
@@ -666,8 +732,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "pvc-size",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       persistentVolume:
@@ -677,8 +743,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "volumes-mount-path-/",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       volumes:
@@ -687,8 +753,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "volumes-relative-mount-path",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       volumes:
@@ -697,8 +763,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "external-volumes-mount-path-/",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       externalVolumes:
@@ -707,8 +773,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "external-volumes-relative-mount-path",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       externalVolumes:
@@ -717,8 +783,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "wrong-pvc-size",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       persistentVolume:
@@ -728,8 +794,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "services-with-mountpath-pullpolicy",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       services:
@@ -741,8 +807,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "services-with-bad-pullpolicy",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       services:
@@ -754,17 +820,17 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "volumes",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
         - docs:/docs`),
-			expectErr: false,
+			expectErr: true,
 		},
 		{
 			name: "external-volumes",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       externalVolumes:
@@ -774,8 +840,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "secrets",
-			manifest: []byte(fmt.Sprintf(`
-      name: deployment
+			manifest: []byte(fmt.Sprintf(`dev:
+    deployment:
       sync:
         - .:/app
       secrets:
@@ -785,8 +851,8 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "bad-pull-policy",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       imagePullPolicy: what`),
@@ -794,26 +860,17 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "good-pull-policy",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       imagePullPolicy: IfNotPresent`),
 			expectErr: false,
 		},
 		{
-			name: "subpath-on-main-dev",
-			manifest: []byte(`
-          name: deployment
-          sync:
-            - .:/app
-          subpath: /app/docs`),
-			expectErr: true,
-		},
-		{
 			name: "valid-ssh-server-port",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       sshServerPort: 2222`),
@@ -821,52 +878,99 @@ func Test_validate(t *testing.T) {
 		},
 		{
 			name: "invalid-ssh-server-port",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       sync:
         - .:/app
       sshServerPort: -1`),
 			expectErr: true,
 		},
+		{
+			name: "runAsNonRoot-with-root-user",
+			manifest: []byte(`dev:
+    deployment:
+      sync:
+        - .:/app
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 0`),
+			expectErr: true,
+		},
+		{
+			name: "runAsNonRoot-with-non-root-user",
+			manifest: []byte(`dev:
+    deployment:
+      sync:
+        - .:/app
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101`),
+			expectErr: false,
+		},
+		{
+			name: "file",
+			manifest: []byte(fmt.Sprintf(`dev:
+    deployment:
+      sync:
+        - %s:/app`, file.Name())),
+			expectErr: true,
+		},
+		{
+			name: "dir",
+			manifest: []byte(fmt.Sprintf(`dev:
+    deployment:
+      sync:
+        - %s:/app`, dir)),
+			expectErr: false,
+		},
+		{
+			name: "runAsNonRoot-with-root-group",
+			manifest: []byte(`dev:
+    deployment:
+      sync:
+        - .:/app
+      securityContext:
+        runAsNonRoot: true
+        runAsGroup: 0`),
+			expectErr: false,
+		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dev, err := Read(tt.manifest)
+			m, err := Read(tt.manifest)
 			if err != nil {
 				t.Fatal(err)
 			}
-
-			err = dev.validate()
+			dev := m.Dev["deployment"]
+			err = dev.Validate()
 			if tt.expectErr && err == nil {
-				t.Error("didn't got the expected error")
+				t.Error("didn't get the expected error")
 			}
-
 			if !tt.expectErr && err != nil {
 				t.Errorf("got an unexpected error: %s", err)
 			}
-
 		})
 	}
 }
+
 func TestPersistentVolumeEnabled(t *testing.T) {
-	var tests = []struct {
+	tests := []struct {
 		name     string
 		manifest []byte
 		expected bool
 	}{
 		{
 			name: "default",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       container: core
       image: code/core:0.1.8`),
 			expected: true,
 		},
 		{
 			name: "set",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       container: core
       image: code/core:0.1.8
       persistentVolume:
@@ -875,8 +979,8 @@ func TestPersistentVolumeEnabled(t *testing.T) {
 		},
 		{
 			name: "disabled",
-			manifest: []byte(`
-      name: deployment
+			manifest: []byte(`dev:
+    deployment:
       container: core
       image: code/core:0.1.8
       persistentVolume:
@@ -887,50 +991,14 @@ func TestPersistentVolumeEnabled(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dev, err := Read(tt.manifest)
+			manifest, err := Read(tt.manifest)
 			if err != nil {
 				t.Fatal(err)
 			}
+			dev := manifest.Dev["deployment"]
 
 			if dev.PersistentVolumeEnabled() != tt.expected {
 				t.Errorf("Expecting %t but got %t", tt.expected, dev.PersistentVolumeEnabled())
-			}
-		})
-	}
-}
-
-func Test_ExpandEnv(t *testing.T) {
-	os.Setenv("BAR", "bar")
-	tests := []struct {
-		name   string
-		value  string
-		result string
-	}{
-		{
-			name:   "no-var",
-			value:  "value",
-			result: "value",
-		},
-		{
-			name:   "var",
-			value:  "value-${BAR}-value",
-			result: "value-bar-value",
-		},
-		{
-			name:   "default",
-			value:  "value-${FOO:-foo}-value",
-			result: "value-foo-value",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := ExpandEnv(tt.value)
-			if err != nil {
-				t.Errorf("error in test '%s': %s", tt.name, err.Error())
-			}
-			if result != tt.result {
-				t.Errorf("error in test '%s': '%s', expected: '%s'", tt.name, result, tt.result)
 			}
 		})
 	}
@@ -943,18 +1011,18 @@ func TestGetTimeout(t *testing.T) {
 		want    time.Duration
 		wantErr bool
 	}{
-		{name: "default value", want: 30 * time.Second},
+		{name: "default value", want: 60 * time.Second},
 		{name: "env var", want: 134 * time.Second, env: "134s"},
 		{name: "bad env var", wantErr: true, env: "bad value"},
 	}
 
-	original := os.Getenv("OKTETO_TIMEOUT")
-	defer os.Setenv("OKTETO_TIMEOUT", original)
+	original := os.Getenv(OktetoTimeoutEnvVar)
+	defer t.Setenv(OktetoTimeoutEnvVar, original)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.env != "" {
-				os.Setenv("OKTETO_TIMEOUT", tt.env)
+				t.Setenv(OktetoTimeoutEnvVar, tt.env)
 			}
 			got, err := GetTimeout()
 			if (err != nil) != tt.wantErr {
@@ -965,6 +1033,560 @@ func TestGetTimeout(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("GetTimeout() = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func Test_loadEnvFile(t *testing.T) {
+	tests := []struct {
+		content   map[string]string
+		existing  map[string]string
+		expected  map[string]string
+		name      string
+		expectErr bool
+	}{
+		{
+			name:      "missing",
+			expectErr: true,
+		},
+		{
+			name:      "basic",
+			expectErr: false,
+			content:   map[string]string{"foo": "bar"},
+			expected:  map[string]string{"foo": "bar"},
+		},
+		{
+			name:      "does-not-override",
+			expectErr: false,
+			content:   map[string]string{"foo": "bar"},
+			existing:  map[string]string{"foo": "var"},
+			expected:  map[string]string{"foo": "var"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.content != nil {
+				file, err := createEnvFile(tt.content)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				defer os.Remove(file)
+			}
+
+			for k, v := range tt.existing {
+				t.Setenv(k, v)
+			}
+
+			if err := godotenv.Load(); err != nil {
+				if tt.expectErr {
+					return
+				}
+
+				t.Fatal(err)
+			}
+
+			if tt.expectErr {
+				t.Fatal("call didn't fail as expected")
+			}
+
+			for k, v := range tt.expected {
+				got := os.Getenv(k)
+				if got != v {
+					t.Errorf("got %s=%s, expected %s=%s", k, got, k, v)
+				}
+			}
+		})
+	}
+}
+
+func Test_LoadManifestWithEnvFile(t *testing.T) {
+	content := map[string]string{
+		"DEPLOYMENT":    "main",
+		"IMAGE_TAG":     "1.2",
+		"MY_VAR":        "from-env-file",
+		"SERVICE":       "secondary",
+		"SERVICE_IMAGE": "code/service:2.1",
+	}
+
+	f, err := createEnvFile(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer os.Remove(f)
+
+	manifestBytes := []byte(`dev:
+    deployment:
+        name: deployment-$DEPLOYMENT
+        container: core
+        image: code/core:$IMAGE_TAG
+        command: ["uwsgi"]
+        environment:
+        - MY_VAR=$MY_VAR
+        services:
+        - name: deployment-$SERVICE
+          container: core
+          image: $SERVICE_IMAGE
+          command: ["uwsgi"]
+          environment:
+          - MY_VAR=$MY_VAR`)
+
+	if err := godotenv.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest, err := Read(manifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := manifest.Dev["deployment"]
+
+	if len(main.Services) != 1 {
+		t.Errorf("'services' was not parsed: %+v", main)
+	}
+
+	if main.Name != "deployment-main" {
+		t.Errorf("'name' was not parsed: got %s, expected %s", main.Name, "deployment-main")
+	}
+
+	if main.Image != "code/core:1.2" {
+		t.Errorf("'tag' was not parsed: got %s, expected %s", main.Image, "code/core:1.2")
+	}
+
+	if main.Environment[0].Value != "from-env-file" {
+		t.Errorf("'environment' was not parsed: got %s, expected %s", main.Environment[0].Value, "from-env-file")
+	}
+
+	if main.Services[0].Name != "deployment-secondary" {
+		t.Errorf("'name' was not parsed: got %s, expected %s", main.Services[0].Name, "deployment-secondary")
+	}
+
+	if main.Services[0].Image != "code/service:2.1" {
+		t.Errorf("'image' was not parsed: got %s, expected %s", main.Services[0].Image, "code/service:2.1")
+	}
+
+	if main.Services[0].Environment[0].Value != "from-env-file" {
+		t.Errorf("'environment' was not parsed: got %s, expected %s", main.Services[0].Environment[0].Value, "from-env-file")
+	}
+}
+
+func Test_validateForExtraFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{
+			name: "services",
+			value: `services:
+            - name: 1`,
+		},
+		{
+			name:  "autocreate",
+			value: "autocreate: true",
+		},
+		{
+			name: "probes",
+			value: `probes:
+               liveness: true
+               readiness: true
+               startup: true`,
+		},
+		{
+			name: "lifecycle",
+			value: `lifecycle:
+               postStart: false
+               preStop: true`,
+		},
+		{
+			name: "securityContext",
+			value: `securityContext:
+               runAsUser: 1000
+               runAsGroup: 2000
+               fsGroup: 3000
+               allowPrivilegeEscalation: false
+               capabilities:
+                 add:
+                 - SYS_PTRACE`,
+		},
+		{
+			name:  "serviceAccount",
+			value: "serviceAccount: sa",
+		},
+		{
+			name:  "remote",
+			value: "remote: 2222",
+		},
+		{
+			name:  "sshServerPort",
+			value: "sshServerPort: 2222",
+		},
+		{
+			name:  "externalVolumes",
+			value: `externalVolumes: []`,
+		},
+		{
+			name: "forward",
+			value: `forward:
+                   - 8080:80`,
+		},
+		{
+			name: "reverse",
+			value: `reverse:
+                   - 9000:9001`,
+		},
+		{
+			name: "reverse",
+			value: `reverse:
+                   - 9000:9001`,
+		},
+		{
+			name:  "interface",
+			value: "interface: 0.0.0.0",
+		},
+		{
+			name: "persistentVolume",
+			value: `persistentVolume:
+                   enabled: true
+                   storageClass: standard
+                   size: 30Gi`,
+		},
+		{
+			name: "initContainer",
+			value: `initContainer:
+                   image: alpine`,
+		},
+		{
+			name: "timeout",
+			value: `timeout:
+                   default: 3m
+                   resources: 5m`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s is present", tt.name), func(t *testing.T) {
+			manifest := []byte(fmt.Sprintf(`dev:
+    deployment:
+        container: core
+        image: code/core:0.1.8
+        command: ["uwsgi"]
+        selector:
+            key3: value3
+        metadata:
+            labels:
+                key4: value4
+            annotations:
+              key1: value1
+              key2: value2
+        resources:
+            requests:
+                memory: "64Mi"
+                cpu: "250m"
+            limits:
+                memory: "128Mi"
+                cpu: "500m"
+        securityContext:
+            capabilities:
+                add:
+                - SYS_PTRACE
+                drop:
+                - SYS_NICE
+        serviceAccount: sa
+        workdir: /app
+        persistentVolume:
+            enabled: true
+        timeout: 63s
+        services:
+        - name: deployment
+          container: core
+          image: code/core:0.1.8
+          command: ["uwsgi"]
+          selector:
+            key3: value3
+          metadata:
+            labels:
+                key4: value4
+            annotations:
+              key1: value1
+              key2: value2
+          resources:
+            requests:
+                memory: "64Mi"
+                cpu: "250m"
+            limits:
+                memory: "128Mi"
+                cpu: "500m"
+          workdir: /app
+          %s`, tt.value))
+			expected := fmt.Sprintf("error on dev 'deployment': %q is not supported in Services. Please visit https://www.okteto.com/docs/reference/okteto-manifest/#services-object-optional for documentation", tt.name)
+
+			_, err := Read(manifest)
+			assert.NotNil(t, err)
+			assert.ErrorContains(t, err, expected)
+		})
+	}
+}
+
+func createEnvFile(content map[string]string) (string, error) {
+	file, err := os.OpenFile(".env", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return "", err
+	}
+
+	for k, v := range content {
+		_, err = fmt.Fprintf(file, "%s=%s\n", k, v)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	if err := file.Sync(); err != nil {
+		return "", err
+	}
+	return file.Name(), nil
+}
+
+func Test_expandEnvFiles(t *testing.T) {
+	tests := []struct {
+		name     string
+		dev      *Dev
+		envs     []byte
+		expected env.Environment
+	}{
+		{
+			name: "add new envs",
+			dev: &Dev{
+				Environment: env.Environment{},
+				EnvFiles:    env.Files{},
+			},
+			envs: []byte("key1=value1"),
+			expected: env.Environment{
+				env.Var{
+					Name:  "key1",
+					Value: "value1",
+				},
+			},
+		},
+		{
+			name: "don't overwrite envs",
+			dev: &Dev{
+				Environment: env.Environment{
+					env.Var{
+						Name:  "key1",
+						Value: "value1",
+					},
+				},
+				EnvFiles: env.Files{},
+			},
+			envs: []byte("key1=value100"),
+			expected: env.Environment{
+				env.Var{
+					Name:  "key1",
+					Value: "value1",
+				},
+			},
+		},
+		{
+			name: "empty env - infer value",
+			dev: &Dev{
+				Environment: env.Environment{},
+				EnvFiles:    env.Files{},
+			},
+			envs: []byte("OKTETO_TEST="),
+			expected: env.Environment{
+				env.Var{
+					Name:  "OKTETO_TEST",
+					Value: "myvalue",
+				},
+			},
+		},
+		{
+			name: "empty env - empty value",
+			dev: &Dev{
+				Environment: env.Environment{},
+				EnvFiles:    env.Files{},
+			},
+			envs:     []byte("OKTETO_TEST2="),
+			expected: env.Environment{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			file, err := os.CreateTemp("", ".env")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(file.Name())
+
+			tt.dev.EnvFiles = env.Files{file.Name()}
+
+			t.Setenv("OKTETO_TEST", "myvalue")
+
+			if _, err = file.Write(tt.envs); err != nil {
+				t.Fatal("Failed to write to temporary file", err)
+			}
+			if err := tt.dev.expandEnvFiles(); err != nil {
+				t.Fatal(err)
+			}
+			assert.Equal(t, tt.expected, tt.dev.Environment)
+		})
+	}
+}
+
+func TestPrepare(t *testing.T) {
+	type input struct {
+		manifestPath string
+	}
+	tests := []struct {
+		name          string
+		dev           *Dev
+		input         input
+		expectedError bool
+	}{
+		{
+			name: "success",
+			dev:  &Dev{},
+			input: input{
+				manifestPath: "okteto.yml",
+			},
+			expectedError: false,
+		},
+		{
+			name: "with missing envFiles",
+			dev: &Dev{
+				EnvFiles: env.Files{".notfound"},
+			},
+			input: input{
+				manifestPath: "okteto.yml",
+			},
+			expectedError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.dev.PreparePathsAndExpandEnvFiles(tt.input.manifestPath, afero.NewMemMapFs())
+			if tt.expectedError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestDev_HasEmptyResources(t *testing.T) {
+	tests := []struct {
+		name     string
+		dev      *Dev
+		expected bool
+	}{
+		{
+			name: "empty resources",
+			dev: &Dev{
+				Resources: ResourceRequirements{},
+			},
+			expected: true,
+		},
+		{
+			name: "only requests set",
+			dev: &Dev{
+				Resources: ResourceRequirements{
+					Requests: ResourceList{
+						"memory": resource.MustParse("100Mi"),
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "only limits set",
+			dev: &Dev{
+				Resources: ResourceRequirements{
+					Limits: ResourceList{
+						"cpu": resource.MustParse("200m"),
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "both requests and limits set",
+			dev: &Dev{
+				Resources: ResourceRequirements{
+					Requests: ResourceList{
+						"memory": resource.MustParse("100Mi"),
+					},
+					Limits: ResourceList{
+						"cpu": resource.MustParse("200m"),
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "nil requests and limits",
+			dev: &Dev{
+				Resources: ResourceRequirements{
+					Requests: nil,
+					Limits:   nil,
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.dev.Resources.HasEmptyResources()
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestDev_HasEmptyNodeSelector(t *testing.T) {
+	tests := []struct {
+		name         string
+		nodeSelector map[string]string
+		expected     bool
+	}{
+		{
+			name:         "empty nodeSelector",
+			nodeSelector: map[string]string{},
+			expected:     true,
+		},
+		{
+			name:         "nil nodeSelector",
+			nodeSelector: nil,
+			expected:     true,
+		},
+		{
+			name: "nodeSelector with values",
+			nodeSelector: map[string]string{
+				"kubernetes.io/os": "linux",
+			},
+			expected: false,
+		},
+		{
+			name: "nodeSelector with multiple values",
+			nodeSelector: map[string]string{
+				"kubernetes.io/os":   "linux",
+				"kubernetes.io/arch": "amd64",
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dev := &Dev{
+				NodeSelector: tt.nodeSelector,
+			}
+			result := dev.HasEmptyNodeSelector()
+			assert.Equal(t, tt.expected, result)
 		})
 	}
 }

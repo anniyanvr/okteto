@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,25 +17,32 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"path"
 	"strings"
 	"time"
 
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 )
 
 type addAPIKeyTransport struct {
 	T http.RoundTripper
 }
 
+const (
+	APIKeyHeader      = "X-Api-Key"
+	APIKeyHeaderValue = "cnd"
+)
+
+// RoundTrip implements the http.RoundTripper interface and is used to add the
+// desired request headers to http requests.
 func (akt *addAPIKeyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Add("X-API-Key", "cnd")
+	req.Header.Add(APIKeyHeader, APIKeyHeaderValue)
 	return akt.T.RoundTrip(req)
 }
 
-//NewAPIClient returns a new syncthing api client configured to call the syncthing api
+// NewAPIClient returns a new syncthing api client configured to call the syncthing api
 func NewAPIClient() *http.Client {
 	return &http.Client{
 		Timeout:   60 * time.Second,
@@ -43,7 +50,7 @@ func NewAPIClient() *http.Client {
 	}
 }
 
-// APICall calls the syncthing API and returns the parsed json or an error
+// APICall calls the syncthing API and returns the response body or an error
 func (s *Syncthing) APICall(ctx context.Context, url, method string, code int, params map[string]string, local bool, body []byte, readBody bool, maxRetries int) ([]byte, error) {
 	retries := 0
 	ticker := time.NewTicker(200 * time.Millisecond)
@@ -55,18 +62,19 @@ func (s *Syncthing) APICall(ctx context.Context, url, method string, code int, p
 				return result, nil
 			}
 
+			if strings.Contains(err.Error(), "connection refused") {
+				oktetoLog.Infof("syncthing is not ready, retrying local=%t", local)
+			} else {
+				oktetoLog.Infof("retrying syncthing call[%s] local=%t: %s", url, local, err.Error())
+			}
+
 			if retries >= maxRetries {
 				return nil, err
 			}
 			retries++
 
-			if strings.Contains(err.Error(), "connection refused") {
-				log.Infof("syncthing is not ready, retrying local=%t", local)
-			} else {
-				log.Infof("retrying syncthing call[%s] local=%t: %s", url, local, err.Error())
-			}
 		case <-ctx.Done():
-			log.Infof("call to syncthing.APICall %s canceled", url)
+			oktetoLog.Infof("call to syncthing.APICall %s canceled", url)
 			return nil, ctx.Err()
 		}
 	}
@@ -114,7 +122,7 @@ func (s *Syncthing) callWithRetry(ctx context.Context, url, method string, code 
 		return nil, nil
 	}
 
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response from syncthing [%s]: %w", url, err)
 	}

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,7 +15,6 @@ package syncthing
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,13 +24,15 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	getter "github.com/hashicorp/go-getter"
-	"github.com/okteto/okteto/pkg/log"
+	"github.com/okteto/okteto/pkg/filesystem"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
 )
 
 const (
-	syncthingVersion       = "1.14.0"
-	syncthingVersionEnvVar = "OKTETO_SYNCTHING_VERSION"
+	syncthingVersion          = "2.1.3"
+	syncthingVersionStringNew = 3
+	syncthingVersionStringOld = 2
 )
 
 var (
@@ -48,7 +49,7 @@ var (
 
 // Install installs syncthing locally
 func Install(p getter.ProgressTracker) error {
-	log.Infof("installing syncthing for %s/%s", runtime.GOOS, runtime.GOARCH)
+	oktetoLog.Infof("installing syncthing for %s/%s", runtime.GOOS, runtime.GOARCH)
 
 	minimum := GetMinimumVersion()
 	downloadURL, err := GetDownloadURL(runtime.GOOS, runtime.GOARCH, minimum.String())
@@ -61,7 +62,7 @@ func Install(p getter.ProgressTracker) error {
 		opts = []getter.ClientOption{getter.WithProgress(p)}
 	}
 
-	dir, err := ioutil.TempDir("", "")
+	dir, err := os.MkdirTemp("", "")
 	if err != nil {
 		return fmt.Errorf("failed to create temp download dir")
 	}
@@ -76,32 +77,32 @@ func Install(p getter.ProgressTracker) error {
 	defer os.RemoveAll(dir)
 
 	if err := client.Get(); err != nil {
-		return fmt.Errorf("failed to download syncthing from %s: %s", client.Src, err)
+		return fmt.Errorf("failed to download syncthing from %s: %w", client.Src, err)
 	}
 
 	i := getInstallPath()
 	b := getBinaryPathInDownload(dir, downloadURL)
 
 	if _, err := os.Stat(b); err != nil {
-		return fmt.Errorf("%s didn't include the syncthing binary: %s", downloadURL, err)
+		return fmt.Errorf("%s didn't include the syncthing binary: %w", downloadURL, err)
 	}
 
 	// skipcq GSC-G302 syncthing is a binary so it needs exec permissions
 	if err := os.Chmod(b, 0700); err != nil {
-		return fmt.Errorf("failed to set permissions to %s: %s", b, err)
+		return fmt.Errorf("failed to set permissions to %s: %w", b, err)
 	}
 
-	if model.FileExists(i) {
+	if filesystem.FileExists(i) {
 		if err := os.Remove(i); err != nil {
-			log.Infof("failed to delete %s, will try to overwrite: %s", i, err)
+			oktetoLog.Infof("failed to delete %s, will try to overwrite: %s", i, err)
 		}
 	}
 
-	if err := model.CopyFile(b, i); err != nil {
-		return fmt.Errorf("failed to write %s: %s", i, err)
+	if err := filesystem.CopyFile(b, i); err != nil {
+		return fmt.Errorf("failed to write %s: %w", i, err)
 	}
 
-	log.Infof("downloaded syncthing %s to %s", syncthingVersion, i)
+	oktetoLog.Infof("downloaded syncthing %s to %s", minimum, i)
 	return nil
 }
 
@@ -127,7 +128,7 @@ func ShouldUpgrade() bool {
 }
 
 func GetMinimumVersion() *semver.Version {
-	v := os.Getenv(syncthingVersionEnvVar)
+	v := os.Getenv(model.SyncthingVersionEnvVar)
 	if v == "" {
 		v = syncthingVersion
 	}
@@ -139,13 +140,13 @@ func getInstalledVersion() *semver.Version {
 	cmd := exec.Command(getInstallPath(), "--version")
 	output, err := cmd.Output()
 	if err != nil {
-		log.Errorf("failed to get the current syncthing version `%s`: %s", output, err)
+		oktetoLog.Errorf("failed to get the current syncthing version `%s`: %s", output, err)
 		return nil
 	}
 
 	s, err := parseVersionFromOutput(output)
 	if err != nil {
-		log.Errorf("failed to parse the current syncthing version `%s`: %s", output, err)
+		oktetoLog.Errorf("failed to parse the current syncthing version `%s`: %s", output, err)
 		return nil
 	}
 
@@ -157,17 +158,17 @@ func parseVersionFromOutput(output []byte) (*semver.Version, error) {
 
 	v := ""
 	switch len(found) {
-	case 3:
+	case syncthingVersionStringNew:
 		v = fmt.Sprintf("%s%s", found[1], found[2])
-	case 2:
-		v = fmt.Sprintf("%s", found[1])
+	case syncthingVersionStringOld:
+		v = fmt.Sprint(found[1])
 	default:
 		return nil, fmt.Errorf("failed to extract the version from `%s`", output)
 	}
 
 	s, err := semver.NewVersion(v)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse the current syncthing version `%s`: %s", v, err)
+		return nil, fmt.Errorf("failed to parse the current syncthing version `%s`: %w", v, err)
 	}
 
 	return s, nil

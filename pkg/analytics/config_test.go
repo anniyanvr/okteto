@@ -1,0 +1,209 @@
+// Copyright 2024 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package analytics
+
+import (
+	"os"
+	"testing"
+
+	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/stretchr/testify/require"
+)
+
+func Test_Get(t *testing.T) {
+	var tests = []struct {
+		name             string
+		currentAnalytics bool
+		enabled          bool
+		fileExits        bool
+		want             bool
+	}{
+		{
+			name:             "is-currentAnalytics-enabled",
+			currentAnalytics: true,
+			enabled:          true,
+			want:             true,
+		},
+		{
+			name:             "is-currentAnalytics-disabled",
+			currentAnalytics: true,
+			enabled:          false,
+			want:             false,
+		},
+		{
+			name:      "is-currentAnalytics-nil-file-not-exists",
+			fileExits: false,
+			want:      false,
+		},
+		{
+			name:      "is-currentAnalytics-nil-file-exists-enabled",
+			fileExits: true,
+			enabled:   true,
+			want:      true,
+		},
+		{
+			name:      "is-currentAnalytics-nil-file-exists-disabled",
+			fileExits: true,
+			enabled:   false,
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+
+			t.Setenv(constants.OktetoFolderEnvVar, dir)
+
+			if !tt.currentAnalytics {
+				currentAnalytics = nil
+			} else {
+				currentAnalytics = &Analytics{Enabled: tt.enabled}
+			}
+
+			if tt.fileExits {
+				a := &Analytics{Enabled: tt.enabled}
+				if err := a.save(); err != nil {
+					t.Fatalf("analytics file wasn't created")
+				}
+			}
+
+			if got := get().Enabled; got != tt.want {
+				t.Errorf("After get, got %v, want %v", got, tt.want)
+			}
+
+		})
+	}
+
+}
+
+func TestAnalyticsEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func()
+		expected bool
+	}{
+		{
+			name: "disabled by user",
+			setup: func() {
+				currentAnalytics = &Analytics{Enabled: false}
+				okteto.CurrentStore = &okteto.ContextStore{
+					CurrentContext: "https://okteto.example.com",
+					Contexts: map[string]*okteto.Context{
+						"https://okteto.example.com": {
+							Name:      "https://okteto.example.com",
+							Analytics: true,
+						},
+					},
+				}
+			},
+			expected: false,
+		},
+		{
+			name: "context not initialized",
+			setup: func() {
+				currentAnalytics = &Analytics{Enabled: true}
+				okteto.CurrentStore = &okteto.ContextStore{CurrentContext: ""}
+			},
+			expected: false,
+		},
+		{
+			name: "disabled by admin",
+			setup: func() {
+				currentAnalytics = &Analytics{Enabled: true}
+				okteto.CurrentStore = &okteto.ContextStore{
+					CurrentContext: "https://okteto.example.com",
+					Contexts: map[string]*okteto.Context{
+						"https://okteto.example.com": {
+							Name:      "https://okteto.example.com",
+							Analytics: false, // admin disabled
+						},
+					},
+				}
+			},
+			expected: false,
+		},
+		{
+			name: "all enabled",
+			setup: func() {
+				currentAnalytics = &Analytics{Enabled: true}
+				okteto.CurrentStore = &okteto.ContextStore{
+					CurrentContext: "https://okteto.example.com",
+					Contexts: map[string]*okteto.Context{
+						"https://okteto.example.com": {
+							Name:      "https://okteto.example.com",
+							Analytics: true,
+						},
+					},
+				}
+			},
+			expected: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prevAnalytics := currentAnalytics
+			prevStore := okteto.CurrentStore
+			defer func() {
+				currentAnalytics = prevAnalytics
+				okteto.CurrentStore = prevStore
+			}()
+			tt.setup()
+			require.Equal(t, tt.expected, analyticsEnabled())
+		})
+	}
+}
+
+func TestGet_MemoizesAfterFirstLoad(t *testing.T) {
+	prev := currentAnalytics
+	defer func() { currentAnalytics = prev }()
+
+	dir := t.TempDir()
+	t.Setenv(constants.OktetoFolderEnvVar, dir)
+	currentAnalytics = nil
+
+	require.NoError(t, os.WriteFile(config.GetAnalyticsPath(),
+		[]byte(`{"machineID":"machine-1","enabled":true}`), 0600))
+
+	first := get()
+	require.Equal(t, "machine-1", first.MachineID)
+
+	// Overwrite the file on disk; a memoized get() must NOT re-read it.
+	require.NoError(t, os.WriteFile(config.GetAnalyticsPath(),
+		[]byte(`{"machineID":"machine-2","enabled":true}`), 0600))
+
+	second := get()
+	require.Same(t, first, second)
+	require.Equal(t, "machine-1", second.MachineID)
+}
+
+func TestGet_DoesNotCacheDisabledFallback(t *testing.T) {
+	prev := currentAnalytics
+	defer func() { currentAnalytics = prev }()
+
+	dir := t.TempDir()
+	t.Setenv(constants.OktetoFolderEnvVar, dir)
+	currentAnalytics = nil
+
+	// No file on disk → disabled fallback, must NOT populate the cache.
+	require.False(t, get().Enabled)
+	require.Nil(t, currentAnalytics)
+
+	// A later successful load must still take effect (cache was not poisoned).
+	require.NoError(t, os.WriteFile(config.GetAnalyticsPath(),
+		[]byte(`{"machineID":"m","enabled":true}`), 0600))
+	require.True(t, get().Enabled)
+}

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,11 +17,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/okteto/okteto/pkg/errors"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 )
 
-// Monitor will send a message to disconnected if remote syncthing is disconnected for more than 10 seconds.
+// Monitor will send a message to disconnect if remote syncthing is disconnected for more than 30 seconds.
 func (s *Syncthing) Monitor(ctx context.Context, disconnect chan error) {
 	ticker := time.NewTicker(10 * time.Second)
 	retries := 0
@@ -32,10 +32,10 @@ func (s *Syncthing) Monitor(ctx context.Context, disconnect chan error) {
 				retries = 0
 				continue
 			}
-			log.Infof("syncthing ping error %d", retries)
-			if retries >= 3 {
-				log.Infof("syncthing ping error, sending disconnect signal")
-				disconnect <- errors.ErrLostSyncthing
+			oktetoLog.Infof("syncthing ping error %d", retries)
+			if retries >= maxRetries {
+				oktetoLog.Infof("syncthing ping error, sending disconnect signal")
+				disconnect <- oktetoErrors.ErrLostSyncthing
 				return
 			}
 			retries++
@@ -45,7 +45,7 @@ func (s *Syncthing) Monitor(ctx context.Context, disconnect chan error) {
 	}
 }
 
-// MonitorStatus will send a message to disconnected if there is a synchronization error
+// MonitorStatus will send a message to disconnect if there is a synchronization error
 func (s *Syncthing) MonitorStatus(ctx context.Context, disconnect chan error) {
 	ticker := time.NewTicker(60 * time.Second)
 	for {
@@ -53,10 +53,10 @@ func (s *Syncthing) MonitorStatus(ctx context.Context, disconnect chan error) {
 		case <-ticker.C:
 			err := s.checkLocalAndRemoteStatus(ctx)
 			switch err {
-			case nil, errors.ErrBusySyncthing, errors.ErrLostSyncthing:
+			case nil, oktetoErrors.ErrBusySyncthing, oktetoErrors.ErrLostSyncthing:
 				continue
 			default:
-				log.Infof("syncthing monitor error, sending disconnect signal: %s", err)
+				oktetoLog.Infof("syncthing monitor error, sending disconnect signal: %s", err)
 				disconnect <- err
 				return
 			}
@@ -74,8 +74,8 @@ func (s *Syncthing) checkLocalAndRemotePing(ctx context.Context) bool {
 }
 
 func (s *Syncthing) checkLocalAndRemoteStatus(ctx context.Context) error {
-	if err := s.IsHealthy(ctx, true, 3); err != nil {
+	if err := s.IsHealthy(ctx, true, maxRetries); err != nil {
 		return err
 	}
-	return s.IsHealthy(ctx, false, 3)
+	return s.IsHealthy(ctx, false, maxRetries)
 }

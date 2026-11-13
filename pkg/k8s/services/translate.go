@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,7 +14,7 @@
 package services
 
 import (
-	"github.com/okteto/okteto/pkg/k8s/labels"
+	"github.com/okteto/okteto/pkg/constants"
 	"github.com/okteto/okteto/pkg/model"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,20 +25,20 @@ const (
 	oktetoAutoIngressAnnotation = "dev.okteto.com/auto-ingress"
 )
 
-func translate(dev *model.Dev) *apiv1.Service {
-	annotations := map[string]string{}
+func translate(dev *model.Dev, namespace string) *apiv1.Service {
+	annotations := model.Annotations{}
 	if len(dev.Services) == 0 {
 		annotations[oktetoAutoIngressAnnotation] = "true"
 	}
-	for k, v := range dev.Annotations {
+	for k, v := range dev.Metadata.Annotations {
 		annotations[k] = v
 	}
 	return &apiv1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      dev.Name,
-			Namespace: dev.Namespace,
+			Namespace: namespace,
 			Labels: map[string]string{
-				labels.DevLabel: "true",
+				constants.DevLabel: "true",
 			},
 			Annotations: annotations,
 		},
@@ -49,7 +49,7 @@ func translate(dev *model.Dev) *apiv1.Service {
 				{
 					Name:       dev.Name,
 					Port:       8080,
-					TargetPort: intstr.IntOrString{StrVal: "8080"},
+					TargetPort: intstr.IntOrString{IntVal: 8080},
 				},
 			},
 		},

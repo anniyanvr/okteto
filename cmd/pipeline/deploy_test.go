@@ -1,17 +1,43 @@
+// Copyright 2023 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package pipeline
 
 import (
 	"context"
-	"io/ioutil"
+	"encoding/base64"
+	"errors"
+	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/config"
+	"github.com/okteto/okteto/internal/test"
+	"github.com/okteto/okteto/internal/test/client"
+	"github.com/okteto/okteto/pkg/analytics"
+	"github.com/okteto/okteto/pkg/cmd/pipeline"
+	"github.com/okteto/okteto/pkg/constants"
+	"github.com/okteto/okteto/pkg/model/utils"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	apiv1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func Test_getRepositoryURL(t *testing.T) {
@@ -22,9 +48,9 @@ func Test_getRepositoryURL(t *testing.T) {
 	}
 	var tests = []struct {
 		name        string
-		expectError bool
-		remotes     []remote
 		expect      string
+		remotes     []remote
+		expectError bool
 	}{
 		{
 			name:        "single origin",
@@ -61,17 +87,14 @@ func Test_getRepositoryURL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir, err := ioutil.TempDir("", "")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer os.RemoveAll(dir)
+			dir := t.TempDir()
 
-			if _, err := getRepositoryURL(context.TODO(), dir); err == nil {
-				t.Fatal("expected error when there's no github repo")
+			if _, err := utils.GetRepositoryURL(dir); err == nil {
+
+				t.Fatal("expected error when there's no git repo")
 			}
 
-			r, err := git.PlainInit(dir, true)
+			r, err := git.PlainInit(dir, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -82,7 +105,8 @@ func Test_getRepositoryURL(t *testing.T) {
 				}
 			}
 
-			url, err := getRepositoryURL(context.TODO(), dir)
+			url, err := utils.GetRepositoryURL(dir)
+
 			if tt.expectError {
 				if err == nil {
 					t.Error("expected error when calling getRepositoryURL")
@@ -96,86 +120,1007 @@ func Test_getRepositoryURL(t *testing.T) {
 			}
 
 			if url != tt.expect {
-				t.Errorf("expected '%s', got '%s", tt.expect, url)
+				t.Errorf("expected '%s', got '%s'", tt.expect, url)
 			}
 		})
 	}
 }
 
-func Test_getBranch(t *testing.T) {
-	dir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+func TestCheckAllResourcesRunning(t *testing.T) {
 
-	r, err := git.PlainInit(dir, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = getBranch(context.TODO(), dir)
-	if err == nil {
-		t.Fatal("expected no-branch error")
-	}
-
-	filename := filepath.Join(dir, "example-git-file")
-	if err := ioutil.WriteFile(filename, []byte("hello world!"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	w, err := r.Worktree()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := w.Add("example-git-file"); err != nil {
-		t.Fatal(err)
-	}
-
-	commit, err := w.Commit("example go-git commit", &git.CommitOptions{
-		Author: &object.Signature{
-			Name:  "John Doe",
-			Email: "john@doe.org",
-			When:  time.Now(),
+	var tests = []struct {
+		resourceStatus map[string]string
+		name           string
+		expectError    bool
+		expectResult   bool
+	}{
+		{
+			name: "all-running",
+			resourceStatus: map[string]string{
+				"1": okteto.RunningStatus,
+				"2": okteto.CompletedStatus,
+				"3": okteto.NotRunningStatus,
+			},
+			expectError:  false,
+			expectResult: true,
 		},
-	})
-	if err != nil {
-		t.Fatal(err)
+		{
+			name: "pulling",
+			resourceStatus: map[string]string{
+				"1": okteto.RunningStatus,
+				"2": okteto.CompletedStatus,
+				"3": okteto.NotRunningStatus,
+				"4": okteto.PullingStatus,
+			},
+			expectError:  false,
+			expectResult: false,
+		},
+		{
+			name: "progressing",
+			resourceStatus: map[string]string{
+				"1": okteto.RunningStatus,
+				"2": okteto.CompletedStatus,
+				"3": okteto.NotRunningStatus,
+				"4": okteto.ProgressingStatus,
+			},
+			expectError:  false,
+			expectResult: false,
+		},
+		{
+			name: "booting",
+			resourceStatus: map[string]string{
+				"1": okteto.RunningStatus,
+				"2": okteto.CompletedStatus,
+				"3": okteto.NotRunningStatus,
+				"4": okteto.BootingStatus,
+			},
+			expectError:  false,
+			expectResult: false,
+		},
+		{
+			name: "error",
+			resourceStatus: map[string]string{
+				"1": okteto.RunningStatus,
+				"2": okteto.CompletedStatus,
+				"3": okteto.NotRunningStatus,
+				"4": okteto.PullingStatus,
+				"5": okteto.ProgressingStatus,
+				"6": okteto.BootingStatus,
+				"7": okteto.ErrorStatus,
+			},
+			expectError:  true,
+			expectResult: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := CheckAllResourcesRunning(tt.name, tt.resourceStatus)
+			if tt.expectError && err == nil || !tt.expectError && err != nil {
+				t.Errorf("expected error '%t', got '%v'", tt.expectError, err)
+			}
+			if tt.expectResult != result {
+				t.Errorf("expected result '%t', got '%t'", tt.expectResult, result)
+			}
+		})
+	}
+}
+
+func TestDeployPipelineSuccessful(t *testing.T) {
+	ctx := context.Background()
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts: map[string]*okteto.Context{
+			"test": {},
+		},
+	}
+	response := &client.FakePipelineResponses{
+		DeployResponse: &types.GitDeployResponse{
+			Action: &types.Action{
+				ID:   "test",
+				Name: "test",
+			},
+		},
+	}
+	pc := &Command{
+		okClient: &client.FakeOktetoClient{
+			PipelineClient: client.NewFakePipelineClient(response),
+		},
+		k8sClientProvider: test.NewFakeK8sProvider(),
+	}
+	opts := &DeployOptions{
+		Repository: "http://stest",
+		Name:       "test",
+	}
+	err := pc.ExecuteDeployPipeline(ctx, opts)
+	assert.NoError(t, err)
+}
+
+func TestDeployPipelineSuccessfulWithWait(t *testing.T) {
+	ctx := context.Background()
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts: map[string]*okteto.Context{
+			"test": {},
+		},
+	}
+	response := &client.FakePipelineResponses{
+		DeployResponse: &types.GitDeployResponse{
+			Action: &types.Action{
+				ID:   "test",
+				Name: "test",
+			},
+		},
+		ResourcesMap: map[string]string{
+			"svc":  okteto.CompletedStatus,
+			"svc2": okteto.RunningStatus,
+		},
 	}
 
-	headRef, err := r.Head()
-	if err != nil {
-		t.Fatal(err)
+	cmap := &apiv1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pipeline.TranslatePipelineName("test"),
+			Namespace: "test",
+			Labels:    map[string]string{},
+		},
+		Data: nil,
 	}
 
-	ref := plumbing.NewHashReference("refs/heads/my-branch", headRef.Hash())
-	if err := r.Storer.SetReference(ref); err != nil {
-		t.Fatal(err)
+	pc := &Command{
+		okClient: &client.FakeOktetoClient{
+			PipelineClient: client.NewFakePipelineClient(response),
+			StreamClient:   client.NewFakeStreamClient(&client.FakeStreamResponse{}),
+		},
+		k8sClientProvider: test.NewFakeK8sProvider(cmap),
+	}
+	opts := &DeployOptions{
+		Repository: "https://test",
+		Name:       "test",
+		Namespace:  "test",
+		Wait:       true,
+		Timeout:    2 * time.Second,
+	}
+	err := pc.ExecuteDeployPipeline(ctx, opts)
+	assert.NoError(t, err)
+}
+
+func newWaitTestCommand(resources map[string]string, objects ...runtime.Object) *Command {
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts: map[string]*okteto.Context{
+			"test": {},
+		},
+	}
+	response := &client.FakePipelineResponses{
+		DeployResponse: &types.GitDeployResponse{
+			Action: &types.Action{
+				ID:   "test",
+				Name: "test",
+			},
+		},
+		ResourcesMap: resources,
+	}
+	return &Command{
+		okClient: &client.FakeOktetoClient{
+			PipelineClient: client.NewFakePipelineClient(response),
+			StreamClient:   client.NewFakeStreamClient(&client.FakeStreamResponse{}),
+		},
+		k8sClientProvider: test.NewFakeK8sProvider(objects...),
+	}
+}
+
+func TestDeployPipelineWithWaitChecksResources(t *testing.T) {
+	pc := newWaitTestCommand(map[string]string{"svc": okteto.ErrorStatus})
+	opts := &DeployOptions{
+		Repository: "https://test",
+		Name:       "test",
+		Namespace:  "test",
+		Wait:       true,
+		Timeout:    2 * time.Second,
 	}
 
-	if err := w.Checkout(&git.CheckoutOptions{
-		Branch: ref.Name(),
-	}); err != nil {
-		t.Fatal(err)
+	err := pc.ExecuteDeployPipeline(context.Background(), opts)
+
+	require.ErrorContains(t, err, "repository 'test' deployed with errors")
+}
+
+func inProgressPipelineConfigMap() *apiv1.ConfigMap {
+	return &apiv1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pipeline.TranslatePipelineName("test"),
+			Namespace: "test",
+		},
+		Data: map[string]string{
+			"status":     pipeline.ProgressingStatus,
+			"actionLock": "lock",
+			"actionName": "not-cli",
+		},
+	}
+}
+
+func TestDeployPipelineWaitingForExistingActionChecksResources(t *testing.T) {
+	pc := newWaitTestCommand(map[string]string{"svc": okteto.ErrorStatus}, inProgressPipelineConfigMap())
+	opts := &DeployOptions{
+		Repository:   "https://test",
+		Name:         "test",
+		Namespace:    "test",
+		SkipIfExists: true,
+		Wait:         true,
+		Timeout:      2 * time.Second,
 	}
 
-	b, err := getBranch(context.TODO(), dir)
-	if err != nil {
-		t.Fatal(err)
+	err := pc.ExecuteDeployPipeline(context.Background(), opts)
+
+	require.ErrorContains(t, err, "repository 'test' deployed with errors")
+}
+
+func TestDeployPipelineWithWaitDoesNotExportDependencyEnvs(t *testing.T) {
+	t.Setenv("OKTETO_DEPENDENCY_TEST_VARIABLE_PASSWORD", "")
+	encoded := base64.StdEncoding.EncodeToString([]byte(`{"PASSWORD":"secret"}`))
+	cmap := &apiv1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pipeline.TranslatePipelineName("test"),
+			Namespace: "test",
+		},
+		Data: map[string]string{constants.OktetoDependencyEnvsKey: encoded},
+	}
+	pc := newWaitTestCommand(map[string]string{"svc": okteto.RunningStatus}, cmap)
+	opts := &DeployOptions{
+		Repository: "https://test",
+		Name:       "test",
+		Namespace:  "test",
+		Wait:       true,
+		Timeout:    2 * time.Second,
 	}
 
-	if b != "my-branch" {
-		t.Errorf("expected branch my-branch, got %s", b)
+	err := pc.ExecuteDeployPipeline(context.Background(), opts)
+
+	require.NoError(t, err)
+	require.Empty(t, os.Getenv("OKTETO_DEPENDENCY_TEST_VARIABLE_PASSWORD"))
+}
+
+func TestDeployWithError(t *testing.T) {
+	ctx := context.Background()
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts: map[string]*okteto.Context{
+			"test": {},
+		},
+	}
+	deployErr := fmt.Errorf("error deploying test")
+	response := &client.FakePipelineResponses{
+		DeployErr: deployErr,
+	}
+	pc := &Command{
+		okClient: &client.FakeOktetoClient{
+			PipelineClient: client.NewFakePipelineClient(response),
+		},
+		k8sClientProvider: test.NewFakeK8sProvider(),
+	}
+	opts := &DeployOptions{
+		Repository: "https://test",
+		Name:       "test",
+	}
+	err := pc.ExecuteDeployPipeline(ctx, opts)
+	assert.ErrorIs(t, err, deployErr)
+}
+
+func TestDeployPipelineSuccessfulWithWaitStreamError(t *testing.T) {
+	ctx := context.Background()
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts: map[string]*okteto.Context{
+			"test": {},
+		},
+	}
+	response := &client.FakePipelineResponses{
+		DeployResponse: &types.GitDeployResponse{
+			Action: &types.Action{
+				ID:   "test",
+				Name: "test",
+			},
+		},
+		ResourcesMap: map[string]string{
+			"svc":  okteto.CompletedStatus,
+			"svc2": okteto.RunningStatus,
+		},
 	}
 
-	if err := w.Checkout(&git.CheckoutOptions{
-		Hash: commit,
-	}); err != nil {
-		t.Fatal(err)
+	cmap := &apiv1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pipeline.TranslatePipelineName("test"),
+			Namespace: "test",
+			Labels:    map[string]string{},
+		},
+		Data: nil,
 	}
 
-	if _, err := getBranch(context.TODO(), dir); err == nil {
-		t.Fatal("didn't fail when getting a non branch")
+	pc := &Command{
+		okClient: &client.FakeOktetoClient{
+			PipelineClient: client.NewFakePipelineClient(response),
+			StreamClient:   client.NewFakeStreamClient(&client.FakeStreamResponse{StreamErr: errors.New("error")}),
+		},
+		k8sClientProvider: test.NewFakeK8sProvider(cmap),
 	}
+	opts := &DeployOptions{
+		Repository: "https://test",
+		Name:       "test",
+		Namespace:  "test",
+		Wait:       true,
+		Timeout:    2 * time.Second,
+	}
+	err := pc.ExecuteDeployPipeline(ctx, opts)
+	assert.NoError(t, err)
+}
+
+func Test_DeployPipelineWithReuseParamsNotFoundError(t *testing.T) {
+	ctx := context.Background()
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts: map[string]*okteto.Context{
+			"test": {},
+		},
+	}
+	pc := &Command{
+		k8sClientProvider: test.NewFakeK8sProvider(),
+	}
+	opts := &DeployOptions{
+		Repository:  "https://test",
+		Name:        "test",
+		ReuseParams: true,
+	}
+	err := pc.ExecuteDeployPipeline(ctx, opts)
+	assert.ErrorIs(t, err, errUnableToReuseParams)
+}
+
+func Test_DeployPipelineWithReuseParamsSuccess(t *testing.T) {
+	ctx := context.Background()
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts: map[string]*okteto.Context{
+			"test": {},
+		},
+	}
+
+	fakePipelineDeployResponses := &client.FakePipelineResponses{}
+	fakePipelineClient := client.NewFakePipelineClient(
+		fakePipelineDeployResponses,
+	)
+	pc := &Command{
+		okClient: &client.FakeOktetoClient{
+			PipelineClient: fakePipelineClient,
+		},
+		k8sClientProvider: test.NewFakeK8sProvider(
+			&v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "okteto-git-test",
+					Namespace: "test",
+					Labels: map[string]string{
+						"label.okteto.com/labeltest": "true",
+					},
+				},
+				Data: map[string]string{
+					"branch":   "testing",
+					"filename": "file",
+				},
+			},
+		),
+	}
+	opts := &DeployOptions{
+		Repository:  "https://test",
+		Name:        "test",
+		Namespace:   "test",
+		ReuseParams: true,
+	}
+	err := pc.ExecuteDeployPipeline(ctx, opts)
+	assert.NoError(t, err)
+
+	assert.NotEmpty(t, fakePipelineDeployResponses.DeployOpts.WorkflowID)
+	fakePipelineDeployResponses.DeployOpts.WorkflowID = ""
+	assert.Equal(t, types.PipelineDeployOptions{
+		Branch:    "testing",
+		Filename:  "file",
+		Labels:    []string{"labeltest"},
+		Namespace: "test",
+	}, fakePipelineDeployResponses.DeployOpts)
+}
+
+func Test_DeployPipelineWithSkipIfExists(t *testing.T) {
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts: map[string]*okteto.Context{
+			"test": {},
+		},
+	}
+
+	fakePipelineClientResponses := &client.FakePipelineResponses{}
+
+	tests := []struct {
+		cmd  *Command
+		opts *DeployOptions
+		name string
+	}{
+		{
+			name: "skip because deployed status",
+			cmd: &Command{
+				okClient: &client.FakeOktetoClient{
+					PipelineClient: client.NewFakePipelineClient(
+						fakePipelineClientResponses,
+					),
+				},
+				k8sClientProvider: test.NewFakeK8sProvider(
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "okteto-git-test",
+							Namespace: "test",
+							Labels: map[string]string{
+								"label.okteto.com/labeltest": "true",
+							},
+						},
+						Data: map[string]string{
+							"status":   pipeline.DeployedStatus,
+							"branch":   "testing",
+							"filename": "file",
+						},
+					},
+				),
+			},
+			opts: &DeployOptions{
+				Repository:   "https://test",
+				Name:         "test",
+				Namespace:    "test",
+				SkipIfExists: true,
+			},
+		},
+		{
+			name: "skip because progressing status",
+			cmd: &Command{
+				okClient: &client.FakeOktetoClient{
+					PipelineClient: client.NewFakePipelineClient(
+						fakePipelineClientResponses,
+					),
+				},
+				k8sClientProvider: test.NewFakeK8sProvider(
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "okteto-git-test",
+							Namespace: "test",
+							Labels: map[string]string{
+								"label.okteto.com/labeltest": "true",
+							},
+						},
+						Data: map[string]string{
+							"status":   pipeline.ProgressingStatus,
+							"branch":   "testing",
+							"filename": "file",
+						},
+					},
+				),
+			},
+			opts: &DeployOptions{
+				Repository:   "https://test",
+				Name:         "test",
+				Namespace:    "test",
+				SkipIfExists: true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		ctx := context.Background()
+
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cmd.ExecuteDeployPipeline(ctx, tt.opts)
+			require.NoError(t, err)
+			require.Zero(t, fakePipelineClientResponses.CallCount)
+		})
+	}
+}
+
+func Test_DeployPipelineWithSkipIfExistsAndWait(t *testing.T) {
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts: map[string]*okteto.Context{
+			"test": {},
+		},
+	}
+
+	fakePipelineClientResponses := &client.FakePipelineResponses{}
+
+	tests := []struct {
+		cmd  *Command
+		opts *DeployOptions
+		name string
+	}{
+		{
+			name: "wait and canStreamPrevLogs",
+			cmd: &Command{
+				okClient: &client.FakeOktetoClient{
+					PipelineClient: client.NewFakePipelineClient(
+						fakePipelineClientResponses,
+					),
+					StreamClient: client.NewFakeStreamClient(
+						&client.FakeStreamResponse{},
+					),
+				},
+				k8sClientProvider: test.NewFakeK8sProvider(
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "okteto-git-test",
+							Namespace: "test",
+							Labels: map[string]string{
+								"label.okteto.com/labeltest": "true",
+							},
+						},
+						Data: map[string]string{
+							"branch":     "testing",
+							"filename":   "file",
+							"actionLock": "lock",
+							"actionName": "not-cli",
+						},
+					},
+				),
+			},
+			opts: &DeployOptions{
+				Repository:   "https://test",
+				Name:         "test",
+				Namespace:    "test",
+				SkipIfExists: true,
+				Wait:         true,
+				Timeout:      1 * time.Minute,
+			},
+		},
+		{
+			name: "wait and canStreamPrevLogs with err in streaming ignore err",
+			cmd: &Command{
+				okClient: &client.FakeOktetoClient{
+					PipelineClient: client.NewFakePipelineClient(
+						fakePipelineClientResponses,
+					),
+					StreamClient: client.NewFakeStreamClient(
+						&client.FakeStreamResponse{
+							StreamErr: assert.AnError,
+						},
+					),
+				},
+				k8sClientProvider: test.NewFakeK8sProvider(
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "okteto-git-test",
+							Namespace: "test",
+							Labels: map[string]string{
+								"label.okteto.com/labeltest": "true",
+							},
+						},
+						Data: map[string]string{
+							"branch":     "testing",
+							"filename":   "file",
+							"actionLock": "lock",
+							"actionName": "not-cli",
+						},
+					},
+				),
+			},
+			opts: &DeployOptions{
+				Repository:   "https://test",
+				Name:         "test",
+				Namespace:    "test",
+				SkipIfExists: true,
+				Wait:         true,
+				Timeout:      1 * time.Minute,
+			},
+		},
+		{
+			name: "wait and not canStreamPrevLogs",
+			cmd: &Command{
+				okClient: &client.FakeOktetoClient{
+					PipelineClient: client.NewFakePipelineClient(
+						fakePipelineClientResponses,
+					),
+					StreamClient: client.NewFakeStreamClient(
+						&client.FakeStreamResponse{},
+					),
+				},
+				k8sClientProvider: test.NewFakeK8sProvider(
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "okteto-git-test",
+							Namespace: "test",
+							Labels: map[string]string{
+								"label.okteto.com/labeltest": "true",
+							},
+						},
+						Data: map[string]string{
+							"status":     pipeline.DeployedStatus,
+							"branch":     "testing",
+							"filename":   "file",
+							"actionLock": "",
+							"actionName": "",
+						},
+					},
+				),
+			},
+			opts: &DeployOptions{
+				Repository:   "https://test",
+				Name:         "test",
+				Namespace:    "test",
+				SkipIfExists: true,
+				Wait:         true,
+				Timeout:      1 * time.Minute,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		ctx := context.Background()
+
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cmd.ExecuteDeployPipeline(ctx, tt.opts)
+			require.NoError(t, err)
+			require.Zero(t, fakePipelineClientResponses.CallCount)
+		})
+	}
+}
+
+func TestFlagsToOptions(t *testing.T) {
+	tt := []struct {
+		expect *DeployOptions
+		name   string
+		flags  deployFlags
+	}{
+		{
+			name:   "no flags",
+			flags:  deployFlags{},
+			expect: &DeployOptions{},
+		},
+		{
+			name: "all flags ",
+			flags: deployFlags{
+				branch:               "branch",
+				repository:           "repository",
+				name:                 "name",
+				namespace:            "namespace",
+				wait:                 true,
+				timeout:              2 * time.Second,
+				labels:               []string{"label1", "label2"},
+				variables:            []string{"var1=1", "var2=2"},
+				reuseParams:          true,
+				redeployDependencies: true,
+			},
+			expect: &DeployOptions{
+				Branch:               "branch",
+				Repository:           "repository",
+				Name:                 "name",
+				Namespace:            "namespace",
+				Wait:                 true,
+				Timeout:              2 * time.Second,
+				Labels:               []string{"label1", "label2"},
+				Variables:            []string{"var1=1", "var2=2"},
+				ReuseParams:          true,
+				RedeployDependencies: true,
+			},
+		},
+	}
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := tc.flags.toOptions(false)
+			assert.Equal(t, tc.expect, opts)
+		})
+	}
+}
+
+func Test_applyOverrideToOptions(t *testing.T) {
+	opts := &DeployOptions{
+		Wait:    true,
+		Timeout: 1 * time.Minute,
+	}
+	override := &DeployOptions{
+		Name:       "test",
+		Namespace:  "testing",
+		File:       "filename",
+		Repository: "repository",
+		Branch:     "branch",
+		Variables:  []string{"KEY=value"},
+		Labels:     []string{"testlabel"},
+	}
+
+	applyOverrideToOptions(opts, override)
+
+	require.Equal(t, &DeployOptions{
+		Name:       "test",
+		Namespace:  "testing",
+		File:       "filename",
+		Repository: "repository",
+		Branch:     "branch",
+		Variables:  []string{"KEY=value"},
+		Labels:     []string{"testlabel"},
+		Wait:       true,
+		Timeout:    1 * time.Minute,
+	}, opts)
+}
+
+func Test_cfgToDeployOptions(t *testing.T) {
+	tests := []struct {
+		input    *v1.ConfigMap
+		expected *DeployOptions
+		name     string
+	}{
+		{
+			name:     "empty input",
+			expected: nil,
+		},
+		{
+			name: "empty namespace",
+			input: &v1.ConfigMap{
+				Data: map[string]string{
+					"name":       "test-name",
+					"filename":   "test-filename",
+					"file":       "test-file",
+					"repository": "test-repository",
+					"branch":     "test-branch",
+					"variables":  "",
+				},
+			},
+			expected: &DeployOptions{
+				Name:       "test-name",
+				File:       "test-filename",
+				Repository: "test-repository",
+				Branch:     "test-branch",
+			},
+		},
+		{
+			name: "with labels and namespace",
+			input: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test-namespace",
+					Labels: map[string]string{
+						"label.okteto.com/testing": "true",
+						"ignored.label":            "true",
+					},
+				},
+				Data: map[string]string{
+					"name":       "test-name",
+					"namespace":  "test-namespace",
+					"filename":   "test-filename",
+					"file":       "test-file",
+					"repository": "test-repository",
+					"branch":     "test-branch",
+					"variables":  "",
+				},
+			},
+			expected: &DeployOptions{
+				Name:       "test-name",
+				Namespace:  "test-namespace",
+				File:       "test-filename",
+				Repository: "test-repository",
+				Branch:     "test-branch",
+				Labels:     []string{"testing"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := cfgToDeployOptions(tt.input)
+			require.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func Test_parseVariablesListFromCfgVariablesString(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		expected    []string
+		expectedErr bool
+	}{
+		{
+			name:     "empty input",
+			input:    "",
+			expected: nil,
+		},
+		{
+			name:        "invalid input",
+			input:       "not-encoded-string",
+			expectedErr: true,
+			expected:    nil,
+		},
+		{
+			name:     "valid input",
+			input:    "W3sibmFtZSI6IktFWSIsInZhbHVlIjoidmFsdWUifV0=",
+			expected: []string{"KEY=value"},
+		},
+	}
+
+	for _, tt := range tests {
+		got, err := parseVariablesListFromCfgVariablesString(tt.input)
+		require.Truef(t, tt.expectedErr == (err != nil), fmt.Sprintf("got unexpected error %v", err))
+		require.Equal(t, tt.expected, got)
+	}
+}
+
+func Test_parseEnvironmentLabelFromLabelsMap(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    map[string]string
+		expected []string
+	}{
+		{
+			name:  "empty input",
+			input: nil,
+		},
+		{
+			name: "with environment labels input",
+			input: map[string]string{
+				"label.okteto.com":         "true",
+				"label.okteto.com/":        "true",
+				"label.okteto.com/testing": "true",
+				"dev.okteto.com":           "true",
+			},
+			expected: []string{"testing"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseEnvironmentLabelFromLabelsMap(tt.input)
+
+			require.Equal(t, got, tt.expected)
+		})
+	}
+}
+
+type capturingPipelineTracker struct {
+	captured analytics.DeployPipelineTriggeredMetadata
+}
+
+func (c *capturingPipelineTracker) TrackDeployPipelineTriggered(_ context.Context, m analytics.DeployPipelineTriggeredMetadata) {
+	c.captured = m
+}
+
+func TestExecuteDeployPipeline_AnalyticsSourcedFromEnv(t *testing.T) {
+	ctx := context.Background()
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts:       map[string]*okteto.Context{"test": {}},
+	}
+	t.Setenv(constants.OktetoWorkflowIDEnvVar, "wf-from-env")
+	t.Setenv(constants.OktetoParentWorkflowIDEnvVar, "parent-from-env")
+	t.Setenv(constants.OktetoDeployTypeEnvVar, "compose")
+
+	tracker := &capturingPipelineTracker{}
+	pc := &Command{
+		okClient: &client.FakeOktetoClient{
+			PipelineClient: client.NewFakePipelineClient(&client.FakePipelineResponses{
+				DeployResponse: &types.GitDeployResponse{Action: &types.Action{ID: "test", Name: "test"}},
+			}),
+		},
+		k8sClientProvider: test.NewFakeK8sProvider(),
+		analyticsTracker:  tracker,
+	}
+
+	err := pc.ExecuteDeployPipeline(ctx, &DeployOptions{Repository: "http://stest", Name: "test"})
+	require.NoError(t, err)
+	require.Equal(t, "wf-from-env", tracker.captured.WorkflowID)
+	require.Equal(t, "parent-from-env", tracker.captured.ParentWorkflowID)
+	require.Equal(t, "compose", tracker.captured.DeployType)
+}
+
+func TestExecuteDeployPipeline_AnalyticsFallbackWhenEnvUnset(t *testing.T) {
+	ctx := context.Background()
+	okteto.CurrentStore = &okteto.ContextStore{
+		CurrentContext: "test",
+		Contexts:       map[string]*okteto.Context{"test": {}},
+	}
+	t.Setenv(constants.OktetoWorkflowIDEnvVar, "")
+	t.Setenv(constants.OktetoParentWorkflowIDEnvVar, "")
+	t.Setenv(constants.OktetoDeployTypeEnvVar, "")
+
+	tracker := &capturingPipelineTracker{}
+	pc := &Command{
+		okClient: &client.FakeOktetoClient{
+			PipelineClient: client.NewFakePipelineClient(&client.FakePipelineResponses{
+				DeployResponse: &types.GitDeployResponse{Action: &types.Action{ID: "test", Name: "test"}},
+			}),
+		},
+		k8sClientProvider: test.NewFakeK8sProvider(),
+		analyticsTracker:  tracker,
+	}
+
+	// opts.ParentWorkflowID feeds the GraphQL mutation but must NOT leak into the analytics event,
+	// which is sourced solely from OKTETO_PARENT_WORKFLOW_ID.
+	err := pc.ExecuteDeployPipeline(ctx, &DeployOptions{Repository: "http://stest", Name: "test", ParentWorkflowID: "opts-parent-should-not-leak"})
+	require.NoError(t, err)
+	require.NotEmpty(t, tracker.captured.WorkflowID)
+	require.Empty(t, tracker.captured.ParentWorkflowID)
+	require.Equal(t, "git_url", tracker.captured.DeployType)
+}
+
+func existingDeployConfigMap(status string) *apiv1.ConfigMap {
+	return &apiv1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pipeline.TranslatePipelineName("test"),
+			Namespace: "test",
+		},
+		Data: map[string]string{"status": status},
+	}
+}
+
+func waitForExistingDeployWith(t *testing.T, status string, resources map[string]string) error {
+	t.Helper()
+	previous := existingDeployPollInterval
+	existingDeployPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { existingDeployPollInterval = previous })
+	pc := newWaitTestCommand(resources, existingDeployConfigMap(status))
+	c, _, err := pc.k8sClientProvider.Provide(nil)
+	require.NoError(t, err)
+	opts := &DeployOptions{Name: "test", Namespace: "test", Timeout: 2 * time.Second}
+
+	return pc.waitForExistingDeploy(context.Background(), c, pipeline.TranslatePipelineName("test"), opts)
+}
+
+func TestWaitForExistingDeployFailsWhenThePipelineFails(t *testing.T) {
+	err := waitForExistingDeployWith(t, pipeline.ErrorStatus, map[string]string{"svc": okteto.RunningStatus})
+
+	require.EqualError(t, err, "repository 'test' failed to deploy")
+}
+
+func TestWaitForExistingDeployChecksResources(t *testing.T) {
+	err := waitForExistingDeployWith(t, pipeline.DeployedStatus, map[string]string{"svc": okteto.ErrorStatus})
+
+	require.ErrorContains(t, err, "repository 'test' deployed with errors")
+}
+
+func TestWaitForExistingDeployTimesOut(t *testing.T) {
+	err := waitForExistingDeployWith(t, pipeline.ProgressingStatus, map[string]string{"svc": okteto.RunningStatus})
+
+	require.EqualError(t, err, "timed out waiting for repository 'test' to be deployed")
+}
+
+func TestWaitForExistingDeployHealthCheckGetsTheTimeLeft(t *testing.T) {
+	// the deploy is found finished after a poll interval, and its resources never get running
+	pc := newWaitTestCommand(map[string]string{"svc": okteto.ProgressingStatus}, existingDeployConfigMap(pipeline.DeployedStatus))
+	c, _, err := pc.k8sClientProvider.Provide(nil)
+	require.NoError(t, err)
+	opts := &DeployOptions{Name: "test", Namespace: "test", Timeout: 1500 * time.Millisecond}
+	start := time.Now()
+
+	err = pc.waitForExistingDeploy(context.Background(), c, pipeline.TranslatePipelineName("test"), opts)
+
+	require.ErrorContains(t, err, "deploy didn't finish")
+	// with the whole timeout again for the health check, it would take a poll interval more
+	require.Less(t, time.Since(start), 2*time.Second)
+}
+
+func TestDeployPipelineSendsTheScheduleToTheOutput(t *testing.T) {
+	out := &recordingDeployOutput{}
+	pc := newWaitTestCommand(map[string]string{})
+	opts := &DeployOptions{Repository: "https://test", Name: "test", Namespace: "test", Output: out}
+
+	require.NoError(t, pc.ExecuteDeployPipeline(context.Background(), opts))
+
+	require.Equal(t, []string{
+		"spinner: Deploying repository 'test'...",
+		"success: Repository 'test' scheduled for deployment",
+	}, out.recorded())
+}
+
+func TestDeployPipelineSendsTheDeployAndItsLogsToTheOutput(t *testing.T) {
+	out := &recordingDeployOutput{}
+	pc := newWaitTestCommand(map[string]string{"svc": okteto.RunningStatus})
+	pc.okClient.(*client.FakeOktetoClient).StreamClient = client.NewFakeStreamClient(&client.FakeStreamResponse{Lines: []string{"creating tables"}})
+	opts := &DeployOptions{Repository: "https://test", Name: "test", Namespace: "test", Wait: true, Timeout: 2 * time.Second, Output: out}
+
+	require.NoError(t, pc.ExecuteDeployPipeline(context.Background(), opts))
+
+	// the logs are streamed while the health check runs, so they can come before or after its message
+	recorded := out.recorded()
+	require.ElementsMatch(t, []string{
+		"spinner: Deploying repository 'test'...",
+		"spinner: Waiting for repository 'test' to be deployed...",
+		"creating tables",
+		"spinner: Waiting for containers to be healthy...",
+		"success: Repository 'test' successfully deployed",
+	}, recorded)
+	require.Equal(t, []string{"spinner: Deploying repository 'test'...", "spinner: Waiting for repository 'test' to be deployed..."}, recorded[:2])
+	require.Equal(t, "success: Repository 'test' successfully deployed", recorded[len(recorded)-1])
 }

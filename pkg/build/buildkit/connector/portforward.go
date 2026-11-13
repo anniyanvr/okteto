@@ -1,0 +1,553 @@
+// Copyright 2025 The Okteto Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package connector
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	ioutil "io"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/moby/buildkit/client"
+	"github.com/okteto/okteto/pkg/analytics"
+	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/env"
+	oktetoErrors "github.com/okteto/okteto/pkg/errors"
+	"github.com/okteto/okteto/pkg/k8s/forward"
+	"github.com/okteto/okteto/pkg/log/io"
+	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
+	"github.com/okteto/okteto/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/client-go/tools/portforward"
+)
+
+// getUserFacingQueueMessage returns the user-facing message for queue waiting
+func getUserFacingQueueMessage(reason string, position, total int) string {
+	if reason == "NO_PODS_AVAILABLE" {
+		return "Waiting for the Okteto Build service to become available"
+	}
+	return fmt.Sprintf("Waiting in the Okteto Build queue (position %d of %d)", position, total)
+}
+
+const (
+	defaultMaxWaitTimePortForward  = 10 * time.Minute
+	initialPollIntervalPortForward = 1 * time.Second
+	maxPollIntervalPortForward     = 10 * time.Second
+	backoffMultiplierPortForward   = 2.0
+	buildkitQueueWaitTimeoutEnvVar = "OKTETO_BUILDKIT_QUEUE_WAIT_TIMEOUT"
+)
+
+type PortForwarderOktetoContextInterface interface {
+	GetCurrentCertStr() string
+	GetCurrentBuilder() string
+	GetCurrentToken() string
+	GetNamespace() string
+	GetGlobalNamespace() string
+	GetCurrentUser() string
+	GetCurrentCfg() *clientcmdapi.Config
+}
+
+// PortForwarder manages a port forward connection to the buildkit server.
+type PortForwarder struct {
+	sessionID    string
+	okCtx        PortForwarderOktetoContextInterface
+	oktetoClient types.OktetoInterface
+	k8sClient    kubernetes.Interface
+	restConfig   *rest.Config
+	ioCtrl       *io.Controller
+	maxWaitTime  time.Duration
+	// Connection state
+	stopChan       chan struct{}
+	readyChan      chan struct{}
+	errChan        chan error
+	localPort      int
+	podName        string
+	isActive       bool
+	mu             sync.Mutex
+	buildkitClient *client.Client
+	waiter         *Waiter
+	// portForward starts the port forward to podName, reporting through the connection channels
+	portForward func() error
+
+	// Metrics collector for analytics
+	metrics *ConnectorMetrics
+}
+
+// NewPortForwarder creates a new port forwarder. It forwards the port to the buildkit server.
+func NewPortForwarder(ctx context.Context, okCtx PortForwarderOktetoContextInterface, ioCtrl *io.Controller, tracker BuildkitConnectionTracker) (*PortForwarder, error) {
+	oktetoClient, err := okteto.NewOktetoClient()
+	if err != nil {
+		return nil, fmt.Errorf("could not create okteto client: %w", err)
+	}
+	sessionID := uuid.New().String()
+
+	k8sClient, restConfig, err := getPortForwardK8sClient(oktetoClient, okCtx)
+	if err != nil {
+		return nil, fmt.Errorf("could not get port forward k8s client: %w", err)
+	}
+
+	// Use IANA ephemeral port range for buildkit port forwarding to minimize conflicts
+	port, err := model.GetAvailablePortInRange(model.Localhost, model.IANAEphemeralPortStart, model.IANAEphemeralPortEnd)
+	if err != nil {
+		return nil, fmt.Errorf("could not get available port: %w", err)
+	}
+
+	maxWaitTime := env.LoadTimeOrDefault(buildkitQueueWaitTimeoutEnvVar, defaultMaxWaitTimePortForward)
+	waiter := NewBuildkitClientReadinessWaiter(ioCtrl)
+
+	pf := &PortForwarder{
+		sessionID:    sessionID,
+		oktetoClient: oktetoClient,
+		k8sClient:    k8sClient,
+		restConfig:   restConfig,
+		okCtx:        okCtx,
+		ioCtrl:       ioCtrl,
+		maxWaitTime:  maxWaitTime,
+		waiter:       waiter,
+		stopChan:     make(chan struct{}, 1),
+		readyChan:    make(chan struct{}, 1),
+		localPort:    port,
+		metrics:      NewConnectorMetrics(analytics.ConnectorTypePortForward, sessionID, tracker),
+	}
+	pf.portForward = pf.establishPortForward
+
+	// We need to call it once in order to check if the buildkit pod endpoint is available
+	response, err := pf.oktetoClient.Buildkit().GetLeastLoadedBuildKitPod(ctx, pf.sessionID)
+	if err != nil {
+		if errors.Is(err, okteto.ErrIncompatibleBackend) {
+			pf.metrics.SetErrReason("IncompatibleBackend")
+		} else {
+			pf.metrics.SetErrReason("BackendInternalError")
+		}
+		pf.metrics.TrackFailure()
+		return nil, fmt.Errorf("could not get least loaded buildkit pod: %w", err)
+	}
+
+	if response.PodName != "" {
+		pf.metrics.TrackSuccess()
+		pf.podName = response.PodName
+	}
+	return pf, nil
+}
+
+// buildkitPort is the port where buildkit listens inside the pod
+const buildkitPort = 1234
+
+// errPortForwardCreation is the user-facing cause of any port forward failure other than a local port conflict
+var errPortForwardCreation = errors.New("port forward creation to BuildKit has failed")
+
+// localPortInUseError is the cause of a port forward that cannot listen on its local port
+type localPortInUseError struct {
+	port int
+}
+
+func (e localPortInUseError) Error() string {
+	return fmt.Sprintf("port %d is already in use", e.port)
+}
+
+// newPortForwardCreationUserError returns the user-facing error for a port forward
+// failure. It deliberately hides the raw cause, which must have been written to the
+// logs by the caller, so the console shows an intuitive message instead of a low-level
+// kubernetes connection error.
+func newPortForwardCreationUserError() oktetoErrors.UserError {
+	return oktetoErrors.UserError{
+		E:    errPortForwardCreation,
+		Hint: "Run the command again with the '--log-level=info' flag to get more information about the failure",
+	}
+}
+
+// Start establishes the port forward connection to the buildkit pod.
+// If already active, it reuses the existing connection.
+// If not active, it connects to the pod assigned to the session, or gets the least loaded pod
+// when there is none or the assigned one can no longer be reached.
+func (pf *PortForwarder) Start(ctx context.Context) error {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	if pf.isActive {
+		pf.ioCtrl.Logger().Infof("port forward connection is already active")
+		return nil
+	}
+
+	if pf.podName == "" {
+		return pf.connectToNewPod(ctx)
+	}
+
+	pf.ioCtrl.Logger().Infof("reusing buildkit pod %s assigned to the session", pf.podName)
+	pf.metrics.StartTracking()
+	err := pf.connect(ctx)
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil || !errors.Is(err, errPortForwardCreation) {
+		pf.trackConnectFailure(connectFailureReason(err))
+		return err
+	}
+	// The pod assigned to the session might be gone, e.g. removed by the BuildKit autoscaler
+	// in the idle gap between two builds of the same deploy. Images are pushed to the registry
+	// after each build, so the session can safely continue on another pod. Other port forward
+	// failures (e.g. an expired kubetoken) get the same single retry.
+	// The failure is tracked with its own reason, as the build can still succeed on the new pod.
+	pf.trackConnectFailure("AssignedPodUnreachable")
+	pf.ioCtrl.Logger().Infof("could not reach buildkit pod %s, requesting a new one", pf.podName)
+	retryErr := pf.connectToNewPod(ctx)
+	var userErr oktetoErrors.UserError
+	if retryErr == nil || ctx.Err() != nil || errors.As(retryErr, &userErr) {
+		return retryErr
+	}
+	// Keep the user-facing port forward error instead of a raw one, e.g. when the backend is unreachable.
+	// A cancellation during the retry is returned as is, so callers can still detect it.
+	pf.ioCtrl.Logger().Infof("could not connect to a new buildkit pod: %s", retryErr)
+	return err
+}
+
+// connectToNewPod gets the least loaded buildkit pod and connects to it
+func (pf *PortForwarder) connectToNewPod(ctx context.Context) error {
+	podName, err := pf.assignBuildkitPod(ctx)
+	if err != nil {
+		// assignBuildkitPod already tracked the failure with specific error reason
+		return fmt.Errorf("failed to assign buildkit pod: %w", err)
+	}
+	pf.podName = podName
+	if err := pf.connect(ctx); err != nil {
+		pf.trackConnectFailure(connectFailureReason(err))
+		return err
+	}
+	return nil
+}
+
+// connect establishes the port forward to podName and waits until it is ready.
+// Failures are tracked by the caller, which knows whether they can still be recovered.
+func (pf *PortForwarder) connect(ctx context.Context) error {
+	if err := pf.portForward(); err != nil {
+		pf.ioCtrl.Logger().Infof("failed to establish port forward: %s", err)
+		return newPortForwardCreationUserError()
+	}
+
+	if err := pf.waitUntilPortForwardIsReady(ctx); err != nil {
+		pf.ioCtrl.Logger().Infof("failed to wait until ready: %s", err)
+		return err
+	}
+
+	return nil
+}
+
+// trackConnectFailure sends a port forward failure event to analytics with the given reason
+func (pf *PortForwarder) trackConnectFailure(reason string) {
+	pf.metrics.SetErrReason(reason)
+	pf.metrics.TrackFailure()
+}
+
+// connectFailureReason returns the analytics reason of a failed port forward connection
+func connectFailureReason(err error) string {
+	var portErr localPortInUseError
+	switch {
+	case errors.As(err, &portErr):
+		return "LocalPortInUse"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "ContextCancelledWhileWaitingForPortForward"
+	default:
+		return "PortForwardCreation"
+	}
+}
+
+// assignBuildkitPod gets the least loaded buildkit pod and assigns it to this port forwarder
+func (pf *PortForwarder) assignBuildkitPod(ctx context.Context) (string, error) {
+	pollInterval := initialPollIntervalPortForward
+
+	// Start tracking metrics
+	pf.metrics.StartTracking()
+
+	sp := pf.ioCtrl.Out().Spinner("Waiting for the Okteto Build service to become available")
+	sp.Start()
+	defer sp.Stop()
+
+	// Track the last message to avoid duplicates
+	var lastMessage string
+
+	for {
+		if time.Since(pf.metrics.StartTime) >= pf.maxWaitTime {
+			pf.metrics.SetErrReason("QueueTimeout")
+			pf.metrics.TrackFailure()
+			return "", oktetoErrors.UserError{
+				E: fmt.Errorf("waiting in the Okteto Build queue timed out after %v", pf.maxWaitTime),
+				Hint: `You can:
+- Try again (queue may have cleared)
+- Contact your Okteto Admin to add build capacity`,
+			}
+		}
+
+		response, err := pf.oktetoClient.Buildkit().GetLeastLoadedBuildKitPod(ctx, pf.sessionID)
+		if err != nil {
+			if errors.Is(err, okteto.ErrIncompatibleBackend) {
+				pf.metrics.SetErrReason("IncompatibleBackend")
+			} else {
+				pf.metrics.SetErrReason("BackendInternalError")
+			}
+			pf.metrics.TrackFailure()
+			return "", fmt.Errorf("could not get least loaded buildkit pod: %w", err)
+		}
+
+		// Capture queue metrics
+		pf.metrics.RecordQueueStatus(response.QueuePosition, response.Reason)
+
+		if response.PodName != "" {
+			pf.ioCtrl.Logger().Infof("assigned buildkit pod: %s", response.PodName)
+			pf.metrics.TrackSuccess()
+			return response.PodName, nil
+		}
+
+		if response.TotalInQueue > 0 {
+			userMessage := getUserFacingQueueMessage(response.Reason, response.QueuePosition, response.TotalInQueue)
+
+			// Only update if the message has changed to avoid duplicates
+			if userMessage != lastMessage {
+				pf.ioCtrl.Logger().Infof("Waiting in queue: %s (position %d of %d)", response.Reason, response.QueuePosition, response.TotalInQueue)
+				sp.Stop()
+				sp = pf.ioCtrl.Out().Spinner(userMessage)
+				sp.Start()
+				defer sp.Stop()
+				lastMessage = userMessage
+			}
+		}
+
+		// Calculate wait duration as min(queue position, exponential backoff)
+		// This prioritizes early queue positions with faster refresh rates
+		waitDuration := min(time.Duration(response.QueuePosition)*time.Second, pollInterval)
+
+		select {
+		case <-time.After(waitDuration):
+			pollInterval = time.Duration(float64(pollInterval) * backoffMultiplierPortForward)
+			if pollInterval > maxPollIntervalPortForward {
+				pollInterval = maxPollIntervalPortForward
+			}
+		case <-ctx.Done():
+			pf.metrics.SetErrReason("ContextCancelledWhileWaitingForBuildkitPod")
+			pf.metrics.TrackFailure()
+			return "", fmt.Errorf("context cancelled while waiting for buildkit pod: %w", ctx.Err())
+		}
+	}
+}
+
+// establishPortForward creates the port forward to the buildkit pod
+func (pf *PortForwarder) establishPortForward() error {
+	pf.stopChan = make(chan struct{}, 1)
+	pf.readyChan = make(chan struct{}, 1)
+	pf.errChan = make(chan error, 1)
+
+	url := pf.k8sClient.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Namespace(pf.okCtx.GetGlobalNamespace()).
+		Name(pf.podName).
+		SubResource("portforward").URL()
+
+	dialer, err := forward.NewDialer(pf.restConfig, url)
+	if err != nil {
+		pf.metrics.SetErrReason("PortForwardCreation")
+		return fmt.Errorf("creating port forward dialer: %w", err)
+	}
+
+	ports := []string{fmt.Sprintf("%d:%d", pf.localPort, buildkitPort)}
+
+	forwarder, err := portforward.NewOnAddressesForStreaming(
+		dialer,
+		[]string{"127.0.0.1"},
+		ports,
+		pf.stopChan,
+		pf.readyChan,
+		ioutil.Discard,
+		new(bytes.Buffer),
+	)
+	if err != nil {
+		pf.metrics.SetErrReason("PortForwardCreation")
+		return fmt.Errorf("failed to create port forwarder: %w", err)
+	}
+
+	// Bind this attempt's error channel: pf.errChan is reassigned on every retry, and a
+	// late failure from this goroutine must never leak into a newer attempt's channel.
+	errChan := pf.errChan
+	go func() {
+		if err := forwarder.ForwardPorts(); err != nil {
+			pf.handlePortForwardError(err, errChan)
+		}
+	}()
+
+	return nil
+}
+
+// handlePortForwardError reports a ForwardPorts failure and cleans up the connection state.
+// The error must be sent to errChan before acquiring pf.mu: Start() holds the lock while
+// blocked in waitUntilPortForwardIsReady, so locking first would deadlock the whole process.
+// errChan must be the channel of the attempt that failed, not read from pf.errChan, which
+// may already belong to a newer attempt.
+func (pf *PortForwarder) handlePortForwardError(err error, errChan chan<- error) {
+	pf.ioCtrl.Logger().Infof("port forward to buildkit finished with error: %s", err)
+	if containsAddressInUse(err) {
+		errChan <- oktetoErrors.UserError{
+			E:    localPortInUseError{port: pf.localPort},
+			Hint: "Check which process is using the port or free it and try again",
+		}
+		return
+	}
+	// errChan is buffered, so this never blocks even if nobody is waiting anymore
+	// (e.g. the connection dropped after the port forward was ready)
+	errChan <- err
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	// Start() may have already replaced the failed attempt with a new one (e.g. on another pod),
+	// whose connection state must not be released
+	if pf.errChan != errChan {
+		pf.ioCtrl.Logger().Infof("ignoring failure of a previous port forward attempt")
+		return
+	}
+	pf.podName = ""
+	pf.stop()
+}
+
+// waitUntilPortForwardIsReady waits for the port forward to be ready or context to be cancelled
+func (pf *PortForwarder) waitUntilPortForwardIsReady(ctx context.Context) error {
+	pf.ioCtrl.Logger().Infof("waiting for port forward to be ready to pod %s", pf.podName)
+
+	select {
+	case <-pf.readyChan:
+		pf.isActive = true
+		pf.ioCtrl.Logger().Infof("port forward to buildkit pod %s is ready on 127.0.0.1:%d", pf.podName, pf.localPort)
+		return nil
+	case err := <-pf.errChan:
+		pf.ioCtrl.Logger().Infof("port forward failed: %s", err)
+		// known failures already carry a user-facing message and hint
+		var userErr oktetoErrors.UserError
+		if errors.As(err, &userErr) {
+			return userErr
+		}
+		return newPortForwardCreationUserError()
+	case <-ctx.Done():
+		// Calling Stop() here would self-deadlock: Start() already holds pf.mu and the
+		// mutex is not reentrant. Close stopChan directly to terminate the forwarder.
+		close(pf.stopChan)
+		return fmt.Errorf("context cancelled while waiting for port forward: %w", ctx.Err())
+	}
+}
+
+// GetType returns the connector type name for logging
+func (pf *PortForwarder) GetType() string {
+	return "port-forward"
+}
+
+// Stop closes the port forward connection gracefully
+func (pf *PortForwarder) Stop() {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	pf.stop()
+}
+
+// stop closes the port forward connection. pf.mu must be held by the caller.
+func (pf *PortForwarder) stop() {
+	if pf.stopChan == nil {
+		pf.ioCtrl.Logger().Infof("port forward connection is not active")
+		return
+	}
+
+	if !pf.isActive {
+		pf.ioCtrl.Logger().Infof("port forward connection is not active")
+		return
+	}
+
+	select {
+	case <-pf.stopChan:
+	default:
+		close(pf.stopChan)
+	}
+	pf.isActive = false
+	pf.buildkitClient = nil
+	pf.ioCtrl.Logger().Infof("port forward connection stopped")
+}
+
+func getPortForwardK8sClient(oktetoClient *okteto.Client, okCtx PortForwarderOktetoContextInterface) (kubernetes.Interface, *rest.Config, error) {
+	kubetoken, err := oktetoClient.Kubetoken().GetKubeToken(okteto.GetContext().Name, okCtx.GetNamespace(), "buildkit")
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not get kubetoken: %w", err)
+	}
+
+	portForwardCfg := okCtx.GetCurrentCfg().DeepCopy()
+
+	portForwardCfg.AuthInfos[okCtx.GetCurrentUser()].Token = kubetoken.Status.Token
+	return okteto.NewK8sClientProvider().Provide(portForwardCfg)
+}
+
+// containsAddressInUse checks if an error indicates that a port is already in use
+func containsAddressInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for common "address already in use" error messages
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "unable to listen on any of the requested ports")
+}
+
+// WaitUntilIsReady waits for the buildkit server to be ready.
+// Any function calling this method must call Start() first and handle the Stop() call.
+func (pf *PortForwarder) WaitUntilIsReady(ctx context.Context) error {
+	if !pf.isActive {
+		if err := pf.Start(ctx); err != nil {
+			return err
+		}
+	}
+	return pf.waiter.WaitUntilIsUp(ctx, pf.GetBuildkitClient)
+}
+
+// GetBuildkitClient returns the buildkit client. Start() must be called before this method.
+// If a client has already been created, it returns the cached one.
+func (pf *PortForwarder) GetBuildkitClient(ctx context.Context) (*client.Client, error) {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+
+	if pf.buildkitClient != nil {
+		return pf.buildkitClient, nil
+	}
+
+	localAddress := fmt.Sprintf("127.0.0.1:%d", pf.localPort)
+	pf.ioCtrl.Logger().Infof("using buildkit via local port forward: %s", localAddress)
+	originalURL, err := url.Parse(pf.okCtx.GetCurrentBuilder())
+	if err != nil {
+		pf.ioCtrl.Logger().Infof("failed to parse original builder URL: %s", err)
+		return nil, fmt.Errorf("failed to parse original builder URL: %w", err)
+	}
+	originalHostname := originalURL.Hostname()
+	buildkitClientFactory := NewBuildkitClientFactory(
+		pf.okCtx.GetCurrentCertStr(), // Keep certificate for TLS
+		"tcp://"+localAddress,        // Local forwarded address
+		pf.okCtx.GetCurrentToken(),   // Keep token for auth
+		config.GetCertificatePath(),
+		pf.ioCtrl)
+
+	buildkitClientFactory.SetTLSServerName(originalHostname)
+	pf.ioCtrl.Logger().Infof("TLS verification will use server name: %s", originalHostname)
+
+	c, err := buildkitClientFactory.GetBuildkitClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	pf.buildkitClient = c
+	return c, nil
+}

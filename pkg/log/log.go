@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,11 +14,16 @@
 package log
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/fatih/color"
 	"github.com/google/uuid"
@@ -35,18 +40,48 @@ var (
 
 	blueString = color.New(color.FgHiBlue).SprintfFunc()
 
-	errorSymbol = color.New(color.BgHiRed, color.FgBlack).Sprint(" x ")
+	errorSymbol        = " x "
+	coloredErrorSymbol = color.New(color.BgHiRed, color.FgBlack).Sprint(errorSymbol)
 
-	successSymbol = color.New(color.BgGreen, color.FgBlack).Sprint(" ✓ ")
+	successSymbol        = " ✓ "
+	coloredSuccessSymbol = color.New(color.BgGreen, color.FgBlack).Sprint(successSymbol)
 
-	informationSymbol = color.New(color.BgHiBlue, color.FgBlack).Sprint(" i ")
+	informationSymbol        = " i "
+	coloredInformationSymbol = color.New(color.BgHiBlue, color.FgBlack).Sprint(informationSymbol)
 
-	warningSymbol = color.New(color.BgHiYellow, color.FgBlack).Sprint(" ! ")
+	warningSymbol        = " ! "
+	coloredWarningSymbol = color.New(color.BgHiYellow, color.FgBlack).Sprint(warningSymbol)
+
+	questionSymbol        = " ? "
+	coloredQuestionSymbol = color.New(color.BgHiMagenta, color.FgBlack).Sprint(questionSymbol)
+
+	// InfoLevel is the json level for information
+	InfoLevel = "info"
+	// WarningLevel is the json level for warning
+	WarningLevel = "warn"
+	// ErrorLevel is the json level for error
+	ErrorLevel = "error"
+	// DebugLevel is the json level for debug
+	DebugLevel = "debug"
 )
 
 type logger struct {
-	out  *logrus.Logger
-	file *logrus.Entry
+	writer OktetoWriter
+	out    *logrus.Logger
+	file   *logrus.Entry
+
+	buf      *bytes.Buffer
+	replacer *strings.Replacer
+	spinner  *spinnerLogger
+
+	stage      string
+	outputMode string
+
+	maskedWords []string
+	isMasked    bool
+
+	// mu guards stage, buf and the masking fields: dependencies deployed in parallel log at the same time
+	mu sync.RWMutex
 }
 
 var log = &logger{
@@ -57,14 +92,27 @@ func init() {
 	if runtime.GOOS == "windows" {
 		successSymbol = color.New(color.BgGreen, color.FgBlack).Sprint(" + ")
 	}
+	Init(logrus.WarnLevel)
 }
 
 // Init configures the logger for the package to use.
 func Init(level logrus.Level) {
 	log.out.SetOutput(os.Stdout)
 	log.out.SetLevel(level)
+	log.writer = log.getWriter(TTYFormat)
+	log.mu.Lock()
+	log.maskedWords = []string{}
+	log.buf = &bytes.Buffer{}
+	log.mu.Unlock()
+	spinner := newSpinner()
+	log.spinner = &spinnerLogger{
+		sp:             spinner,
+		isActive:       spinner.Active,
+		spinnerSupport: !loadBool(OktetoDisableSpinnerEnvVar) && IsInteractive(),
+	}
 }
 
+// ConfigureFileLogger configures the file to write
 func ConfigureFileLogger(dir, version string) {
 	fileLogger := logrus.New()
 	fileLogger.SetFormatter(&logrus.TextFormatter{
@@ -86,7 +134,7 @@ func getRollingLog(path string) io.Writer {
 		Filename:   path,
 		MaxSize:    1, // megabytes
 		MaxBackups: 10,
-		MaxAge:     28, //days
+		MaxAge:     28, // days
 		Compress:   true,
 	}
 }
@@ -99,73 +147,129 @@ func SetLevel(level string) {
 	}
 }
 
+// GetLevel gets the level of the main logger
+func GetLevel() string {
+	l := log.out.Level
+	return l.String()
+}
+
+// GetOutputFormat returns the output format of the command
+func GetOutputFormat() string {
+	return log.outputMode
+}
+
+// GetOutput returns the log output
+func GetOutput() io.Writer {
+	return log.out.Out
+}
+
+// SetOutput sets the log output
+func SetOutput(output io.Writer) {
+	log.out.SetOutput(output)
+}
+
+// SetOutputFormat sets the output format
+func SetOutputFormat(format string) {
+	log.writer = log.getWriter(format)
+	log.spinner.spinnerSupport = !loadBool(OktetoDisableSpinnerEnvVar) && IsInteractive()
+}
+
+// GetOutputWriter returns the output writer
+func GetOutputWriter() OktetoWriter {
+	return log.writer
+}
+
+// SetStage sets the stage of the logger
+func SetStage(stage string) {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	log.stage = stage
+}
+
+// GetStage returns the stage of the logger
+func GetStage() string {
+	return log.getStage()
+}
+
+func (l *logger) getStage() string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.stage
+}
+
+// getStageOrSet returns the stage of the logger, setting it to stage when it is empty
+func (l *logger) getStageOrSet(stage string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.stage == "" {
+		l.stage = stage
+	}
+	return l.stage
+}
+
+// writeRawToBuffer adds msg to the buffer of the running command, without a new line
+func (l *logger) writeRawToBuffer(msg string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buf.WriteString(msg)
+}
+
+// writeToBuffer adds a line to the buffer of the running command
+func (l *logger) writeToBuffer(line string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buf.WriteString(line)
+	l.buf.WriteString("\n")
+}
+
+// IsDebug checks if the level of the main logger is DEBUG or TRACE
+func IsDebug() bool {
+	return log.out.GetLevel() >= logrus.DebugLevel
+}
+
 // Debug writes a debug-level log
 func Debug(args ...interface{}) {
-	log.out.Debug(args...)
-	if log.file != nil {
-		log.file.Debug(args...)
-	}
+	log.writer.Debug(args...)
 }
 
 // Debugf writes a debug-level log with a format
 func Debugf(format string, args ...interface{}) {
-	log.out.Debugf(format, args...)
-	if log.file != nil {
-		log.file.Debugf(format, args...)
-	}
+	log.writer.Debugf(format, args...)
 }
 
-// Info writes a info-level log
+// Info writes an info-level log
 func Info(args ...interface{}) {
-	log.out.Info(args...)
-	if log.file != nil {
-		log.file.Info(args...)
-	}
+	log.writer.Info(args...)
 }
 
-// Infof writes a info-level log with a format
+// Infof writes an info-level log with a format
 func Infof(format string, args ...interface{}) {
-	log.out.Infof(format, args...)
-	if log.file != nil {
-		log.file.Infof(format, args...)
-	}
+	log.writer.Infof(format, args...)
 }
 
-// Error writes a error-level log
+// Error writes an error-level log
 func Error(args ...interface{}) {
-	log.out.Error(args...)
-	if log.file != nil {
-		log.file.Error(args...)
-	}
+	log.writer.Error(args...)
 }
 
-// Errorf writes a error-level log with a format
+// Errorf writes an error-level log with a format
 func Errorf(format string, args ...interface{}) {
-	log.out.Errorf(format, args...)
-	if log.file != nil {
-		log.file.Errorf(format, args...)
-	}
+	log.writer.Errorf(format, args...)
 }
 
-// Fatalf writes a error-level log with a format
+// Fatalf writes an error-level log with a format
 func Fatalf(format string, args ...interface{}) {
-	if log.file != nil {
-		log.file.Errorf(format, args...)
-	}
-
-	log.out.Fatalf(format, args...)
+	log.writer.Fatalf(format, args...)
 }
 
 // Yellow writes a line in yellow
 func Yellow(format string, args ...interface{}) {
-	log.out.Infof(format, args...)
-	fmt.Fprintln(color.Output, yellowString(format, args...))
+	log.writer.Yellow(format, args...)
 }
 
 // Green writes a line in green
 func Green(format string, args ...interface{}) {
-	log.out.Infof(format, args...)
-	fmt.Fprintln(color.Output, greenString(format, args...))
+	log.writer.Green(format, args...)
 }
 
 // BlueString returns a string in blue
@@ -173,38 +277,174 @@ func BlueString(format string, args ...interface{}) string {
 	return blueString(format, args...)
 }
 
+// RedString returns a string in red
+func RedString(format string, args ...interface{}) string {
+	return redString(format, args...)
+}
+
+// BlueBackgroundString returns a string in a blue background
+func BlueBackgroundString(format string, args ...interface{}) string {
+	return blueString(format, args...)
+}
+
 // Success prints a message with the success symbol first, and the text in green
 func Success(format string, args ...interface{}) {
-	log.out.Infof(format, args...)
-	fmt.Fprintf(color.Output, "%s %s\n", successSymbol, greenString(format, args...))
+	log.writer.Success(format, args...)
 }
 
 // Information prints a message with the information symbol first, and the text in blue
 func Information(format string, args ...interface{}) {
-	log.out.Infof(format, args...)
-	fmt.Fprintf(color.Output, "%s %s\n", informationSymbol, blueString(format, args...))
+	log.writer.Information(format, args...)
+}
+
+// Question prints a message with the question symbol first, and the text in magenta
+func Question(format string, args ...interface{}) error {
+	return log.writer.Question(format, args...)
 }
 
 // Warning prints a message with the warning symbol first, and the text in yellow
 func Warning(format string, args ...interface{}) {
-	log.out.Infof(format, args...)
-	fmt.Fprintf(color.Output, "%s %s\n", warningSymbol, yellowString(format, args...))
+	log.writer.Warning(format, args...)
+}
+
+// FWarning prints a message with the warning symbol first, and the text in yellow to a specific writer
+func FWarning(w io.Writer, format string, args ...interface{}) {
+	log.writer.FWarning(w, format, args...)
 }
 
 // Hint prints a message with the text in blue
 func Hint(format string, args ...interface{}) {
-	log.out.Infof(format, args...)
-	fmt.Fprintf(color.Output, "%s\n", blueString(format, args...))
+	log.writer.Hint(format, args...)
 }
 
 // Fail prints a message with the error symbol first, and the text in red
 func Fail(format string, args ...interface{}) {
-	log.out.Infof(format, args...)
-	fmt.Fprintf(color.Output, "%s %s\n", errorSymbol, redString(format, args...))
+	msg := fmt.Sprintf(format, args...)
+	msg = redactMessage(msg)
+	log.writer.Fail("%s", msg)
 }
 
 // Println writes a line with colors
 func Println(args ...interface{}) {
-	log.out.Info(args...)
-	fmt.Fprintln(color.Output, args...)
+	msg := fmt.Sprint(args...)
+	msg = redactMessage(msg)
+	log.writer.Println(msg)
+}
+
+// FPrintln writes a line with colors to specific writer
+func FPrintln(w io.Writer, args ...interface{}) {
+	msg := fmt.Sprint(args...)
+	msg = redactMessage(msg)
+	log.writer.FPrintln(w, msg)
+}
+
+// Print writes a line with colors
+func Print(args ...interface{}) {
+	msg := fmt.Sprint(args...)
+	msg = redactMessage(msg)
+	log.writer.Print(msg)
+}
+
+// Printf writes a line with format
+func Printf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	msg = redactMessage(msg)
+	log.writer.Print(msg)
+}
+
+// IsInteractive checks if the writer is interactive
+func IsInteractive() bool {
+	return log.writer.IsInteractive()
+}
+
+// AddMaskedWord adds a new word to be redacted, only if longer than 5 chars
+func AddMaskedWord(word string) {
+	addMaskedWord(word, false)
+}
+
+// AddMaskedSecret adds a secret value to be redacted whatever its length.
+// The lines of a multiline value are still redacted only if longer than 5
+// chars, so a line like "}" doesn't redact every brace of the output
+func AddMaskedSecret(value string) {
+	addMaskedWord(value, true)
+}
+
+func addMaskedWord(word string, always bool) {
+	clean := strings.TrimSpace(word)
+
+	// only mask words longer than 5 chars (i.e. 'true' and 'false' won't be masked)
+	minCharsToMask := 5
+	if clean == "" || (!always && len(clean) <= minCharsToMask) {
+		return
+	}
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	log.maskedWords = append(log.maskedWords, clean)
+
+	crossPlatformCleanWord := strings.ReplaceAll(clean, "\r\n", "\n")
+	lines := strings.Split(crossPlatformCleanWord, "\n")
+	for _, line := range lines {
+		cleanLine := strings.TrimSpace(line)
+		if len(cleanLine) <= minCharsToMask {
+			continue
+		}
+		log.maskedWords = append(log.maskedWords, cleanLine)
+	}
+}
+
+// EnableMasking starts redacting all variables
+func EnableMasking() {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	log.isMasked = true
+	sort.Slice(log.maskedWords, func(i, j int) bool {
+		return len(log.maskedWords[i]) > len(log.maskedWords[j])
+	})
+	oldnew := []string{}
+	for _, maskWord := range log.maskedWords {
+		oldnew = append(oldnew, maskWord)
+		oldnew = append(oldnew, "***")
+	}
+	log.replacer = strings.NewReplacer(oldnew...)
+}
+
+// DisableMasking will stop redacting secrets and vars
+func DisableMasking() {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	log.isMasked = false
+}
+
+func redactMessage(message string) string {
+	log.mu.RLock()
+	defer log.mu.RUnlock()
+	if log.isMasked {
+		return log.replacer.Replace(message)
+	}
+	return message
+}
+
+// GetOutputBuffer returns a copy of the buffer of the running command.
+// It is a copy so that it can be read while dependencies deployed in parallel keep logging
+func GetOutputBuffer() *bytes.Buffer {
+	log.mu.RLock()
+	defer log.mu.RUnlock()
+	return bytes.NewBuffer(append([]byte(nil), log.buf.Bytes()...))
+}
+
+// AddToBuffer logs into the buffer but does not print anything
+func AddToBuffer(level, format string, args ...interface{}) {
+	log.writer.AddToBuffer(level, format, args...)
+}
+
+func loadBool(env string) bool {
+	value := os.Getenv(env)
+	if value == "" {
+		value = "false"
+	}
+	boolValue, err := strconv.ParseBool(value)
+	if err != nil {
+		Yellow("'%s' is not a valid value for environment variable %s", value, env)
+	}
+	return boolValue
 }

@@ -1,6 +1,4 @@
-// based on https://github.com/havoc-io/ssh_config
-
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,6 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// based on https://github.com/havoc-io/ssh_config
 package ssh
 
 import (
@@ -20,12 +19,11 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 )
 
 type (
@@ -53,8 +51,10 @@ const (
 	hostNameKeyword               = "HostName"
 	portKeyword                   = "Port"
 	strictHostKeyCheckingKeyword  = "StrictHostKeyChecking"
+	hostKeyAlgorithms             = "HostKeyAlgorithms"
 	userKnownHostsFileKeyword     = "UserKnownHostsFile"
 	identityFile                  = "IdentityFile"
+	identitiesOnly                = "IdentitiesOnly"
 )
 
 func newHost(hostnames, comments []string) *host {
@@ -86,9 +86,9 @@ func (h *host) String() string {
 
 }
 
-func newParam(keyword string, args, comments []string) *param {
+func newParam(keyword string, args []string) *param {
 	return &param{
-		comments: comments,
+		comments: nil,
 		keyword:  keyword,
 		args:     args,
 	}
@@ -131,7 +131,7 @@ func parse(r io.Reader) (*sshConfig, error) {
 		h *host
 	)
 
-	data, err := ioutil.ReadAll(r)
+	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
@@ -224,14 +224,14 @@ func (config *sshConfig) writeTo(w io.Writer) error {
 func (config *sshConfig) writeToFilepath(p string) error {
 	sshDir := filepath.Dir(p)
 	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		log.Infof("failed to create SSH directory %s: %s", sshDir, err)
+		oktetoLog.Infof("failed to create SSH directory %s: %s", sshDir, err)
 	}
 
 	stat, err := os.Stat(p)
 	var mode os.FileMode
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return fmt.Errorf("failed to get info on %s: %s", p, err)
+			return fmt.Errorf("failed to get info on %s: %w", p, err)
 		}
 
 		// default for ssh_config
@@ -241,9 +241,9 @@ func (config *sshConfig) writeToFilepath(p string) error {
 	}
 
 	dir := filepath.Dir(p)
-	temp, err := ioutil.TempFile(dir, "")
+	temp, err := os.CreateTemp(dir, "")
 	if err != nil {
-		return fmt.Errorf("failed to create temporary config file: %s", err)
+		return fmt.Errorf("failed to create temporary config file: %w", err)
 	}
 
 	defer os.Remove(temp.Name())
@@ -257,15 +257,15 @@ func (config *sshConfig) writeToFilepath(p string) error {
 	}
 
 	if err := os.Chmod(temp.Name(), mode); err != nil {
-		return fmt.Errorf("failed to set permissions to %s: %s", temp.Name(), err)
+		return fmt.Errorf("failed to set permissions to %s: %w", temp.Name(), err)
 	}
 
 	if _, err := getConfig(temp.Name()); err != nil {
-		return fmt.Errorf("new config is not valid: %s", err)
+		return fmt.Errorf("new config is not valid: %w", err)
 	}
 
 	if err := os.Rename(temp.Name(), p); err != nil {
-		return fmt.Errorf("failed to move %s to %s: %s", temp.Name(), p, err)
+		return fmt.Errorf("failed to move %s to %s: %w", temp.Name(), p, err)
 	}
 
 	return nil

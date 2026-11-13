@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,77 +16,88 @@ package down
 import (
 	"context"
 
-	"github.com/okteto/okteto/pkg/k8s/deployments"
+	"github.com/okteto/okteto/pkg/k8s/apps"
 	"github.com/okteto/okteto/pkg/k8s/secrets"
 	"github.com/okteto/okteto/pkg/k8s/services"
-	"github.com/okteto/okteto/pkg/log"
+	oktetoLog "github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/model"
+	"github.com/okteto/okteto/pkg/okteto"
 	"github.com/okteto/okteto/pkg/ssh"
 	"github.com/okteto/okteto/pkg/syncthing"
-	appsv1 "k8s.io/api/apps/v1"
-	"k8s.io/client-go/kubernetes"
 )
 
-//Run runs the "okteto down" sequence
-func Run(dev *model.Dev, d *appsv1.Deployment, trList map[string]*model.Translation, wait bool, c *kubernetes.Clientset) error {
+// Run runs the "okteto down" sequence
+func (d *Operation) Run(app apps.App, dev *model.Dev, namespace string, trMap map[string]*apps.Translation, wait bool) error {
 	ctx := context.Background()
-	if len(trList) == 0 {
-		log.Info("no translations available in the deployment")
+	if len(trMap) == 0 {
+		oktetoLog.Info("no translations available in the deployment")
 	}
 
-	for _, tr := range trList {
-		if tr.Deployment == nil {
-			continue
+	k8sClient, _, err := d.K8sClientProvider.Provide(okteto.GetContext().Cfg)
+	if err != nil {
+		return err
+	}
+
+	for _, tr := range trMap {
+		if app.ObjectMeta().Annotations[model.OktetoAutoCreateAnnotation] == model.OktetoUpCmd {
+			if err := app.Destroy(ctx, k8sClient); err != nil {
+				return err
+			}
+
+			if err := services.DestroyDev(ctx, dev, namespace, k8sClient); err != nil {
+				return err
+			}
+			if tr.Dev != dev {
+				if err := tr.DevModeOff(); err != nil {
+					oktetoLog.Infof("failed to turn devmode off: %s", err)
+				}
+				if err := tr.App.Deploy(ctx, k8sClient); err != nil {
+					return err
+				}
+			}
+
+		} else {
+			if err := tr.DevModeOff(); err != nil {
+				oktetoLog.Infof("failed to turn devmode off: %s", err)
+			}
+			if err := tr.App.Deploy(ctx, k8sClient); err != nil {
+				return err
+			}
 		}
-		dTmp, err := deployments.TranslateDevModeOff(tr.Deployment)
-		if err != nil {
+
+		tr.DevApp = tr.App.DevClone()
+		if err := tr.DevApp.Destroy(ctx, k8sClient); err != nil {
 			return err
 		}
-		tr.Deployment = dTmp
 	}
-	if err := deployments.UpdateDeployments(ctx, trList, c); err != nil {
+
+	if err := secrets.Destroy(ctx, dev, namespace, k8sClient); err != nil {
 		return err
 	}
 
-	if err := secrets.Destroy(ctx, dev, c); err != nil {
-		return err
-	}
-
-	stopSyncthing(dev)
+	d.stopSyncthing(dev, namespace)
 
 	if err := ssh.RemoveEntry(dev.Name); err != nil {
-		log.Infof("failed to remove ssh entry: %s", err)
-	}
-
-	if d == nil {
-		return nil
-	}
-
-	if d.Annotations[model.OktetoAutoCreateAnnotation] == model.OktetoUpCmd {
-		if err := deployments.DestroyDev(ctx, dev, c); err != nil {
-			return err
-		}
-		if err := services.DestroyDev(ctx, dev, c); err != nil {
-			return err
-		}
+		oktetoLog.Infof("failed to remove ssh entry: %s", err)
 	}
 
 	if !wait {
 		return nil
 	}
 
-	waitForDevPodsTermination(ctx, c, dev, 30)
+	devPodTerminationRetries := 30
+	waitForDevPodsTermination(ctx, k8sClient, dev, namespace, devPodTerminationRetries)
 	return nil
 }
 
-func stopSyncthing(dev *model.Dev) {
-	sy, err := syncthing.New(dev)
+func (d *Operation) stopSyncthing(dev *model.Dev, namespace string) {
+	sy, err := syncthing.New(dev, namespace, d.Fs)
 	if err != nil {
-		log.Infof("failed to create syncthing instance")
+		oktetoLog.Infof("failed to create syncthing instance")
 		return
 	}
 
 	if err := sy.HardTerminate(); err != nil {
-		log.Infof("failed to hard terminate existing syncthing")
+		oktetoLog.Infof("failed to hard terminate existing syncthing")
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2020 The Okteto Authors
+// Copyright 2023 The Okteto Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,8 +19,8 @@ import (
 
 func Test_needsDatabaseReset(t *testing.T) {
 	tests := []struct {
-		name                      string
 		wfc                       *waitForCompletion
+		name                      string
 		previousLocalGlobalBytes  int64
 		previousRemoteGlobalBytes int64
 		globalBytesRetries        int64
@@ -121,7 +121,7 @@ func Test_needsDatabaseReset(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := tt.wfc.needsDatabaseReset()
 			if result != tt.want {
-				t.Errorf("test '%s' wrong completed: %t vs %t", tt.name, result, tt.want)
+				t.Errorf("test '%s' wrong needsDatabaseReset: %t vs %t", tt.name, result, tt.want)
 			}
 			if tt.wfc.previousLocalGlobalBytes != tt.previousLocalGlobalBytes {
 				t.Errorf("test '%s' wrong previousLocalGlobalBytes: %d vs %d", tt.name, tt.wfc.previousLocalGlobalBytes, tt.previousLocalGlobalBytes)
@@ -138,8 +138,8 @@ func Test_needsDatabaseReset(t *testing.T) {
 
 func Test_isCompleted(t *testing.T) {
 	tests := []struct {
-		name               string
 		wfc                *waitForCompletion
+		name               string
 		needDeletesRetries int64
 		want               bool
 	}{
